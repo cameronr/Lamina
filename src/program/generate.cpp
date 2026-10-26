@@ -78,6 +78,17 @@ using lamina::program::serve_print;   // the --serve protocol's replies (serve_i
 
 namespace {
 
+// FNV-1a over raw bytes: the LAMINA_WINDOW_DIGEST accepted-token chain (see the serve loop's emit).  The seed and
+// byte order match the request parser's own local copy in serve_io.cpp.
+uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 /// The chunk size a batched prompt of `len` tokens reads in: as few chunks of at most `cap` tokens as it takes, of one
 /// size (a multiple of 256, the last one shorter), not whole `cap` chunks and the rest.  Every chunk streams each
 /// expert its tokens use, so a short last one costs nearly a whole one's copies, and under --prompt-split it leaves the
@@ -3271,6 +3282,12 @@ int lamina::program::run(int argc, char** argv) {
         serve_print("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::string line;
         int64_t rounds = 0;
+        // LAMINA_WINDOW_DIGEST: a debug-only line per verify window (the solo token-exactness baseline, see the
+        // window loop's emit).  Read once; when unset the hot loop does no extra work and nothing is printed.
+        static const bool window_digest = std::getenv("LAMINA_WINDOW_DIGEST") != nullptr;
+        int64_t digest_req = 0;   // serve requests accepted (GEN/GENI): the digest lines' req field
+        int64_t digest_win = 0;   // the current request's window index
+        uint64_t digest_chain = 1469598103934665603ull;   // its accepted-token chain (FNV-1a, restarted per request)
         const int S = o.spec, W = o.max_window();   // the draft layer's windows; with prompt lookup's
         // prompt lookup: the text so far, kept across requests (a conversation's next request shares its prefix)
         lamina::spec::SuffixDrafter lookup(o.spec_lookup, 32, o.spec_lookup > 0 ? (size_t) o.max_context + 16 : 16);
@@ -3317,6 +3334,11 @@ int lamina::program::run(int argc, char** argv) {
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 serve_print("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
+            }
+            if (window_digest) {   // a new request: restart the chain at FNV-1a's offset basis and the window index
+                ++digest_req;
+                digest_win = 0;
+                digest_chain = 1469598103934665603ull;
             }
             char* endp = nullptr;
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
@@ -3851,6 +3873,18 @@ int lamina::program::run(int argc, char** argv) {
                     if (o.spec_lookup > 0) lookup.append(outv[(size_t) i]);
                     ++produced_n;
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                }
+                if (window_digest) {   // one line per completed window, after the commit; the chain folds the window's
+                    for (int i = 0; i <= a; ++i) {   // committed tokens, whose count is exactly the accepted= field
+                        const uint32_t tok = (uint32_t) window[(size_t) i];
+                        const unsigned char b[4] = {(unsigned char) (tok & 0xff), (unsigned char) (tok >> 8),
+                                                    (unsigned char) (tok >> 16), (unsigned char) (tok >> 24)};
+                        digest_chain = fnv1a(b, 4, digest_chain);
+                    }
+                    std::fprintf(stderr, "lamina digest: req=%lld win=%lld p=%lld rows=%d accepted=%d chain=%016llx\n",
+                                 (long long) digest_req, (long long) digest_win, (long long) p, T, a + 1,
+                                 (unsigned long long) digest_chain);
+                    ++digest_win;
                 }
                 ++rounds;
                 // the next window's drafts: the lookup's when they are more than the draft layer's chain allows (the
