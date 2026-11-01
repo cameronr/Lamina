@@ -72,6 +72,9 @@ class Engine:
             yield line.rstrip("\n")
 
 
+def chat_text(q):
+    return f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
 def main():
 
     ap = argparse.ArgumentParser()
@@ -89,7 +92,7 @@ def main():
     tok = tokenizer(cfg["tokenizer"])
     prompts = []
     for q in QUESTIONS[:N_PROMPTS]:
-        text = f"<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        text = chat_text(q)
         prompts.append(tok.encode(text, parse_special=True))
 
     n = len(prompts)

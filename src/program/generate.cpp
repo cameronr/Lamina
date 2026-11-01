@@ -78,6 +78,10 @@ using lamina::program::serve_print;   // the --serve protocol's replies (serve_i
 
 namespace {
 
+// Ids at or above this are control tokens of this family (<|endoftext|> is 248044, the first --eos-ids default:
+// the think and tool tags and the end of turn follow it).  Relaxed drafting never keeps one: those rows stay exact.
+constexpr int32_t kFirstControlToken = 248044;
+
 // FNV-1a over raw bytes: the LAMINA_WINDOW_DIGEST accepted-token chain (see the serve loop's emit).  The seed and
 // byte order match the request parser's own local copy in serve_io.cpp.
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -228,6 +232,10 @@ struct Options {
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.
     double spec_min_p = 0.0;
+    /// Relaxed drafting: sampled requests also keep a draft the target gives this probability or more under the
+    /// request's final distribution (0 = off: a draft is kept only when it equals the target's own draw).  Greedy
+    /// requests, biased rows and control tokens stay exact.
+    double relaxed_drafting = 0.0;
     /// Prompt lookup: when the text's last N+ tokens occurred before and the tokens after that occurrence are more
     /// drafts than --spec gives the draft layer, the next window verifies up to kVerifyMaxT - 1 of them instead;
     /// 0 = off.
@@ -351,6 +359,9 @@ void usage() {
                  "  --spec T             verify windows of up to T tokens: the last one and T-1 MTP drafts (2..8)\n"
                  "  --spec-min-p P       a draft enters the window only while it and the drafts before it have at\n"
                  "                       least probability P under the draft layer (default 0: always T-1 drafts)\n"
+                 "  --relaxed-drafting P sampled requests also keep a draft the target gives probability >= P under\n"
+                 "                       the request's final distribution (default 0: exact; greedy requests and\n"
+                 "                       control tokens stay exact: the kept row is that token, greedy)\n"
                  "  --spec-lookup N      when the text's last N+ tokens occurred before, the next window verifies\n"
                  "                       up to 7 of the tokens that followed there instead, if they are more than\n"
                  "                       --spec allows the draft layer (windows of up to 8 tokens; 0 = off)\n"
@@ -1234,6 +1245,8 @@ int lamina::program::run(int argc, char** argv) {
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
         else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+        else if (a == "--relaxed-drafting")
+            o.relaxed_drafting = std::clamp((double) std::atof(next("--relaxed-drafting")), 0.0, 1.0);
         else if (a == "--spec-lookup") o.spec_lookup = std::max(0, std::atoi(next("--spec-lookup")));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
@@ -3344,6 +3357,7 @@ int lamina::program::run(int argc, char** argv) {
             const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F, penalty_last_n=N,
             // penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N, spec_min_p=F (this request's draft floor),
+            // relaxed_drafting=F (this request's relaxed-drafting threshold; 0: exact),
             // score=ID:ID:... (an `LP` line with those ids' log-probabilities after the prompt, before the first `T`);
             // unknown keys are skipped.  Absent keys: greedy, no penalties.
             float req_temperature = 0.0f, req_top_p = 1.0f, req_min_p = 0.0f;
@@ -3352,6 +3366,7 @@ int lamina::program::run(int argc, char** argv) {
             float req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             double req_spec_min_p = o.spec_min_p;
+            double req_relaxed = o.relaxed_drafting;   // this request's relaxed-drafting threshold (0: exact)
             std::vector<int32_t> req_score;   // score=ID:ID:...: see the first window
             // img_keys=<hex>,<hex>,...: each picture's key from the server (its normalized bytes' hash), in prompt
             // order; the conversation cache then matches a picture by key and grid, not by its embedding floats
@@ -3378,6 +3393,7 @@ int lamina::program::run(int argc, char** argv) {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(v, nullptr, 10);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "relaxed_drafting") req_relaxed = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "img_keys") {
                         req_img_keys.clear();
                         for (const char* q = v; *q != '\0';) {
@@ -3515,6 +3531,10 @@ int lamina::program::run(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             ver.set_sampling(req_sp);
+            // relaxed drafting: the verifier probes each row's draft probability, and the accept loop below keeps a
+            // draft the target gives `req_relaxed` or more.  Greedy requests draw nothing, so they stay exact.
+            const bool relax_on = req_relaxed > 0.0 && !req_sp.greedy;
+            ver.set_draft_probe(relax_on);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             req_tiers = tier_counters();
@@ -3854,6 +3874,16 @@ int lamina::program::run(int argc, char** argv) {
                 const bool fw = first_window;
                 int a = fw ? T - 1 : 0;   // the first window's prompt tokens are all committed
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (relax_on) {   // relaxed drafting: past the first mismatch, keep a draft the target gives
+                    const std::vector<float>& pp = ver.probe_prob();   // `req_relaxed` or more under the row's
+                    if ((int) pp.size() >= T)                          // final distribution, and emit it (the row
+                        for (; a < T - 1; ++a) {                       // turns greedy); stop at anything else
+                            const int32_t d = window[(size_t) a + 1];
+                            if (d == outv[(size_t) a]) continue;   // a row after a relaxed keep can still match
+                            if (d >= kFirstControlToken || pp[(size_t) a] < (float) req_relaxed) break;
+                            outv[(size_t) a] = d;   // the kept draft is this row's output, not the draw
+                        }
+                }
                 if (!ver.commit(a + 1, err, false)) {   // beside the draft
                     drive.join_adapt();
                     report(err);

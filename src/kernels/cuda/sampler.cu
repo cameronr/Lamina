@@ -402,7 +402,16 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
         cum += exp((double) scaled(i) - (double) smx) / sum;
         if ((double) u < cum) { pick = sel_ids[i]; break; }
     }
-    if (threadIdx.x == 0) out[t] = pick;
+    if (threadIdx.x == 0) {
+        out[t] = pick;
+        if (p.probe_prob != nullptr) {   // relaxed drafting: the draft's probability under this same distribution
+            const int d = p.probe_tok ? p.probe_tok[t] : -1;
+            float pr = 0.0f;
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_ids[i] == d) { pr = (float) (exp((double) scaled(i) - (double) smx) / sum); break; }
+            p.probe_prob[t] = pr;
+        }
+    }
 }
 
 // ---- the same list, in the same order, without the `taken` sweep ----
@@ -504,6 +513,13 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
             if ((double) u < cum) { pick = sel_ids[i]; break; }
         }
         out[t] = pick;
+        if (p.probe_prob != nullptr) {   // relaxed drafting: the draft's probability under this same distribution
+            const int d = p.probe_tok ? p.probe_tok[t] : -1;
+            float pr = 0.0f;
+            for (int i = 0; i < n_keep; ++i)
+                if (sel_ids[i] == d) { pr = (float) ex[i]; break; }
+            p.probe_prob[t] = pr;
+        }
     }
 }
 

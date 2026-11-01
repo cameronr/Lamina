@@ -100,6 +100,12 @@ public:
     /// Off: `run` skips the head sampling and `out` is the greedy pick (windows whose picks are discarded: a prompt
     /// read through windows commits every token).
     void set_head_sampling(bool on) { head_sampling_ = on; }
+    /// Relaxed drafting's probe: with it on, after every window that sampled, `probe_prob()[t]` is the probability
+    /// the row's final distribution gives to `tokens[t + 1]` - the draft after that row (0 past the window's last
+    /// row and for drafts the filters dropped).  Empty after a window that did not sample (greedy, head sampling
+    /// off): a caller must treat empty as "no relaxed keeps".  Set per request alongside `set_sampling`.
+    void set_draft_probe(bool on) { draft_probe_ = on; }
+    const std::vector<float>& probe_prob() const { return probe_prob_; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  With `wait` false
     /// the commit graph is only launched (the MTP draft, on its own stream, reads nothing it writes): `wait_commit`
@@ -201,6 +207,10 @@ private:
     const int32_t* hist_d_ = nullptr;
     int hist_len_ = 0;
     bool head_sampling_ = true;
+    bool draft_probe_ = false;                                       // relaxed drafting's probability probe
+    std::vector<float> probe_prob_;                                  // the last sampling window's drafts' probabilities
+    int32_t* h_ptok_ = nullptr;   int32_t* m_ptok_ = nullptr;        // T: the draft after each row (mapped)
+    float* h_pprob_ = nullptr;    float* m_pprob_ = nullptr;         // T: their probabilities (the sampler writes)
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

@@ -100,7 +100,7 @@ Verifier::~Verifier() {
     void* hosts[] = {h_tok_, h_val_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_,
                      h_ymiss_, h_bad_,
                      h_flagA_, h_plan_, h_flagB_, h_pids_, h_pw_, h_pseq_, h_pleflag_, h_rows_, h_res_, h_flag2_,
-                     h_list2_, h_xk_, h_xq1_};
+                     h_list2_, h_xk_, h_xq1_, h_ptok_, h_pprob_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -185,6 +185,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     xk_stride_ = ((int64_t) (N / 256) * 292 + 15) & ~15ll;
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
+              mapped(T * 4, (void**) &h_ptok_, (void**) &m_ptok_) &&
+              mapped(T * 4 + 16, (void**) &h_pprob_, (void**) &m_pprob_) &&
               mapped(T * lamina::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * NH * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
@@ -1368,10 +1370,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (sampled) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        // relaxed drafting's probe: each row's draft (tokens[t + 1]) probability under the row's final distribution
+        const bool probe = draft_probe_ && !sp.greedy && sp.temperature > 0.0f;
+        if (probe) {
+            for (int t = 0; t < T; ++t) h_ptok_[t] = t + 1 < T ? tokens[t + 1] : -1;
+            sp.probe_tok = m_ptok_;
+            sp.probe_prob = m_pprob_;
+        }
         sample_tokens(shead_ != nullptr ? head_full_ : head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_,
                       cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify: the head sampling failed"; return false; }
-    }
+        if (probe) {
+            probe_prob_.resize((size_t) T);
+            for (int t = 0; t < T; ++t) probe_prob_[(size_t) t] = ((volatile float*) h_pprob_)[t];
+        } else
+            probe_prob_.clear();
+    } else
+        probe_prob_.clear();
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (stamps_ != nullptr && G == 1) {
         const int64_t NL = g.n_layers;

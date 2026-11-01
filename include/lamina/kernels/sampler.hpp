@@ -26,6 +26,12 @@ struct SamplerParams {
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
+    // relaxed drafting's probe (device, optional; the sampled paths only): `probe_prob[t]` gets the probability the
+    // row's FINAL distribution (penalties and filters applied, temperature scaled) gives to token `probe_tok[t]`;
+    // 0 when that token is not among the survivors, -1 never matches.  The pick is untouched: the probe reads the
+    // same normalized weights the draw sampled from.  The greedy path never writes them (greedy rows need no probe).
+    const int* probe_tok = nullptr;
+    float* probe_prob = nullptr;
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.

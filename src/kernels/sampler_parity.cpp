@@ -1319,6 +1319,67 @@ int main(int argc, char** argv) {
         bad += wrong;
     }
 
+    // ---- fixture 19: RELAXED DRAFTING probe.  Three finite logits per row, the rest at -1e30: the survivor list
+    // is the three plus 17 sentinels of zero weight, so each probed token's probability is exactly the host's
+    // e[i] / sum (the same double exps, the same ascending sum, the same division).  And the pick must not move
+    // when the probe is armed.
+    {
+        const int NT2 = 2;
+        std::vector<float> l((size_t) NV * NT2, -1e30f);
+        const float v[3] = {2.0f, 0.5f, -1.0f};
+        for (int t = 0; t < NT2; ++t)
+            for (int i = 0; i < 3; ++i) l[(size_t) t * NV + (size_t) (3 * t + i)] = v[i];
+        lamina::kernels::SamplerParams p;
+        p.top_k = 20; p.top_p = 1.0f; p.min_p = 0.0f; p.temperature = 1.0f; p.seed = 11;
+        const double e[3] = {1.0, std::exp(-1.5), std::exp(-3.0)};
+        double sum = 0.0;
+        for (int i = 0; i < 3; ++i) sum += e[i];
+        float* d_l = nullptr;
+        int* d_o = nullptr;
+        int* d_pt = nullptr;
+        float* d_pp = nullptr;
+        check(cudaMalloc(&d_l, l.size() * sizeof(float)), "p19 l");
+        check(cudaMalloc(&d_o, (size_t) NT2 * sizeof(int)), "p19 o");
+        check(cudaMalloc(&d_pt, (size_t) NT2 * sizeof(int)), "p19 pt");
+        check(cudaMalloc(&d_pp, (size_t) NT2 * sizeof(float)), "p19 pp");
+        check(cudaMemcpy(d_l, l.data(), l.size() * sizeof(float), cudaMemcpyHostToDevice), "p19 copy");
+        int wrong = 0, probed = 0, pick_diff = 0;
+        std::vector<int> base_off, base_on;
+        for (int probe = -1; probe <= 3; ++probe) {   // -1: unarmed; 0..2: the three tokens; 3: a zero-weight one
+            lamina::kernels::SamplerParams q = p;
+            int pt[NT2];
+            for (int t = 0; t < NT2; ++t) pt[t] = probe < 0 ? -1 : 3 * t + probe;
+            if (probe >= 0) {
+                check(cudaMemcpy(d_pt, pt, sizeof(pt), cudaMemcpyHostToDevice), "p19 pt copy");
+                q.probe_tok = d_pt;
+                q.probe_prob = d_pp;
+            }
+            check(cudaMemset(d_o, 0xFF, (size_t) NT2 * sizeof(int)), "p19 fill");
+            lamina::kernels::sample_tokens(d_l, NT2, NV, nullptr, 0, q, d_o, nullptr);
+            std::vector<int> got((size_t) NT2);
+            check(cudaMemcpy(got.data(), d_o, got.size() * sizeof(int), cudaMemcpyDeviceToHost), "p19 back");
+            if (probe < 0) {
+                base_off = got;
+                continue;
+            }
+            base_on = got;
+            std::vector<float> pp((size_t) NT2);
+            check(cudaMemcpy(pp.data(), d_pp, pp.size() * sizeof(float), cudaMemcpyDeviceToHost), "p19 pp back");
+            const float want = probe < 3 ? (float) (e[probe] / sum) : 0.0f;
+            for (int t = 0; t < NT2; ++t) {
+                if (std::fabs(pp[(size_t) t] - want) > 1e-7f) ++wrong;
+                ++probed;
+            }
+        }
+        for (int t = 0; t < NT2; ++t)
+            if (base_off[(size_t) t] != base_on[(size_t) t]) ++pick_diff;
+        std::printf("  %-34s %s (%d of %d probe values off, %d picks moved when armed)\n",
+                    "relaxed-drafting probe", (!wrong && !pick_diff) ? "matches" : "*** WRONG ***", wrong, probed,
+                    pick_diff);
+        bad += wrong + pick_diff;
+        cudaFree(d_l); cudaFree(d_o); cudaFree(d_pt); cudaFree(d_pp);
+    }
+
     std::printf("\nsampler: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("sampler_parity OK\n");
