@@ -125,10 +125,11 @@ def try_json(base, path, key="", timeout=20):
         return None
 
 
-def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = False, tools=None, timeout: float = 3600) -> dict:
+def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = False, tools=None, timeout: float = 3600,
+         temperature: float = 0.0) -> dict:
     """One streamed chat request -> {first, total, text, usage, timings, err}.  `first` is the seconds to the first
     non-empty content or reasoning piece (keep-alives and empty deltas ignored)."""
-    body = {"model": "lamina", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages}
+    body = {"model": "lamina", "stream": True, "max_tokens": max_tokens, "temperature": temperature, "messages": messages}
     if tools:
         body["tools"] = tools
     if not think:
@@ -222,9 +223,11 @@ def pctl(values, p):
 
 # ---------------------------------------------------------------------------------------------------- the suite
 class Suite:
-    def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False):
+    def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False,
+                 temperature=0.0):
         self.base, self.key, self.ctx, self.runs, self.think, self.log = base, key, ctx, runs, think, log
         self.clients, self.want_long = want_clients, want_long
+        self.temperature = temperature   # the chat decode test's sampling temperature (sampled decoding needs > 0)
         self.quick = quick
         self.nonce = str(int(time.time()))
         self.tokens_per_word, self.overhead = 1.1, 40
@@ -265,7 +268,7 @@ class Suite:
         for run in range(self.runs):
             for i, p in enumerate(PROMPTS):
                 d = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag(run, i, 'c')}] {p}"}],
-                                CHAT_MAX_TOKENS, self.think))
+                                CHAT_MAX_TOKENS, self.think, temperature=self.temperature))
                 d.update(run=run, prompt=i)
                 rows.append(d)
                 if not d["ok"]:
@@ -846,7 +849,7 @@ def render_readme(res: dict) -> str:
          f"- Model and quantization: {model}",
          f"- Context: {mc.get('context') or 'not read'} tokens; parallel slots: {mc.get('parallel_slots') or 1}",
          f"- Settings: the install's own configuration, unchanged{' (' + mc['config']['backend'] + ' backend)' if mc.get('config', {}).get('backend') else ''}; thinking "
-         f"{'on' if p['think'] else 'off'} for the suite; temperature 0", ""]
+         f"{'on' if p['think'] else 'off'} for the suite; temperature {p.get('temperature') or 0}", ""]
     if mc.get("launch"):
         L += ["```text", mc["launch"], "```", ""]
     env = (mc.get("config") or {}).get("env")
@@ -960,6 +963,9 @@ def main(argv=None) -> int:
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
     ap.add_argument("--think", action="store_true", help="leave thinking on (the default suite turns it off)")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="sampling temperature for the chat decode test (default 0: greedy; > 0 exercises "
+                         "sampled decoding, e.g. --relaxed-drafting)")
     ap.add_argument("--out", help="where to write the results folder (default: bench/results)")
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
     ap.add_argument("--compare-only", metavar="NEW", help="print --compare of two existing results folders and stop")
@@ -1020,7 +1026,8 @@ def main(argv=None) -> int:
                 return 1
         t0 = time.time()
         pre = collect_machine(base, key, cfg, a.gpu)
-        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long)
+        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long,
+                      temperature=a.temperature)
         slots = pre.get("parallel_slots") or 1
         if a.clients and a.clients > slots:
             say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
@@ -1030,9 +1037,10 @@ def main(argv=None) -> int:
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/lamina_bench.py", "date": datetime.date.today().isoformat(),
-               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "started_server": started,
+               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "temperature": a.temperature, "started_server": started,
                           "command": "python tools/lamina_bench.py" + "".join(
                               f" {x}" for x in (f"--clients {a.clients}" if a.clients else "", "--long" if a.long else "",
+                                                f"--temperature {a.temperature}" if a.temperature else "",
                                                 "--think" if a.think else "", f"--runs {a.runs}" if a.runs != 3 else "") if x)},
                "elapsed_s": time.time() - t0, "machine": machine, "results": out}
         parent = Path(a.out) if a.out else ROOT / "bench" / "results"
