@@ -224,10 +224,11 @@ def pctl(values, p):
 # ---------------------------------------------------------------------------------------------------- the suite
 class Suite:
     def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False,
-                 temperature=0.0):
+                 temperature=0.0, decode_tokens=CHAT_MAX_TOKENS):
         self.base, self.key, self.ctx, self.runs, self.think, self.log = base, key, ctx, runs, think, log
         self.clients, self.want_long = want_clients, want_long
         self.temperature = temperature   # the chat decode test's sampling temperature (sampled decoding needs > 0)
+        self.decode_tokens = decode_tokens   # the chat decode test's new-token cap (long caps show decode-bound speedups)
         self.quick = quick
         self.nonce = str(int(time.time()))
         self.tokens_per_word, self.overhead = 1.1, 40
@@ -263,12 +264,15 @@ class Suite:
         chat(self.base, self.key, self.prompt_for(1024, -1), 8, self.think)
 
     def run_chat(self):
-        self.log(f"chat: {len(PROMPTS)} short questions x {self.runs} runs, up to {CHAT_MAX_TOKENS} new tokens")
+        self.log(f"chat: {len(PROMPTS)} short questions x {self.runs} runs, up to {self.decode_tokens} new tokens")
         rows = []
         for run in range(self.runs):
             for i, p in enumerate(PROMPTS):
-                d = digest(chat(self.base, self.key, [{"role": "user", "content": f"[{self.tag(run, i, 'c')}] {p}"}],
-                                CHAT_MAX_TOKENS, self.think, temperature=self.temperature))
+                ask = f"[{self.tag(run, i, 'c')}] {p}"
+                if self.decode_tokens > CHAT_MAX_TOKENS:   # a long cap asks for long form: the short questions
+                    ask += " Answer in detail, at length."  # stop early otherwise and the test stays half prefill-bound
+                d = digest(chat(self.base, self.key, [{"role": "user", "content": ask}],
+                                self.decode_tokens, self.think, temperature=self.temperature))
                 d.update(run=run, prompt=i)
                 rows.append(d)
                 if not d["ok"]:
@@ -860,7 +864,7 @@ def render_readme(res: dict) -> str:
           f"({'started by the benchmark from the install configuration' if p['started_server'] else 'already running'}); model loading is not "
           f"timed. One warm-up chat and a 1K prompt are discarded first. Every prompt starts with a unique tag, so the conversation "
           f"cache cannot help the fresh-prompt tests.", "",
-          f"- short chat: the three questions of `tools/ab_engine.py`, up to {CHAT_MAX_TOKENS} new tokens, {p['runs']} runs",
+          f"- short chat: the three questions of `tools/ab_engine.py`, up to {p.get('decode_tokens') or CHAT_MAX_TOKENS} new tokens, {p['runs']} runs",
           f"- 4K / 16K{' / 32K' if 'prompt' in res['results'] and '32K' in res['results']['prompts'] else ''} prompts: generated word lists sized by a calibration request, "
           f"{LONG_MAX_TOKENS} new tokens, {p['runs']} fresh prompts each",
           f"- agent session: system prompt and four tools, then {AGENT_TURNS} turns that each add about {AGENT_WORDS} words of a project file "
@@ -966,6 +970,9 @@ def main(argv=None) -> int:
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="sampling temperature for the chat decode test (default 0: greedy; > 0 exercises "
                          "sampled decoding, e.g. --relaxed-drafting)")
+    ap.add_argument("--decode-tokens", type=int, default=CHAT_MAX_TOKENS, metavar="N",
+                    help=f"new tokens the chat decode test asks for (default {CHAT_MAX_TOKENS}; a long cap like "
+                         "1024 makes it decode-bound, where speculation gains show up)")
     ap.add_argument("--out", help="where to write the results folder (default: bench/results)")
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
     ap.add_argument("--compare-only", metavar="NEW", help="print --compare of two existing results folders and stop")
@@ -1027,7 +1034,7 @@ def main(argv=None) -> int:
         t0 = time.time()
         pre = collect_machine(base, key, cfg, a.gpu)
         suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long,
-                      temperature=a.temperature)
+                      temperature=a.temperature, decode_tokens=a.decode_tokens)
         slots = pre.get("parallel_slots") or 1
         if a.clients and a.clients > slots:
             say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
@@ -1037,10 +1044,11 @@ def main(argv=None) -> int:
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/lamina_bench.py", "date": datetime.date.today().isoformat(),
-               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "temperature": a.temperature, "started_server": started,
+               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "temperature": a.temperature, "decode_tokens": a.decode_tokens, "started_server": started,
                           "command": "python tools/lamina_bench.py" + "".join(
                               f" {x}" for x in (f"--clients {a.clients}" if a.clients else "", "--long" if a.long else "",
                                                 f"--temperature {a.temperature}" if a.temperature else "",
+                                                f"--decode-tokens {a.decode_tokens}" if a.decode_tokens != CHAT_MAX_TOKENS else "",
                                                 "--think" if a.think else "", f"--runs {a.runs}" if a.runs != 3 else "") if x)},
                "elapsed_s": time.time() - t0, "machine": machine, "results": out}
         parent = Path(a.out) if a.out else ROOT / "bench" / "results"
