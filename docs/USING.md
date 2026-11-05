@@ -125,6 +125,14 @@ model sampled for its position, so the drafts change the speed, never the distri
 conversation in the background, so a sampled answer is reproducible run to run only with `--adapt-every 0` in the
 engine's arguments.
 
+`--relaxed-drafting P` (default 0) gives up that guarantee for sampled requests: a draft the target gives probability
+`P` or more under the row's final distribution is kept as well, and the row turns greedy for that token. It is a
+sampling change, not a speculation fix: the answers come from a slightly different distribution (roughly P of their
+tokens' mass moved onto drafts the model liked), in exchange for a few percent of decode speed on long answers.
+Greedy requests are untouched, and a draft of a control token (a think or tool tag, end of turn) is never relaxed.
+A request can override the server with `"relaxed_drafting": 0` in its body; `tools/lamina_bench.py
+--temperature 0.6 --decode-tokens 1024` measures the trade.
+
 ## Behaviour
 
 - **Streaming**: with `"stream": true` the thinking, the answer and tool calls (name first, then the arguments piece by
