@@ -911,8 +911,8 @@ private:
 };
 
 /// Telemetry.sample's figures from its readings: `reads` the cards' (index, NVML reading) when the first card is
-/// readable (else empty: no GPU figures), `names` their names (read for several cards only), the CPU load and RAM
-/// (total, available) (nullopt: psutil raised), the disk rates and extra()'s figures
+/// readable (else empty: no GPU figures), `names` their names, the CPU load and RAM (total, available) (nullopt:
+/// psutil raised), the disk rates and extra()'s figures
 json assemble(const std::vector<std::pair<int, json>>& reads, const std::vector<json>& names,
               const std::optional<double>& load, const std::optional<std::pair<int64_t, int64_t>>& ram,
               const json& disk_read, const json& disk_write, const json& more) {
@@ -965,30 +965,23 @@ json assemble(const std::vector<std::pair<int, json>>& reads, const std::vector<
     return s;
 }
 
-/// a sample into the sparklines' series (floats rounded to 2 places), the last kHistory of each
+/// a reading onto its series (a float rounded to 2 places), the last kHistory kept
+void push(json& h, const json& v) {
+    if (!h.is_array()) h = json::array();
+    h.push_back(v.is_number_float() ? json(py_round(v.get<double>(), 2)) : v);
+    if (h.size() > kHistory) h.erase(h.begin());
+}
+
+/// a sample into the sparklines' series, and each card's own for the GPU cards' lines (gpu_util_g<index>, ...; the
+/// cards are fixed at the server's start, so none goes stale)
 void record(json& hist, const json& s) {
-    for (const char* k : kSeries) {
-        const json& v = jget(s, k);
-        json& h = hist[k];
-        if (!h.is_array()) h = json::array();
-        h.push_back(v.is_number_float() ? json(py_round(v.get<double>(), 2)) : v);
-        if (h.size() > kHistory) h.erase(h.begin());
-    }
-    // each card's own util/temp/power/rx for the GPU cards' per-GPU lines (the indices are fixed at
-    // engine startup: no stale series)
+    for (const char* k : kSeries) push(hist[k], jget(s, k));
     if (const json& gpus = jget(s, "gpus"); gpus.is_array())
         for (const json& g : gpus)
             if (const json& idx = jget(g, "index"); idx.is_number()) {
                 const std::string suffix = "_g" + std::to_string(idx.get<int64_t>());
-                const auto put = [&](const char* field, const char* series) {
-                    const json& v = jget(g, field);
-                    json& h = hist[series + suffix];
-                    if (!h.is_array()) h = json::array();
-                    h.push_back(v.is_number_float() ? json(py_round(v.get<double>(), 2)) : v);
-                    if (h.size() > kHistory) h.erase(h.begin());
-                };
-                put("util", "gpu_util"); put("temp", "gpu_temp"); put("power", "gpu_power");
-                put("pcie_rx_mb", "gpu_pcie_rx_mb"); put("mem_used", "gpu_mem_used");
+                for (const char* f : {"util", "mem_used", "temp", "power", "pcie_rx_mb"})
+                    push(hist["gpu_" + std::string(f) + suffix], jget(g, f));
             }
 }
 
@@ -1085,9 +1078,6 @@ Telemetry::Telemetry(std::function<json()> extra, int gpu_index, std::vector<int
     for (const auto& g : all)
         if (g.second.ok()) m.gpus.push_back(g);
     if (m.gpus.empty()) m.gpus.push_back(all.front());   // none readable: the first, for its count and its nulls
-    // the Monitor lists the cards by NVML index (lowest first), not the engine's [main, tiers...] order: the per-card
-    // rows must be deterministic across runs and configs. gpu_index (the engine's own card) is a separate value, unchanged.
-    std::sort(m.gpus.begin(), m.gpus.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     m.facts = machine_facts(m.gpus);
     m.thread = std::thread([self = impl_] { self->loop(); });
 }

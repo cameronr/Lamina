@@ -46,6 +46,7 @@
   --st-info:#0f97ff;     --st-info-tint:#e8f4ff;    --st-info-text:#0668c2;
   --st-warn:#e39b0b;     --st-warn-tint:#fff6e0;    --st-warn-text:#8a5a00;   /* (derived) */
   --st-danger:#e0283f;   --st-danger-tint:#fdecee;  --st-danger-text:#b01a2e; /* (derived) */
+  --st-gpu-1:#3b82f6;    --st-gpu-2:#10b981;        --st-gpu-3:#a78bfa;        --st-gpu-4:#f472b6;  /* the Monitor's cards, both themes (derived) */
 
   --st-code-bg:#1b1f23;  --st-code-ink:#e6e9ec;  /* code blocks stay dark in both themes (derived) */
 

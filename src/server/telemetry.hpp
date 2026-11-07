@@ -21,7 +21,8 @@ public:
     /// `extra()`: more series to record each second (the server's tok/s). `gpu_index`: the card the engine runs on,
     /// numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when the model is split
     /// across several (#112) - the gpu_* readings are then their total (memory, power, PCIe traffic), mean (load) or
-    /// hottest (temperature), and "gpus" has each card's own.
+    /// hottest (temperature). "gpus" has each card's own however many there are, in this order (the engine's card
+    /// first, as is "gpu_name"), and the history each card's series (gpu_util_g<index>, ...).
     explicit Telemetry(std::function<json()> extra = nullptr, int gpu_index = 0, std::vector<int> gpu_indices = {});
     ~Telemetry();
     Telemetry(const Telemetry&) = delete;
