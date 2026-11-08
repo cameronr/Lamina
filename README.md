@@ -18,8 +18,8 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
 
 - **An NVIDIA GPU** of compute capability 8.0 or newer (RTX 30, 40 or 50 series, or the workstation cards of those
   generations), with a driver for CUDA 13. The model runs on one GPU that nothing else uses: no display, no other
-  program. Up to three more GPUs become further expert tiers, and these may drive the display. The engine was developed
-  on an RTX 3090 (24 GB), with an RTX 5070 Ti and an RTX 5060 Ti (16 GB each) as tiers. A smaller card holds fewer
+  program. Up to three more GPUs become further expert tiers, and these may drive the display. The engine is developed
+  on an RTX 3090 (24 GB), with an RTX 5070 Ti (16 GB) and a second RTX 3090 as tiers. A smaller card holds fewer
   experts and runs slower. Qwen3.6-35B-A3B and Qwen3.8-27B take more GPUs differently: their layers are split over the
   fewest that hold the whole model. Qwen3.8-27B, a dense model, needs ~36 GB of VRAM at its full context (262,144
   tokens, K and V in 8 bits): two GPUs, such as a 24 GB and a 16 GB one.

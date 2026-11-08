@@ -5,8 +5,8 @@ llama.cpp's mainline build 11606 and Strata a0116b27 (engine 0.1.43.1) measured 
 through the API, on fixed text and sampled, start and memory) on 2026-10-18/19 at dbecd594, after a restart with the
 file cache's standby list emptied first, with its configs' draft layer trained on both models' own output, its prompts
 in two stages and UD-Q4_K_XL's experts read past the file cache; its agreement with llama.cpp on 2026-10-18 at
-08877797, whose arithmetic is the same. The RTX 5060 Ti, a third GPU in Lamina's configs since, came after these
-measurements.
+08877797, whose arithmetic is the same. Lamina's configs have since gained a third GPU, which these measurements
+predate: an RTX 5060 Ti in the Gyro-L section's runs, now a second RTX 3090, the one the model runs on.
 
 **In short**, with both GPUs:
 
