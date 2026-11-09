@@ -144,7 +144,16 @@ void PromptCache::stash_live(int64_t keep_upto) {
     int64_t chain = has_end ? 0 : 1;
     for (const Ckpt& c : live_.ckpts) chain += c.pos > keep_upto;
     std::vector<Seq> evicted;
-    if (!parked_.make_room(bytes + (uint64_t) std::min<int64_t>(chain, chain_cap_) * ckpt_bytes_, evicted)) return;
+    const uint64_t incoming = bytes + (uint64_t) std::min<int64_t>(chain, chain_cap_) * ckpt_bytes_;
+    const int64_t spare = ram_spare ? ram_spare() : ConversationCache::kNoRamLimit;
+    if (!parked_.make_room(incoming, evicted, spare)) {
+        if (spare != ConversationCache::kNoRamLimit && incoming <= parked_.budget())
+            std::fprintf(stderr, "lamina serve: prompt cache: a conversation of %lld cells (%.0f MiB) not parked: the "
+                                 "system's available RAM is %.0f MiB %s the reserve\n", (long long) L,
+                         (double) incoming / 1048576.0, (double) (spare < 0 ? -spare : spare) / 1048576.0,
+                         spare < 0 ? "below" : "above");
+        return;
+    }
     for (Seq& s : evicted) {
         std::fprintf(stderr, "lamina serve: prompt cache: a parked conversation of %zu cells evicted\n",
                      s.tokens.size());
@@ -281,6 +290,35 @@ void PromptCache::clear() {
     live_.tokens.clear();
     live_.imgs.clear();
     for (Seq& s : parked_.drain()) release(s, -1);
+}
+
+size_t PromptCache::shed() {
+    if (!ram_spare || (parked_.size() == 0 && free_.empty())) return 0;
+    const int64_t spare = ram_spare();
+    if (spare >= 0 || spare == ConversationCache::kNoRamLimit) return 0;
+    std::vector<Seq> evicted;
+    const size_t n = parked_.shed(spare, evicted);
+    for (Seq& s : evicted) {
+        std::fprintf(stderr, "lamina serve: prompt cache: a parked conversation of %zu cells evicted: the system's "
+                             "available RAM is %.0f MiB below the reserve\n", s.tokens.size(),
+                     (double) -spare / 1048576.0);
+        release(s, -1);
+    }
+    // The evicted chains' buffers went to the free list, which keeps the pinned ones for the next chains: below the
+    // reserve no idle buffer is kept, so the RAM the evictions counted goes back to the system.
+    for (void* h : free_) {
+        const auto o = std::find_if(owned_.begin(), owned_.end(), [&](const auto& b) { return b.first == h; });
+        if (o == owned_.end()) continue;
+        if (o->second) {
+            cudaFreeHost(h);
+            --pinned_;
+        } else {
+            std::free(h);
+        }
+        owned_.erase(o);
+    }
+    free_.clear();
+    return n;
 }
 
 PromptCache::State PromptCache::state() const {

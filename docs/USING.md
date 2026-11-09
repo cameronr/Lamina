@@ -143,7 +143,10 @@ engine's arguments.
   request replaces (a chat app's title request, a subagent) is parked in RAM with its K/V and its checkpoints
   (`--conversation-cache-mib MIB`, default 16384; `--conversation-cache-slots N` caps their number, by default only
   the memory does) so switching back continues where it was. A parked conversation leaves only whole, the least
-  recently used first; `--conversation-cache-min-tokens N` (default 1024) keeps shorter ones out. The Monitor's
+  recently used first; `--conversation-cache-min-tokens N` (default 1024) keeps shorter ones out. They never take
+  the RAM below `--ram-reserve-mib MIB` (default 6144) available to the system, and leave between requests when it
+  runs below it: the expert arena is pinned, so without it a park beside a large arena swaps the rest of the system
+  instead (0: only the budget limits them). The Monitor's
   Conversation cache card shows them. The engine keeps the model's own token ids of each reply for the next turn.
   Responses report the reused tokens
   (`usage.prompt_tokens_details.cached_tokens`; Anthropic: `cache_read_input_tokens`).

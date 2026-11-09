@@ -3,8 +3,8 @@
 // Every conversation owns its checkpoints: the live one and each parked one (a conversation another request replaced,
 // kept in host memory with its K/V cells) hold chains of their own, so no conversation's new checkpoints can take
 // another's.  A chain over its cap gives up the point chain_victim picks; a parked conversation leaves only whole, the
-// least recently used first, when the park's bytes (its K/V copies and its chains) or its slots run out, and never
-// while it lends its start to the live one.
+// least recently used first, when the park's bytes (its K/V copies and its chains) or its slots run out, or the RAM
+// the system can spare above a reserve, and never while it lends its start to the live one.
 //
 // The checkpoint buffers and the K/V copies are opaque here: `PromptCache` allocates and frees them, this header only
 // moves them and counts their bytes, so the policy is testable without a device.
@@ -121,14 +121,18 @@ public:
     }
 
     /// Makes room for a conversation of `incoming` bytes: the least recently used conversation that lends nothing
-    /// leaves whole until it fits and a slot is free.  The evicted ones move to `evicted` (their buffers are the
-    /// caller's to free).  false, with nothing evicted: it would not fit even so (the budget, or only lenders left).
-    bool make_room(uint64_t incoming, std::vector<Seq>& evicted) {
-        if (incoming > budget_) return false;
+    /// leaves whole until it fits and a slot is free.  `spare`: the RAM the park may still take beside what it holds
+    /// (the system's available RAM less the reserve; negative when it is below the reserve, kNoRamLimit: only the
+    /// budget counts), so with it the park holds at most its bytes now plus `spare`: an eviction gives its bytes back
+    /// to the system.  The evicted ones move to `evicted` (their buffers are the caller's to free).  false, with
+    /// nothing evicted: it would not fit even so (the budget, the RAM, or only lenders left).
+    bool make_room(uint64_t incoming, std::vector<Seq>& evicted, int64_t spare = kNoRamLimit) {
+        const uint64_t limit = std::min(budget_, ram_limit(spare));
+        if (incoming > limit) return false;
         std::vector<size_t> victims;   // chosen first: an eviction is only committed once the incoming one fits
         uint64_t held = bytes();
         size_t left = entries_.size();
-        while ((slots_ > 0 && left >= slots_) || held + incoming > budget_) {
+        while ((slots_ > 0 && left >= slots_) || held + incoming > limit) {
             size_t pick = entries_.size();
             for (size_t i = 0; i < entries_.size(); ++i)
                 if (entries_[i].pin < 0 && std::find(victims.begin(), victims.end(), i) == victims.end() &&
@@ -146,6 +150,26 @@ public:
             ++evictions_;
         }
         return true;
+    }
+
+    /// Gives RAM back when the system runs below the reserve (`spare` < 0, as make_room's): the least recently used
+    /// conversations that lend nothing leave whole until their bytes cover the deficit or none is left.  The evicted
+    /// ones move to `evicted`; returns how many.
+    size_t shed(int64_t spare, std::vector<Seq>& evicted) {
+        size_t n = 0;
+        while (spare < 0) {
+            size_t pick = entries_.size();
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (entries_[i].pin < 0 && (pick == entries_.size() || entries_[i].stamp < entries_[pick].stamp))
+                    pick = i;
+            if (pick == entries_.size()) break;
+            spare += (int64_t) bytes(entries_[pick]);
+            evicted.push_back(std::move(entries_[pick]));
+            entries_.erase(entries_.begin() + (ptrdiff_t) pick);
+            ++evictions_;
+            ++n;
+        }
+        return n;
     }
 
     /// Admits `s` (after make_room) as the most recently used.
@@ -166,7 +190,18 @@ public:
     /// The park's use clock: a parked conversation's stamp advances when it is parked and when it lends its start.
     uint64_t tick() { return ++clock_; }
 
+    /// make_room's `spare` when the RAM is not looked at.
+    static constexpr int64_t kNoRamLimit = INT64_MAX;
+
 private:
+    /// The bytes the park may hold with `spare` RAM to take beside them.
+    uint64_t ram_limit(int64_t spare) const {
+        if (spare == kNoRamLimit) return UINT64_MAX;
+        const int64_t held = (int64_t) bytes();
+        if (spare <= -held) return 0;
+        return spare > INT64_MAX - held ? UINT64_MAX : (uint64_t) (held + spare);
+    }
+
     uint64_t budget_;
     size_t slots_;
     int64_t min_tokens_;
