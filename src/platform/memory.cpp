@@ -124,6 +124,13 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
     return ok;
 }
 
+bool available_ram(uint64_t& bytes) {
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    bytes = GlobalMemoryStatusEx(&m) ? (uint64_t) m.ullAvailPhys : 0;
+    return bytes > 0;
+}
+
 bool read_ahead_enabled() { return false; }
 void advise_willneed(const void*, uint64_t) {}
 void advise_willneed(int, uint64_t, uint64_t) {}
@@ -146,6 +153,19 @@ bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, st
     budget = usage = 0;
     why = "DXGI is Windows-only";
     return false;
+}
+
+bool available_ram(uint64_t& bytes) {
+    bytes = 0;
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return false;
+    char line[256];
+    unsigned long long kb = 0;
+    bool found = false;
+    while (!found && std::fgets(line, sizeof line, f)) found = std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1;
+    std::fclose(f);
+    bytes = found ? (uint64_t) kb << 10 : 0;
+    return found;
 }
 
 namespace {

@@ -83,6 +83,11 @@ int main() {
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
+    // the conversation cache's RAM reserve (--ram-reserve-mib) reads this figure
+    uint64_t avail = 0;
+    const bool got = lamina::platform::available_ram(avail);
+    std::printf("available_ram: ok=%d %llu MiB\n", (int) got, (unsigned long long) (avail >> 20));
+    fail |= !got || avail == 0;
 #if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS pmc{};
     GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);

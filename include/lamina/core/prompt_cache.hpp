@@ -45,6 +45,11 @@ public:
     /// The elastic K/V (--kv-grow): called before any copy of `cells` K/V cells to or from the device (a parked
     /// conversation's restore, the live one's park), so the pools can grow to hold them first.  false: no room.
     std::function<bool(int64_t cells)> ensure_kv;
+    /// --ram-reserve-mib: the RAM the parked conversations may still take, the system's available RAM less the
+    /// reserve (negative when it is below it; ConversationCache::kNoRamLimit when it cannot be read).  Unset: only
+    /// the park's budget limits them.  The pinned expert arena is not swappable, so with the park's budget beside it
+    /// over the RAM the rest of the system swaps instead, and while swap is left the OOM killer does not step in.
+    std::function<int64_t()> ram_spare;
     /// Item bf, while a split prompt path runs (prefill/split.hpp): a checkpoint saves the layers below `split_from`
     /// itself and hands its buffer to `split_save`, whose stage writes the rest once that chunk is through it (the
     /// prompt's end waits for that).  0: not split.
@@ -68,6 +73,10 @@ public:
     /// Forgets the live sequence, every checkpoint and every parked conversation (after non-finite logits: whatever
     /// the state holds may be poisoned).
     void clear();
+    /// Between requests: below the RAM reserve (ram_spare), the least recently used parked conversations leave until
+    /// the deficit is covered, and the idle checkpoint buffers (pinned ones too) go back to the system.  Returns how
+    /// many conversations left.
+    size_t shed();
 
     /// The cache's state: the live conversation, the park's contents, its budgets and its evictions (the CACHE line,
     /// which the Monitor shows).

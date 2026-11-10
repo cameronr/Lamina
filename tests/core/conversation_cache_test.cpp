@@ -6,9 +6,13 @@
 //   2. the park's limits: the slots and the byte budget (K/V copies and chains) evict whole conversations, the least
 //      recently used first; no slot limit with 0; a lending conversation is never evicted; nothing is evicted for a
 //      conversation that would not fit anyway; short conversations and a budget of 0 park nothing;
-//   3. reusable(): the live sequence whole, a parked one from its best checkpoint, a changed image clamping the match.
+//   3. reusable(): the live sequence whole, a parked one from its best checkpoint, a changed image clamping the match;
+//   4. the RAM: a conversation parks only into the RAM the system can spare above the reserve, evicting the least
+//      recently used to make that room, and shed() gives back what the park holds once the system runs below it
+//      (a 16 GiB park beside a 101 GiB pinned arena on a 125 GiB PC swapped the system to a halt).
 #include "lamina/core/conversation_cache.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
@@ -112,6 +116,50 @@ int main() {
         pics.imgs = {{2000, 11}};
         check(reusable(pics, prompt(6000), {{2000, 12}}, false) == 1000, "a changed image clamps the match before it");
         check(reusable(pics, prompt(6000), {{2000, 11}}, false) == 4000, "the same image does not");
+    }
+    {   // 4. the RAM
+        std::vector<Seq> evicted;
+        auto two = [] {   // a budget that never binds; the least recently used first: 10,100 then 20,100 bytes
+            ConversationCache c(1u << 30, 0, 0, kCkpt);
+            c.park(conv(1000, {1000}));
+            c.park(conv(2000, {2000}));
+            return c;
+        };
+        ConversationCache open = two();
+        check(open.make_room(50000, evicted) && evicted.empty(), "no RAM limit given: only the budget counts");
+        ConversationCache room = two();
+        check(room.make_room(5000, evicted, 5000) && evicted.empty(), "a conversation the spare RAM holds evicts nothing");
+        ConversationCache tight = two();
+        check(tight.make_room(15000, evicted, 6000) && evicted.size() == 1 && evicted[0].kv_cells == 1000 &&
+                  tight.size() == 1,
+              "one the spare RAM does not hold evicts the least recently used until it does");
+        ConversationCache none = two();
+        evicted.clear();
+        check(!none.make_room(40000, evicted, 5000) && evicted.empty() && none.size() == 2,
+              "nothing is evicted for one the spare RAM would not hold even with the park empty");
+        ConversationCache below = two();
+        evicted.clear();
+        check(below.make_room(5000, evicted, -6000) && evicted.size() == 2 && below.size() == 0,
+              "below the reserve one parks only in place of older ones that cover the deficit as well");
+        ConversationCache short_ram = two();
+        evicted.clear();
+        check(!short_ram.make_room(5000, evicted, -30000) && evicted.empty() && short_ram.size() == 2,
+              "and none parks when the whole park could not cover it");
+        ConversationCache shed = two();
+        check(shed.shed(0, evicted) == 0 && shed.shed(100, evicted) == 0 && evicted.empty() && shed.size() == 2,
+              "at or above the reserve shed() keeps every conversation");
+        check(shed.shed(-5000, evicted) == 1 && evicted.size() == 1 && evicted[0].kv_cells == 1000 &&
+                  shed.size() == 1 && shed.evictions() == 1,
+              "below it the least recently used leave until the deficit is covered");
+        ConversationCache all = two();
+        evicted.clear();
+        check(all.shed(-1000000, evicted) == 2 && evicted.size() == 2 && all.size() == 0 && all.bytes() == 0,
+              "a deficit larger than the park empties it");
+        ConversationCache lend = two();
+        lend.entries()[0].pin = 1000;
+        evicted.clear();
+        check(lend.shed(-1000000, evicted) == 1 && lend.size() == 1 && lend.entries()[0].pin == 1000,
+              "a lending conversation is never shed");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

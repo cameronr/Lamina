@@ -53,6 +53,10 @@ inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read
     return room >= need;
 }
 
+/// The RAM the system can still give without swapping, in `bytes`: MemAvailable on Linux, ullAvailPhys on Windows.
+/// False (and 0) when it cannot be read.
+bool available_ram(uint64_t& bytes);
+
 /// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with LAMINA_READ_AHEAD=0.
 bool read_ahead_enabled();
 /// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  Linux reads at most one
