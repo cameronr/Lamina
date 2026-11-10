@@ -223,6 +223,18 @@ bool cpu_avxvnni_ok() {
     return ok;
 }
 
+bool cpu_mwaitx_ok() {
+    static const bool ok = [] {
+        if (const char* v = std::getenv("LAMINA_NO_MWAITX"); v != nullptr && std::atoi(v) != 0) return false;
+        unsigned r[4];
+        cpuid_regs(0x80000000u, 0, r);
+        if (r[0] < 0x80000001u) return false;
+        cpuid_regs(0x80000001u, 0, r);
+        return ((r[2] >> 29) & 1u) != 0;       // MONITORX; a bit Intel's CPUs leave zero
+    }();
+    return ok;
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
 #if defined(_MSC_VER)

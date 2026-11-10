@@ -64,6 +64,9 @@ bool cpu_gather_fast_here();
 /// LAMINA_FORCE_ISA, and not an older-CPU build (LAMINA_ISA_FLOOR, which stays on its floor and AVX2).
 /// LAMINA_NO_AVXVNNI=1 answers no.
 bool cpu_avxvnni_ok();
+/// Whether this CPU has MONITORX / MWAITX (AMD: CPUID 8000_0001h ECX[29]; user-mode instructions, nothing asked of
+/// the OS): the pool's parked workers wait in them (pool.hpp).  LAMINA_NO_MWAITX=1 answers no.
+bool cpu_mwaitx_ok();
 /// Whether a native pack's layer of this ggml type runs on Lamina's own Q2_0 kernels (q2_rows_any's AVX-512, AVX2 and
 /// AVX rungs).  On a CPU without AVX (an older-CPU build: ggml-cpu compiled for its SSE; LAMINA_FORCE_ISA=sse) a Q2_0
 /// layer takes ggml-cpu's own Q2_0 vec_dot like every other native type: slower, but it runs.

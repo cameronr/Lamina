@@ -2190,8 +2190,9 @@ int lamina::program::run(int argc, char** argv) {
     std::string on;
     for (int i = 0; i < pool.workers() && i < (int) placement.workers().size(); ++i)
         on += (i > 0 ? "," : "") + std::to_string(placement.workers()[(size_t) i]);
-    std::fprintf(stderr, "lamina: %d pool workers on logical processors %s, the host thread on %d%s\n",
-                 pool.workers(), on.c_str(), placement.host(), pool.host_works() ? " (draining too)" : "");
+    std::fprintf(stderr, "lamina: %d pool workers on logical processors %s%s, the host thread on %d%s\n",
+                 pool.workers(), on.c_str(), pool.waits_in_mwaitx() ? " (parked in MWAITX)" : "", placement.host(),
+                 pool.host_works() ? " (draining too)" : "");
 
     mem_mark("the expert cache");
     std::vector<int64_t> produced;

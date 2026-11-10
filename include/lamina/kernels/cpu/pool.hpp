@@ -20,10 +20,19 @@
 // claim a job from the NEXT batch.  Closing is what makes a late worker harmless: one that notices a phase
 // only after the host finished it (it was asleep, or descheduled) finds it closed and waits for the next.
 //
-// IDLE WORKERS SLEEP.  A parked worker spins for `kIdleSpin`, then blocks on the word (`std::atomic::wait`:
-// WaitOnAddress, a futex) until the host opens a phase; the host wakes them only when one sleeps.  Generation
-// opens phases every few hundred microseconds, and a round's longest gap (head, drafts, the first layer) is
-// a few ms, so they sleep only between requests and while a prompt runs on the GPUs.
+// HOW A PARKED WORKER WAITS.  It spins on the word (`_mm_pause`) for `kParkSpinTicks`, which covers a layer's
+// phases, opened microseconds apart.  Past that, where the CPU has MONITORX / MWAITX (AMD: `cpu_mwaitx_ok`), it
+// waits in them for the next store to the word: through a round a worker is parked most of the time (a layer's
+// phases are a fraction of the main GPU's part of it), and the wait costs a Ryzen 7 9700X's package 4-7 W less
+// than the spin at the same speed: a wake takes 0.23 us instead of 0.04-0.10, and the host, which opens the
+// phase, starts on its tasks at once.  MWAITX's timer (`kWaitTicks`) ends a wait whose store was missed (about one
+// in 40,000 under a hypervisor): that worker joins late or not at all, which the protocol above allows.  Other
+// CPUs keep the spin.
+//
+// IDLE WORKERS SLEEP.  After `kIdleSpin` parked, a worker blocks on the word (`std::atomic::wait`: WaitOnAddress,
+// a futex) until the host opens a phase; the host wakes them only when one sleeps.  Generation opens phases every
+// few hundred microseconds, and a round's longest gap (head, drafts, the first layer) is a few ms, so they sleep
+// only between requests and while a prompt runs on the GPUs.
 #pragma once
 
 #include "lamina/kernels/cpu/expert.hpp"
@@ -196,8 +205,15 @@ public:
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;
 
-    /// How long a parked worker spins before it sleeps.
+    /// How long a parked worker waits awake (spinning, then in MWAITX where the CPU has it) before it sleeps.
     static constexpr std::chrono::milliseconds kIdleSpin{50};
+    /// A parked worker's spin before it waits in MWAITX, and MWAITX's timer, in TSC ticks (the instruction's unit):
+    /// 13-33 us and 0.4-1 ms at 2-5 GHz.  Neither needs the TSC's rate: the first only has to outlast a layer's
+    /// phases, the second to end a wait whose store was missed.
+    static constexpr uint64_t kParkSpinTicks = 1ull << 16;
+    static constexpr uint32_t kWaitTicks = 1u << 21;
+    /// Whether parked workers wait in MWAITX (`cpu_mwaitx_ok`).  Reported at startup.
+    bool waits_in_mwaitx() const { return mwaitx_; }
     /// How many times a worker has gone to sleep (each worker counts once per idle stretch).
     uint32_t sleeps() const { return sleeps_.load(std::memory_order_relaxed); }
 
@@ -220,6 +236,7 @@ private:
 
     int n_ = 0;
     bool host_works_ = true;
+    bool mwaitx_ = false;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
     /// The host's own scratch when `host_works_`.  A separate object rather than a share of `scratch_[i]`,

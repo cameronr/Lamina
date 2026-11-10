@@ -96,7 +96,7 @@ struct StressStats {
 void stress_report(const char* what, const StressStats& s, uint32_t sleeps) {
     std::printf("  %-34s %s (%lld of %lld outputs differ, %lld batches; %d long gaps, %u worker sleeps)\n", what,
                 s.differ ? "*** NO ***" : "identical to serial", s.differ, s.outputs, s.batches, s.long_gaps, sleeps);
-    std::printf("  %-34s %.3f ms while the workers spin, %.3f ms right after they slept (median)\n",
+    std::printf("  %-34s %.3f ms while the workers wait awake, %.3f ms right after they slept (median)\n",
                 "  a one-expert batch", median(s.ms_spinning), median(s.ms_after_sleep));
 }
 
@@ -223,7 +223,8 @@ StressStats stress_native(cpu::ExpertPool& pool, std::mt19937& rng, int iters, g
 int stress(int iters) {
     std::mt19937 rng(20260927);
     cpu::ExpertPool pool;
-    std::printf("  %-34s %d + the host thread; they sleep after %lld ms without work\n", "workers", pool.workers(),
+    std::printf("  %-34s %d + the host thread; parked they %s, and sleep after %lld ms without work\n", "workers",
+                pool.workers(), pool.waits_in_mwaitx() ? "spin, then wait in MWAITX" : "spin",
                 (long long) cpu::ExpertPool::kIdleSpin.count());
     int bad = 0;
     if (cpu::cpu_features().usable()) {

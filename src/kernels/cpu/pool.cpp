@@ -6,6 +6,11 @@
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 #include <cstdio>
 
@@ -203,6 +208,23 @@ GROUP_AFFINITY group_affinity(int core) {
 }
 #endif
 
+// MONITORX arms a monitor on `word`'s cache line; MWAITX then waits, in C1, until a store to that line, an interrupt
+// or `ticks` of the TSC (ECX bit 1: EBX is a timer).  Only where cpu_mwaitx_ok().
+inline void monitorx(const void* word) {
+#if defined(_MSC_VER)
+    _mm_monitorx(word, 0, 0);
+#else
+    __asm__ volatile(".byte 0x0f, 0x01, 0xfa" : : "a"(word), "c"(0u), "d"(0u));
+#endif
+}
+inline void mwaitx(uint32_t ticks) {
+#if defined(_MSC_VER)
+    _mm_mwaitx(2, 0, ticks);
+#else
+    __asm__ volatile(".byte 0x0f, 0x01, 0xfb" : : "a"(0u), "b"(ticks), "c"(2u));
+#endif
+}
+
 void pin_this_thread(int core) {
     if (core < 0) return;
 #if defined(_WIN32)
@@ -257,7 +279,8 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 #endif
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, std::vector<int> cores) : host_works_(host_works) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, std::vector<int> cores)
+    : host_works_(host_works), mwaitx_(cpu_mwaitx_ok()) {
     if (cores.empty()) cores = CorePlacement(false).workers();
     n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
@@ -301,10 +324,12 @@ void ExpertPool::worker(int id) {
     uint32_t seen = 0;   // the last epoch this worker joined
     for (;;) {
         // Park: wait for an open phase this worker has not joined.  `_mm_pause` rather than a bare spin because
-        // it yields the pipeline to the sibling hyperthread.  The loop writes nothing shared (see the note on
-        // the atomics in pool.hpp) until it joins, or goes to sleep after `kIdleSpin` without work.
+        // it yields the pipeline to the sibling hyperthread; past `kParkSpinTicks`, MWAITX where the CPU has it
+        // (pool.hpp).  The loop writes nothing shared (see the note on the atomics in pool.hpp) until it joins, or
+        // goes to sleep after `kIdleSpin` without work.
         uint64_t s = state_.load(std::memory_order_acquire);
         auto idle_from = std::chrono::steady_clock::now();
+        const uint64_t parked_at = mwaitx_ ? __rdtsc() : 0;
         for (uint32_t spins = 1;; ++spins) {
             if (stop_.load(std::memory_order_relaxed)) return;
             if (!(s & kClosed) && (uint32_t) (s >> 32) != seen) {
@@ -312,8 +337,17 @@ void ExpertPool::worker(int id) {
                 if (state_.compare_exchange_weak(s, s - 1, std::memory_order_acq_rel, std::memory_order_acquire)) break;
                 continue;
             }
-            _mm_pause();
-            if (spins % 1024 == 0 && std::chrono::steady_clock::now() - idle_from > kIdleSpin) {
+            bool waited = false;
+            if (mwaitx_ && __rdtsc() - parked_at > kParkSpinTicks) {
+                // a store between the read of `s` and the monitor's arming would be waited out: read again
+                monitorx(&state_);
+                if (state_.load(std::memory_order_acquire) == s) mwaitx(kWaitTicks);
+                waited = true;
+            } else {
+                _mm_pause();
+            }
+            // a wait returns at a store or at its timer, far apart when idle: the clock is read after each
+            if ((waited || spins % 1024 == 0) && std::chrono::steady_clock::now() - idle_from > kIdleSpin) {
                 // seq_cst, against open_phase's store then load: the host sees this sleeper or this worker's
                 // wait sees the new epoch
                 sleepers_.fetch_add(1, std::memory_order_seq_cst);
