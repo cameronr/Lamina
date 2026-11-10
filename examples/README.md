@@ -16,7 +16,7 @@ engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's keys: 
 
 ## The development PC's own options
 
-The development PC's configs name their GPUs (`--main-gpu GPU-bcfe84b3 --second-gpu "RTX 5070 Ti,GPU-f26e9ba6"`, its
+The development PC's configs name their GPUs (`--main-gpu GPU-75af3083 --second-gpu "RTX 5070 Ti,GPU-f26e9ba6"`, its
 two RTX 3090s by their UUIDs' starts, where the examples take every other GPU with `auto`), and its Flash-Next configs add three options measured for its hardware, which the examples
 leave out. Each pays only where a PC has the same trait: measure it through the server before keeping it. Its
 Qwen3.8-27B config puts the RTX 5070 Ti first (`--main-gpu`, which setup sets to a PC's own choice): that card reads
