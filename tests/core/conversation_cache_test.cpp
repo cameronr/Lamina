@@ -9,7 +9,8 @@
 //   3. reusable(): the live sequence whole, a parked one from its best checkpoint, a changed image clamping the match;
 //   4. the RAM: a conversation parks only into the RAM the system can spare above the reserve, evicting the least
 //      recently used to make that room, and shed() gives back what the park holds once the system runs below it
-//      (a 16 GiB park beside a 101 GiB pinned arena on a 125 GiB PC swapped the system to a halt).
+//      (a 16 GiB park beside a 101 GiB pinned arena on a 125 GiB PC swapped the system to a halt); ram_bound(),
+//      whether the RAM or the budget limits the park.
 #include "lamina/core/conversation_cache.hpp"
 
 #include <cstdint>
@@ -160,6 +161,11 @@ int main() {
         evicted.clear();
         check(lend.shed(-1000000, evicted) == 1 && lend.size() == 1 && lend.entries()[0].pin == 1000,
               "a lending conversation is never shed");
+        ConversationCache bound(40000, 0, 0, kCkpt);   // 30,200 bytes held
+        bound.park(conv(1000, {1000}));
+        bound.park(conv(2000, {2000}));
+        check(!bound.ram_bound(ConversationCache::kNoRamLimit) && bound.ram_bound(5000) && !bound.ram_bound(9800),
+              "the RAM holds the park below its budget only where held + spare is less (a refusal is logged then)");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

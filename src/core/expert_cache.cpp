@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "lamina/core/expert_cache.hpp"
+#include "lamina/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
@@ -35,27 +36,20 @@ size_t device_free_bytes() {
             unified_memory = c == 1;
         }
     }
-    if (unified_memory) {
-        if (FILE* m = std::fopen("/proc/meminfo", "r")) {
-            char line[256];
-            unsigned long long kb = 0;
-            while (std::fgets(line, sizeof line, m))
-                if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
-            std::fclose(m);
-            // LAMINA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
-            static const long gib = [] {
-                const char* h = std::getenv("LAMINA_UMA_HEADROOM_GIB");
-                if (h == nullptr) return 6L;
-                char* end = nullptr;
-                const long v = std::strtol(h, &end, 10);
-                if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
-                std::fprintf(stderr, "lamina: LAMINA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
-                return 6L;
-            }();
-            const unsigned long long head = (unsigned long long) gib << 30;
-            const unsigned long long avail = kb << 10;
-            if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
-        }
+    uint64_t avail = 0;
+    if (unified_memory && lamina::platform::available_ram(avail)) {
+        // LAMINA_UMA_HEADROOM_GIB: a whole number of GiB, 0..1024; anything else keeps the default 6 (said once)
+        static const long gib = [] {
+            const char* h = std::getenv("LAMINA_UMA_HEADROOM_GIB");
+            if (h == nullptr) return 6L;
+            char* end = nullptr;
+            const long v = std::strtol(h, &end, 10);
+            if (end != h && *end == '\0' && v >= 0 && v <= 1024) return v;
+            std::fprintf(stderr, "lamina: LAMINA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): using 6\n", h);
+            return 6L;
+        }();
+        const uint64_t head = (uint64_t) gib << 30;
+        if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
     }
 #endif
     return free_b;

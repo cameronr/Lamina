@@ -192,6 +192,8 @@ public:
 
     /// make_room's `spare` when the RAM is not looked at.
     static constexpr int64_t kNoRamLimit = INT64_MAX;
+    /// Whether, with `spare` (as make_room's), the RAM holds the park below its budget.
+    bool ram_bound(int64_t spare) const { return ram_limit(spare) < budget_; }
 
 private:
     /// The bytes the park may hold with `spare` RAM to take beside them.

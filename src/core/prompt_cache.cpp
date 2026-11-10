@@ -147,7 +147,9 @@ void PromptCache::stash_live(int64_t keep_upto) {
     const uint64_t incoming = bytes + (uint64_t) std::min<int64_t>(chain, chain_cap_) * ckpt_bytes_;
     const int64_t spare = ram_spare ? ram_spare() : ConversationCache::kNoRamLimit;
     if (!parked_.make_room(incoming, evicted, spare)) {
-        if (spare != ConversationCache::kNoRamLimit && incoming <= parked_.budget())
+        // logged when the RAM's limit is the lower one: the budget, or a conversation that lends its start, also
+        // turn one away (as before the reserve, silently)
+        if (incoming <= parked_.budget() && parked_.ram_bound(spare))
             std::fprintf(stderr, "lamina serve: prompt cache: a conversation of %lld cells (%.0f MiB) not parked: the "
                                  "system's available RAM is %.0f MiB %s the reserve\n", (long long) L,
                          (double) incoming / 1048576.0, (double) (spare < 0 ? -spare : spare) / 1048576.0,
