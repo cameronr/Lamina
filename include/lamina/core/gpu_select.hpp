@@ -31,8 +31,9 @@ std::vector<GpuInfo> list_gpus();
 int find_gpu(const std::vector<GpuInfo>& gpus, const std::string& spec, std::string& why);
 
 /// A tier's GPU as a short probe saw it: the pinned host-to-device rate of 64 MiB copies (GB/s, the best of five
-/// after the link is woken), and whether the desktop or another graphics program uses it (NVML: a display active or a
-/// process's graphics context; unknown when NVML is not there: true, the larger reserve).
+/// after the link is woken, and of five more for as long as those were faster), and whether the desktop or another
+/// graphics program uses it (NVML: a display active or a process's graphics context; unknown when NVML is not there:
+/// true, the larger reserve).
 struct GpuProbe {
     double h2d_gbps = 0;
     bool display = true;

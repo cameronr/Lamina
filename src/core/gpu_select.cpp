@@ -241,18 +241,26 @@ std::vector<GpuProbe> probe_gpus(const std::vector<int>& devices, int main_devic
     }
     for (Dev& x : d)
         if (x.ok) cudaStreamSynchronize(x.s);
-    // then each link alone: the best of five copies
+    // then each link alone: the best of five copies, and of five more while those were still faster.  A link can
+    // report its full generation before it copies at it: about one start in fifty the 5070 Ti's first five read 7.3
+    // GB/s here (54 in the others), which left its prefetch off and, with "auto", would put it behind a 3090.
     for (size_t i = 0; i < n; ++i) {
         Dev& x = d[i];
-        for (int r = 0; x.ok && r < 5; ++r) {
-            float ms = 0;
-            cudaSetDevice(devices[i]);
-            cudaEventRecord(x.a, x.s);
-            cudaMemcpyAsync(x.buf, host, kBytes, cudaMemcpyHostToDevice, x.s);
-            cudaEventRecord(x.b, x.s);
-            if (cudaEventSynchronize(x.b) == cudaSuccess && cudaEventElapsedTime(&ms, x.a, x.b) == cudaSuccess &&
-                ms > 0)
-                out[i].h2d_gbps = std::max(out[i].h2d_gbps, (double) kBytes / (double) ms / 1e6);
+        for (int fives = 0; x.ok && fives < 40; ++fives) {
+            double best = 0;
+            for (int r = 0; r < 5; ++r) {
+                float ms = 0;
+                cudaSetDevice(devices[i]);
+                cudaEventRecord(x.a, x.s);
+                cudaMemcpyAsync(x.buf, host, kBytes, cudaMemcpyHostToDevice, x.s);
+                cudaEventRecord(x.b, x.s);
+                if (cudaEventSynchronize(x.b) == cudaSuccess && cudaEventElapsedTime(&ms, x.a, x.b) == cudaSuccess &&
+                    ms > 0)
+                    best = std::max(best, (double) kBytes / (double) ms / 1e6);
+            }
+            const bool faster = best > 1.05 * out[i].h2d_gbps;
+            out[i].h2d_gbps = std::max(out[i].h2d_gbps, best);
+            if (!faster) break;
         }
         cudaSetDevice(devices[i]);
         for (cudaEvent_t e : {x.a, x.b, x.done[0], x.done[1]})
