@@ -32,27 +32,6 @@ void unlock_resident(void* p, uint64_t bytes);
 /// `why` says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
-/// #357/#577: whether the OS file cache could keep the `read_bytes` the expert files are read for, beside
-/// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`
-/// bytes of RAM available.  The file tier passes only the expert bytes it really reads from the files (the experts
-/// outside its resident RAM copy) and the RAM that copy really holds - not every shard's bytes and the requested
-/// budget, which on a 96 GB PC (#577) made the file tier read unbuffered when the cache could keep its reads.
-/// #1194: the file tier's reads are a skewed set (the GPU cache and the RAM copy took the hottest experts; the same
-/// few of the rest come back token after token), so the cache does not have to hold all `read_bytes` to serve most of
-/// them.  With `hot_fraction` < 1 it is enough that the room holds that share of them, but never less than
-/// `floor_bytes` (below it the cache holds nothing worth having) and never more than every read.  The defaults ask for
-/// every byte, as the Windows rule does.  Measured on Linux (#1194, a Tesla P100 box under 20 to 32 GB cgroups): through
-/// the cache beat the unbuffered reads at every room tried, down to 7% of the read bytes (decode +7% to +118%, a third to
-/// a sixth of the drive traffic).
-inline bool file_cache_keeps(uint64_t avail, uint64_t arena_bytes, uint64_t read_bytes,
-                             uint64_t margin = 4ull << 30, double hot_fraction = 1.0, uint64_t floor_bytes = 0) {
-    const uint64_t room = avail > arena_bytes + margin ? avail - arena_bytes - margin : 0;
-    uint64_t need = (uint64_t) ((double) read_bytes * hot_fraction);
-    if (need < floor_bytes) need = floor_bytes;
-    if (need > read_bytes) need = read_bytes;
-    return room >= need;
-}
-
 /// The RAM the system can still give without swapping, in `bytes`: MemAvailable on Linux, ullAvailPhys on Windows.
 /// False (and 0) when it cannot be read.
 bool available_ram(uint64_t& bytes);
