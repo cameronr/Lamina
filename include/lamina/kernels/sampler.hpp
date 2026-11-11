@@ -10,7 +10,32 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(__CUDACC__)
+#define LAMINA_SAMPLER_HD __host__ __device__ __forceinline__
+#else
+#define LAMINA_SAMPLER_HD inline
+#endif
+
 namespace lamina::kernels {
+
+/// The uniform number of draw `counter` under `seed`, in [0, 1): Philox 4x32-10 over (counter, seed), the upper 24
+/// bits of its first word (so the value never rounds to 1).  Counter-based: a draw is a function of (seed, position)
+/// and not of how many came before, so a batch samples in any order, a run repeats, and the host can read the number
+/// a position will be drawn with before its window runs (core/draft_pass.hpp).  One definition for the kernels and
+/// the host: integer arithmetic and an exact conversion, the same bits on both.
+LAMINA_SAMPLER_HD float philox_uniform(uint64_t seed, uint64_t counter) {
+    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
+    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
+    for (uint32_t i = 0; i < 10; ++i) {   // round i's key is (i, 0)
+        const uint64_t m0 = (uint64_t) 0x9E3779B9u * c0, m1 = (uint64_t) 0xBB67AE85u * c2;
+        const uint32_t n0 = (uint32_t) (m1 >> 32) ^ c1 ^ i, n2 = (uint32_t) (m0 >> 32) ^ c3;
+        c1 = (uint32_t) m1;
+        c3 = (uint32_t) m0;
+        c0 = n0;
+        c2 = n2;
+    }
+    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
+}
 
 struct SamplerParams {
     int top_k = 20;              // sampled path: 1..64 as given; 0 (off) or more than 64 keep the widest list, 64

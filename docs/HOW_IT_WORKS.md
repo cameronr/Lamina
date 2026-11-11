@@ -83,6 +83,13 @@ takes far less time than as many passes over one: the weights are read once for 
   vocabulary (it never drafts the others), scored through a 2-bit copy and the best ones again exactly. Its dense part
   was trained further on this engine's own output, so its drafts are right more often
   ([eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP)).
+- **A sampled request's drafts**: a position's token is drawn with a number that follows from the seed and the
+  position alone, so the engine knows the number a draft will meet. The draft is still the layer's likeliest token,
+  which passes when the model's likeliest token is the same and the number falls inside its share of the
+  distribution; from the draft's probability, the number and the temperature the engine reckons that chance
+  (`include/lamina/core/draft_pass.hpp`) and keeps the draft when it is at least what a draft at the floor has under
+  an average number. A draft whose number has already lost it takes no place in the window, one a little under the
+  floor stays when its number is small, and a greedy request keeps the plain floor.
 - **Prompt lookup**: where the last 16 tokens of the text occurred before (`--spec-lookup 16`), up to 7 of the tokens
   that followed them there take the drafts' place. An answer that quotes its prompt, such as a file returned with an
   edit, then passes about 7.5 tokens a step.

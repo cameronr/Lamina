@@ -2,6 +2,7 @@
 #include "lamina/core/mtp.hpp"
 
 #include "lamina/core/cuda_host.hpp"
+#include "lamina/core/draft_pass.hpp"
 #include "lamina/core/native_head.hpp"
 #include "lamina/kernels/bf16_gemv.hpp"
 #include "lamina/kernels/draft_proxy.hpp"
@@ -600,8 +601,23 @@ uint64_t MtpDrafter::tensor_bytes(const void* p) const {
     return 0;
 }
 
+void MtpDrafter::set_sampling(const lamina::kernels::SamplerParams& sp) {
+    static const bool on = [] {
+        const char* e = std::getenv("LAMINA_DRAFT_PASS");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    const bool penalties = sp.penalty_last_n > 0 &&
+                           (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
+    // a temperature the sampler takes for greedy (sample_tokens) draws nothing; penalties move the verifier's
+    // logits where the draft layer's stay
+    pass_ = on && !sp.greedy && sp.temperature >= 1e-30f && !penalties && sp.logit_bias == nullptr;
+    pass_seed_ = sp.seed;
+    pass_temperature_ = sp.temperature;
+    pass_min_p_ = -1.0f;   // the floors follow the temperature
+}
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, float min_p, int* n_drafts, int* n_kept) {
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     // the accepted rows' K/V and row a's layer: no read reaches a cell past the one being drafted, and the chain or the
     // next round writes the rejected rows' cells first
@@ -628,16 +644,32 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    // Whether draft j, of probability q under the layer, is kept.  A sampled request's draft is judged by its chance
+    // to pass: chain step j drafts the token after cell p + a + j's, which its verify row draws with counter
+    // p + a + j + 1 (row t of a window at pos0 draws Philox(seed, pos0 + t): Verifier::set_sampling).
+    if (pass_ && pass_min_p_ != min_p) {
+        for (int j = 0; j < 3; ++j) pass_floor_[j] = draft_pass_floor(j, min_p, pass_temperature_);
+        pass_min_p_ = min_p;
+    }
+    const auto keeps = [&](int j, float q) {
+        if (probs) probs[j] = q;
+        if (!pass_) {
+            chances_[j] = q;
+            return q >= min_p;
+        }
+        const float u = lamina::kernels::philox_uniform(pass_seed_, (uint64_t) (p + a + j + 1));
+        chances_[j] = draft_pass_chance(j, q, u, pass_temperature_);
+        return chances_[j] >= pass_floor_[std::min(j, 2)];
+    };
     drafts[0] = ((volatile int32_t*) h_out_)[0];
-    float pj = ((volatile float*) h_prob_)[0];
-    if (probs) probs[0] = pj;
-    if (on_draft) on_draft(0, drafts[0], pj);
-    int n = 1;
-    // the chain continues while the last draft is likely enough to be verified; draft j's K/V goes to cell p + a + j,
-    // so near the context's end it stops at the last cell
+    bool kept = keeps(0, ((volatile float*) h_prob_)[0]);
+    if (on_draft) on_draft(0, drafts[0], kept);
+    int n = 1, nk = kept ? 1 : 0;
+    // the chain goes on past a kept draft; draft j's K/V goes to cell p + a + j, so near the context's end it stops
+    // at the last cell
     const int chain = (int) std::min<int64_t>(max_drafts_ > 0 ? std::min(max_drafts_, max_t_ - 1) : max_t_ - 1,
                                               st_.max_cells - (p + a));
-    for (int j = 1; j < chain && pj >= min_p; ++j) {
+    for (int j = 1; j < chain && kept; ++j) {
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -646,26 +678,27 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             return false;
         }
         drafts[j] = ((volatile int32_t*) h_out_)[j];
-        pj = ((volatile float*) h_prob_)[j];
-        if (probs) probs[j] = pj;
-        if (on_draft) on_draft(j, drafts[j], pj);
+        kept = keeps(j, ((volatile float*) h_prob_)[j]);
+        if (on_draft) on_draft(j, drafts[j], kept);
         ++n;
+        nk += kept ? 1 : 0;
     }
-    for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
+    for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; chances_[j] = 0.0f; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (n_kept) *n_kept = nk;
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
 }
 
 bool MtpDrafter::draft_first(const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                             float* probs, float min_p, int* n_drafts) {
+                             float* probs, float min_p, int* n_drafts, int* n_kept) {
     if (cudaMemcpy((void*) window_R_, R_row, (size_t) (g_->hc * g_->n_embd) * sizeof(float), cudaMemcpyDeviceToDevice) !=
         cudaSuccess) {
         err = "mtp: staging the first residual failed";
         return false;
     }
-    return draft(1, &token, cell, 0, drafts, err, probs, min_p, n_drafts);
+    return draft(1, &token, cell, 0, drafts, err, probs, min_p, n_drafts, n_kept);
 }
 
 }  // namespace lamina::core

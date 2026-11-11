@@ -116,7 +116,7 @@ The example configs' options, and the ones that pay on some PCs. `build/lamina -
 | `--max-context N` | the context the K/V is sized for (the examples: 262,144, the trained context) |
 | `--kv-grow` | the K/V takes VRAM only for the cells the requests reach; the expert cache holds the rest and gives it back as a conversation grows |
 | `--kv fp16\|int8\|k8v4\|q4_0` | the K/V's format: 8-bit (`int8`), 8-bit keys and 4-bit values (`k8v4`), 4-bit both; smaller formats leave more VRAM to experts, at a cost in precision |
-| `--spec T`, `--spec-min-p P`, `--spec-lookup N` | verify windows of up to T tokens (the last one and T-1 drafts), a draft kept while its probability under the draft layer stays above P, and drafts from earlier text that repeats (16 tokens of it) |
+| `--spec T`, `--spec-min-p P`, `--spec-lookup N` | verify windows of up to T tokens (the last one and T-1 drafts), a draft kept while its probability under the draft layer stays above P (a sampled request's by the number its position is drawn with: [HOW_IT_WORKS.md](HOW_IT_WORKS.md#drafts)), and drafts from earlier text that repeats (16 tokens of it) |
 | `--prefill N` | the prompt chunk (the examples: 16,384 tokens) |
 | `--feed-max N` | prompt parts of up to N tokens go through verify windows instead of the prompt path |
 | `--hc-q8` | the hyper-connection projections in 8 bits only: half their VRAM, read ~30% faster |

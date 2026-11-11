@@ -125,9 +125,9 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
     return bad;
 }
 
-// The Philox draw, host side - a transcription of the kernel's `philox_uniform` so the SAMPLED pick (not
-// just the greedy argmax) can be pinned against a reference.  `__umulhi(a, b)` is the high half of a 32x32
-// multiply, spelled `(uint32_t)(((uint64_t) a * b) >> 32)` here.
+// The Philox draw, host side - this file's own writing of it, round by round, so the SAMPLED pick (not just the
+// greedy argmax) is pinned against a reference that is not the header's `philox_uniform` (which the kernels and the
+// host share; `main` checks the two against each other).
 struct PhiloxRound {
     uint32_t& c0; uint32_t& c1; uint32_t& c2; uint32_t& c3;
     void step(uint32_t k0, uint32_t k1) const {
@@ -447,6 +447,20 @@ int main(int argc, char** argv) {
     }
     int bad = 0;
     const int NV = 512, NT = 4;
+
+    // The header's philox_uniform, which the kernels draw with and the draft layer reads on the host
+    // (core/draft_pass.hpp), against this file's transcription of it: the sampled fixtures below then pin the
+    // kernels' draws to both.
+    {
+        int wrong = 0;
+        for (uint64_t i = 0; i < 200000; ++i) {
+            const uint64_t seed = i * 0x9E3779B97F4A7C15ull + 12345u, counter = i * 2654435761u + (i << 33);
+            wrong += lamina::kernels::philox_uniform(seed, counter) != host_philox_uniform(seed, counter);
+        }
+        std::printf("  %-34s %s (%d of 200000 differ)\n", "philox_uniform on the host", wrong ? "*** WRONG ***" : "matches",
+                    wrong);
+        bad += wrong;
+    }
 
     // Request bias affects every target row, including greedy; omission leaves logits and the default pick intact.
     // Compare against an independently pre-biased input through each ctest sampler implementation.

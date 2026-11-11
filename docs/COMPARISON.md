@@ -202,6 +202,13 @@ its speed as it is. The sampled runs spread about as widely as the greedy ones.
 | Edit, the prompt's file returned, sampled | 31.2 (29.6-31.6; 0.99x) | 306.8 (305.7-307.0; 0.98x) | 7.54 | 25.2 (25.2-25.5; 1.00x) | 189.8 (188.0-192.2; 1.00x) | 7.54 |
 <!-- /matrix:sampled -->
 
+Since these runs a sampled request keeps its drafts by the number each position is drawn with
+([HOW_IT_WORKS.md](HOW_IT_WORKS.md#drafts)): on sampled fixed text (the same tokens with and without the rule, on
+the three GPUs, 2026-11-11) IQ3_S thinks 1.3-1.8% faster with it and UD-Q4_K_XL 1.4-1.6%, 0.2-1.6% after 64K tokens
+of context, and code and the edit run as fast. The table's requests on the three GPUs with it: IQ3_S thinking 164.9
+t/s greedy and 144.7 sampled (135.8-155.5 over the five seeds; 2.30 and 1.96 tokens a pass), UD-Q4_K_XL 129.6 and
+122.9 (118.7-125.4; 2.14 and 2.04).
+
 ## Generation on fixed text (Lamina)
 
 Each run emits the model's reference text (`--spec-follow`), so runs and builds compare on the same tokens and

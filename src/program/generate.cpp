@@ -156,9 +156,13 @@ struct Options {
     bool no_prompt_offload = false;
     /// verify windows of up to this many tokens: the last emitted one and spec - 1 drafts
     int spec = 0;
-    /// Benchmarks: the run emits this continuation (token ids) instead of the window's argmax, and a draft is
+    /// Benchmarks: the run emits this continuation (token ids) instead of the window's pick, and a draft is
     /// accepted when it matches it, so runs with different speculation settings process the same text.
     std::string spec_follow;
+    /// Generate mode's sampling, as a --serve request's keys (temperature 0: greedy; seed 0: from the clock).
+    double temperature = 0.0, top_p = 1.0, min_p = 0.0;
+    int top_k = 20;
+    unsigned long long seed = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
@@ -219,7 +223,9 @@ struct Options {
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
-    /// this probability under the draft layer; 0 = always --spec-1 drafts.
+    /// this probability under the draft layer; 0 = always --spec-1 drafts.  A sampled request judges each draft by
+    /// its chance to pass under the number its position draws with, against the chance a draft of this probability
+    /// has under an average number (core/draft_pass.hpp).
     double spec_min_p = 0.0;
     /// Prompt lookup: when the text's last N+ tokens occurred before and the tokens after that occurrence are more
     /// drafts than --spec gives the draft layer, the next window verifies up to kVerifyMaxT - 1 of them instead;
@@ -349,7 +355,12 @@ void usage() {
                  "                       turn checkpoint (a trailing reasoning-effort turn; default -1 = off)\n"
                  "  --spec T             verify windows of up to T tokens: the last one and T-1 MTP drafts (2..8)\n"
                  "  --spec-min-p P       a draft enters the window only while it and the drafts before it have at\n"
-                 "                       least probability P under the draft layer (default 0: always T-1 drafts)\n"
+                 "                       least probability P under the draft layer (default 0: always T-1 drafts);\n"
+                 "                       a sampled request's draft, by the number its position draws with, at least\n"
+                 "                       the chance to pass that a draft of probability P has on average\n"
+                 "  --temperature F      generate mode: sample at this temperature (default 0: greedy), with\n"
+                 "                       --top-p F (1), --top-k N (20), --min-p F (0) and --seed N (0: the clock);\n"
+                 "                       --serve takes each request's\n"
                  "  --spec-lookup N      when the text's last N+ tokens occurred before, the next window verifies\n"
                  "                       up to 7 of the tokens that followed there instead, if they are more than\n"
                  "                       --spec allows the draft layer (windows of up to 8 tokens; 0 = off)\n"
@@ -880,7 +891,8 @@ static std::vector<std::array<int32_t, 3>> refill_plan(const SlotLoan& loan, con
 /// .r16 every position's final residual row (hc * n_embd FP16, the prompt's from the batched path), in order; .meta a
 /// record a position (position, token, the next token or -1 for the prompt's, and from a verify window the 64
 /// likeliest next tokens: ids, then log-probabilities); .rounds a record a window (its first position, T, the drafts
-/// accepted, the next window's first three drafts and their probabilities under the draft layer).
+/// accepted, the next window's first three drafts, their probabilities under the draft layer, what they were kept by,
+/// which in a sampled request is their chance to pass, and how many were kept).
 struct DraftDump {
     static constexpr int TOP = 64;
     std::string dir;
@@ -937,11 +949,16 @@ struct DraftDump {
         std::fwrite(ids, 4, TOP, meta);
         std::fwrite(lp, 4, TOP, meta);
     }
-    void put_round(int32_t p, int32_t T, int32_t a, const int32_t* d, const float* dp) {
+    /// A round: its window, and the three drafts made after it with their probabilities under the draft layer, what
+    /// they were kept by (a sampled request's chances to pass, else the probabilities again) and how many were kept.
+    void put_round(int32_t p, int32_t T, int32_t a, const int32_t* d, const float* dp, const float* chance,
+                   int32_t kept) {
         const int32_t h[3] = {p, T, a};
         std::fwrite(h, 4, 3, rounds);
         std::fwrite(d, 4, 3, rounds);
         std::fwrite(dp, 4, 3, rounds);
+        std::fwrite(chance, 4, 3, rounds);
+        std::fwrite(&kept, 4, 1, rounds);
     }
 };
 
@@ -1237,6 +1254,11 @@ int lamina::program::run(int argc, char** argv) {
         else if (a == "--no-prompt-offload") o.no_prompt_offload = true;
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
+        else if (a == "--temperature") o.temperature = std::atof(next("--temperature"));
+        else if (a == "--top-p") o.top_p = std::atof(next("--top-p"));
+        else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
+        else if (a == "--min-p") o.min_p = std::atof(next("--min-p"));
+        else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--main-gpu") o.main_gpu_name = next("--main-gpu");
@@ -3553,6 +3575,7 @@ int lamina::program::run(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             ver.set_sampling(req_sp);
+            mtp.set_sampling(req_sp);   // a sampled request's drafts are kept by their chance to pass
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             req_tiers = tier_counters();
@@ -3583,6 +3606,7 @@ int lamina::program::run(int argc, char** argv) {
             mtp.set_prompt_len(n);
             std::vector<int32_t> drafts((size_t) W, 0), window((size_t) W), outv((size_t) W);
             std::vector<float> dprob((size_t) W, 0.0f);
+            int kept = 0;   // the drafts the last round kept: the next window's
             // ---- the rest of the prompt, [reuse, n - 1).  A turn usually shares everything before its prompt's
             // last <|im_start|> with the next one (chat templates re-render the answer, e.g. without its
             // reasoning), so that position gets a checkpoint, and so do the prompt's end (a regenerated answer)
@@ -3817,18 +3841,14 @@ int lamina::program::run(int argc, char** argv) {
                 for (int64_t i = 0; i < n; ++i) ids32[(size_t) i] = (int32_t) ids[(size_t) i];
                 lookup.assign(ids32.data(), ids32.size());
             }
-            mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
-                if (lk == 0 && prob >= (float) req_spec_min_p) ver.ple_ahead(j + 1, tok);
+            mtp.on_draft = [&](int j, int32_t tok, bool keeps) {   // the drafts the next window will verify
+                if (lk == 0 && keeps) ver.ple_ahead(j + 1, tok);
             };
             ver.set_logits_wanted(!req_score.empty() || ddump.on());   // score=: a split head's first row whole
             std::vector<float> dd_logits(ddump.on() ? (size_t) W * (size_t) n_vocab : 0);
             while (poison_at < 0 && produced_n < max_new) {
                 if (stop_req.load()) { finish = "cancel"; break; }   // the client went away
-                int T = S;
-                if (req_spec_min_p > 0.0) {
-                    T = 1;
-                    while (T < S && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
-                }
+                int T = 1 + kept;
                 if (lk > 0) T = 1 + lk;
                 if (first_window) T = (int) (n - merge_from);   // the prompt's last tokens (1: its last alone)
                 const std::vector<int32_t>& dr = lk > 0 ? ldrafts : drafts;
@@ -3929,7 +3949,8 @@ int lamina::program::run(int argc, char** argv) {
                 if (fw)   // the draft layer catches up on the prompt tokens: each position's next token is the prompt's
                     for (int i = 0; i < T - 1; ++i) outv[(size_t) i] = (int32_t) ids[(size_t) (merge_from + i + 1)];
                 const bool drafted = (eos || produced_n >= max_new ||
-                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p)) &&
+                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                                (float) req_spec_min_p, nullptr, &kept)) &&
                                      ver.wait_commit(err);
                 if (!drive.join_adapt()) {
                     report("an adaptive refill failed");
@@ -3946,9 +3967,11 @@ int lamina::program::run(int argc, char** argv) {
                         ddump.put_meta((int32_t) (p + i), window[(size_t) i], outv[(size_t) i],
                                        dd_logits.data() + (size_t) i * (size_t) n_vocab, n_vocab);
                     const bool none = eos || produced_n >= max_new;
+                    const float* ch = mtp.chances();
                     const int32_t d3[3] = {none ? -1 : drafts[0], none || W < 3 ? -1 : drafts[1], none || W < 4 ? -1 : drafts[2]};
                     const float p3[3] = {none ? 0.0f : dprob[0], none || W < 3 ? 0.0f : dprob[1], none || W < 4 ? 0.0f : dprob[2]};
-                    ddump.put_round((int32_t) p, T, a, d3, p3);
+                    const float c3[3] = {none ? 0.0f : ch[0], none || W < 3 ? 0.0f : ch[1], none || W < 4 ? 0.0f : ch[2]};
+                    ddump.put_round((int32_t) p, T, a, d3, p3, c3, none ? 0 : kept);
                 }
                 if (eos) { finish = "stop"; break; }
                 x = outv[(size_t) a];
@@ -4171,6 +4194,17 @@ int lamina::program::run(int argc, char** argv) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }
+        if (o.temperature > 0.0) {   // a sampled run: its windows draw as a request with these settings does
+            lamina::kernels::SamplerParams sp;
+            sp.greedy = false;
+            sp.temperature = (float) o.temperature;
+            sp.top_p = (float) o.top_p;
+            sp.top_k = o.top_k;
+            sp.min_p = std::clamp((float) o.min_p, 0.0f, 1.0f);
+            sp.seed = o.seed ? o.seed : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+            ver.set_sampling(sp);
+            mtp.set_sampling(sp);
+        }
         mem_mark("the verifier and the drafter's binding");
         ver.set_host_rows(!o.window_hashes.empty());
         hook_verifier(ver);
@@ -4187,13 +4221,13 @@ int lamina::program::run(int argc, char** argv) {
         int32_t x = (int32_t) tok;
         const int W = o.max_window();
         std::vector<int32_t> drafts((size_t) W, 0);
-        std::vector<float> dprob((size_t) W, 1.0f);
+        int kept = 0;   // the drafts the last round kept: the next window's
         std::vector<int64_t> window_hist((size_t) W + 1, 0);
         // the first window is the last prompt token alone (it produces the first generated token and the MTP's
         // first cell)
         bool first_window = true;
         if (use_mtp && !first_window &&
-            !mtp.draft_first(ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
+            !mtp.draft_first(ss.R, x, p - 1, drafts.data(), err, nullptr, (float) o.spec_min_p, nullptr, &kept)) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }
@@ -4243,16 +4277,12 @@ int lamina::program::run(int argc, char** argv) {
         const uint32_t sleeps0 = pool.sleeps();
         if (o.stats) drive.d.routed.assign((size_t) (g.n_layers * g.n_expert), 0);
         if (use_mtp)
-            mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
-                if (lk == 0 && prob >= (float) o.spec_min_p) ver.ple_ahead(j + 1, tok);
+            mtp.on_draft = [&](int j, int32_t tok, bool keeps) {   // the drafts the next window will verify
+                if (lk == 0 && keeps) ver.ple_ahead(j + 1, tok);
             };
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
-            int T = o.spec;
-            if (use_mtp && o.spec_min_p > 0.0) {
-                T = 1;
-                while (T < o.spec && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
-            }
+            int T = use_mtp ? 1 + kept : o.spec;   // (without a draft layer: windows of zeros, a measurement arm)
             if (lk > 0) T = 1 + lk;
             if (first_window) T = 1;
             T = (int) std::min<int64_t>(T, o.max_context - p);   // near the context's end, the rows that fit
@@ -4349,7 +4379,8 @@ int lamina::program::run(int argc, char** argv) {
             }
             mtp.set_max_drafts(lk > 0 ? 1 : o.spec - 1);
             const bool drafted = (!use_mtp || (int64_t) produced.size() >= max_new ||
-                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) &&
+                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, nullptr, (float) o.spec_min_p,
+                                            nullptr, &kept)) &&
                                  ver.wait_commit(err);
             if (!drive.join_adapt()) {
                 std::fprintf(stderr, "lamina: %s\n", adapt_err.c_str());
@@ -4373,8 +4404,8 @@ int lamina::program::run(int argc, char** argv) {
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
         if (!follow.empty())
-            serve_print("%-24s %lld of %lld emitted tokens differ from the argmax\n", "follow",
-                        (long long) follow_differ, (long long) follow_emitted);
+            serve_print("%-24s %lld of %lld emitted tokens differ from the %s\n", "follow",
+                        (long long) follow_differ, (long long) follow_emitted, o.temperature > 0.0 ? "draw" : "argmax");
         if (o.spec_min_p > 0.0) {
             serve_print("%-24s", "window sizes");
             for (size_t i = 1; i < window_hist.size(); ++i) serve_print(" T%zu:%lld", i, (long long) window_hist[i]);

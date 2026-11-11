@@ -25,6 +25,7 @@
 #include "lamina/core/layer.hpp"
 #include "lamina/core/session.hpp"
 #include "lamina/kernels/iq_kernels.hpp"
+#include "lamina/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
@@ -65,6 +66,13 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// The draft chain stops after `n` drafts (0: max_t - 1).
     void set_max_drafts(int n) { max_drafts_ = n; }
+    /// The request's sampling.  A sampled one (a temperature above 0, no penalties) keeps its drafts by their chance
+    /// to pass under the number each position is drawn with (core/draft_pass.hpp, `draft`'s `min_p`); the draft
+    /// stays the layer's likeliest token.  LAMINA_DRAFT_PASS=0: by their probability, as a greedy request's.
+    void set_sampling(const lamina::kernels::SamplerParams& sp);
+    /// What the last round's drafts were kept by: a sampled request's chances to pass, else their probabilities
+    /// (0 past its chain).
+    const float* chances() const { return chances_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The layer's own K/V cells (the prompt cache stashes them with the model's).
     QsaState& kv_state() { return st_; }
@@ -80,8 +88,12 @@ public:
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1): the catch-up over the cells up to the last accepted
     /// row `a` (the rejected rows' cells are written by the draft chain or the next round before anything reads
     /// them), then the draft chain from row a at cells p+a+1 ...
+    /// The chain goes on past a draft that is kept: one with at least the probability `min_p` under the draft layer
+    /// (`probs`), or in a sampled request (`set_sampling`) one whose chance to pass under its own number is at
+    /// least the chance a draft of probability `min_p` has under an average number.  `n_kept` counts them (the
+    /// next window's drafts), `n_drafts` the drafts made: one more, unless the chain reached its limit.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+               float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, int* n_kept = nullptr);
 
     /// The draft head's rows gathered from the main head now (before the main GPU keeps only part of it); `bind`
     /// then takes them as they are.
@@ -89,11 +101,11 @@ public:
     bool has_draft_head() const { return dhead_ != nullptr; }
     /// The first round: one cell (`cell`) from `R_row` (device) and `token`.
     bool draft_first(const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, int* n_kept = nullptr);
 
-    /// Called with each draft as soon as it is known (j = 0.., its probability under the draft layer), while the
-    /// chain goes on: the next window's PLE rows start there.
-    std::function<void(int j, int32_t token, float prob)> on_draft;
+    /// Called with each draft as soon as it is known (j = 0.., whether it is kept), while the chain goes on: the
+    /// next window's PLE rows start there.
+    std::function<void(int j, int32_t token, bool kept)> on_draft;
 
     double ms_draft = 0;
     int64_t rounds = 0;
@@ -120,6 +132,11 @@ private:
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0, max_drafts_ = 0;
+    bool pass_ = false;                              // a sampled request: the drafts' chances to pass (set_sampling)
+    uint64_t pass_seed_ = 0;
+    float pass_temperature_ = 0.0f;
+    float pass_min_p_ = -1.0f, pass_floor_[3] = {};  // min_p's floors on the chance, per chain step (draft)
+    float chances_[9] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
