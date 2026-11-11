@@ -1,5 +1,5 @@
-// include/lamina/core/gpu_select.hpp - GPUs named in the options, and a short probe that orders and sizes the GPU
-// tiers.
+// include/lamina/core/gpu_select.hpp - GPUs named in the options, a short probe that orders and sizes the GPU tiers,
+// and a tier's clocks locked while the engine generates.
 //
 // A device ordinal moves when a card is added: here an RTX 5060 Ti on an M.2 adapter took bus 02 and made the RTX
 // 3090 device 2 instead of 1, and its slot's bus 0F became 10, so a PCI bus id moves too.  A UUID stays with its
@@ -42,5 +42,43 @@ struct GpuProbe {
 /// The devices' probes: their links woken together (copies until each link is at its full PCIe generation, 0.4-0.5 s
 /// here), then each one's copies timed alone; `main_device` current after.
 std::vector<GpuProbe> probe_gpus(const std::vector<int>& devices, int main_device);
+
+/// GPUs' clocks locked while the engine generates (--second-gpu-clocks): under a tier's short shares the driver lowers
+/// that card's clocks between them, and its rows come late; locked all the time it draws its awake power while the
+/// engine idles or reads a prompt.  The locks are NVML's (nvidia-smi's -lgc and -lmc: they need administrator rights
+/// and stay until released or a reboot), set and released on a thread of this object's: a lock is at speed about
+/// half a second after it is asked for.
+class GpuClocks {
+public:
+    GpuClocks() = default;
+    ~GpuClocks();   ///< releases the locks it holds
+    GpuClocks(const GpuClocks&) = delete;
+    GpuClocks& operator=(const GpuClocks&) = delete;
+
+    /// `spec` as "<graphics min>-<graphics max>/<memory>" MHz ("1395-2100/9751"; a memory clock of 0 leaves that
+    /// one to the driver): that lock for `device` (a CUDA ordinal).  False with `why` for another form.  Before
+    /// the first hold().
+    bool add(int device, const std::string& spec, std::string& why);
+    /// Generation nears or runs: the locks are set unless they are, and a release that was coming is off.  Returns at
+    /// once.
+    void hold();
+    /// Generation is over: the locks are released `seconds` from now unless hold() comes first.
+    void release_after(double seconds);
+    /// The locks of the object that held some, released on the calling thread: for an exit that runs no destructor
+    /// (std::exit runs it by itself; std::_Exit does not).
+    static void release_now();
+
+private:
+    struct Gpu {
+        int device = -1;
+        void* nvml = nullptr;
+        unsigned gr_min = 0, gr_max = 0, mem = 0;
+    };
+    struct State;
+    void run();
+    bool set(bool lock);
+    std::vector<Gpu> gpus_;
+    State* st_ = nullptr;
+};
 
 }  // namespace lamina::core

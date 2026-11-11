@@ -17,7 +17,7 @@ engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's keys: 
 ## The development PC's own options
 
 The development PC's configs name their GPUs (`--main-gpu GPU-75af3083 --second-gpu "RTX 5070 Ti,GPU-f26e9ba6"`, its
-two RTX 3090s by their UUIDs' starts, where the examples take every other GPU with `auto`), and its Flash-Next configs add three options measured for its hardware, which the examples
+two RTX 3090s by their UUIDs' starts, where the examples take every other GPU with `auto`), and its Flash-Next configs add four options measured for its hardware, which the examples
 leave out. Each pays only where a PC has the same trait: measure it through the server before keeping it. Its
 Qwen3.8-27B config puts the RTX 5070 Ti first (`--main-gpu`, which setup sets to a PC's own choice): that card reads
 prompts ~1.44x as fast as the RTX 3090 and takes the first 26 layers, the 3090 the other 38 with the head, and the
@@ -39,3 +39,12 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
   32K-128K tokens read 1.13-1.55x as fast. It takes 0.7 GiB more pinned RAM and lends 6-8 GiB of the tier's expert
   cache while such a prompt runs. Its layer needs measuring too, through the server: here generate mode put IQ3_S's
   best layer at 23 (6-11% faster than 26), while through the API 26 was 2-4% faster than 23.
+- **`--second-gpu-clocks 0,1395-2100/9751`** (all three): a value per tier, here none for the first and, for the
+  second, its graphics clock locked at 1395-2100 MHz and its memory clock at 9,751 while the engine generates (NVML's
+  locks, the ones `nvidia-smi -lgc` and `-lmc` set: the engine's process needs administrator rights, and says so
+  when it has none). It pays for a tier that gets nothing but the verify windows' short shares: under them the
+  Windows driver drops this PC's second RTX 3090 to its idle clocks between shares, its rows come late and its
+  moves copy at a quarter of the link's rate, and generation takes 4-22% longer. The engine sets the locks from a
+  request's start, or from a long prompt's last chunk, until 5 s after the request, so the card idles at ~12 W
+  instead of the ~110 W it draws locked. The clocks are a card's own: its full memory clock, and a graphics range
+  that starts well above its idle clock.

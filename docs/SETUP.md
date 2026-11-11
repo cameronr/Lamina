@@ -104,7 +104,8 @@ computes the experts of a prompt that the main GPU lacks and part of the output 
 that does keeps 2048 MiB free, a headless one 512 (`--second-gpu-reserve-mib`). To fix the tiers and their order, name
 them: `--second-gpu "RTX 5070 Ti,RTX 5060 Ti"`; `--second-gpu -1` uses none. Only the first tier takes part in
 prompts. The others help generation, where an expert crosses the link once and stays, so a GPU on a slow link (an x1
-or x4 slot) still pays as a later tier.
+or x4 slot) still pays as a later tier. Such a tier gets only short pieces of work, and a driver may lower its clocks
+between them until its results come late: `--second-gpu-clocks` (below) locks them while the engine generates.
 
 ## Engine options
 
@@ -124,8 +125,9 @@ The example configs' options, and the ones that pay on some PCs. `build/lamina -
 | `--prompt-split L` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk |
 | `--arena-place` | off by default: for RAM with slower regions (unpaired DIMMs), the experts the CPU reads are kept out of them |
 | `--no-file-cache` | off by default: the experts are read past the OS file cache, which then holds no second copy of the model |
+| `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz (`0`: that tier's stay the driver's); needs administrator rights |
 
-The last three are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
+The last four are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
 keeping them.
 
 ## Qwen3.6-35B-A3B and Qwen3.8-27B
