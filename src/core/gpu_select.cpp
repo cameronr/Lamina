@@ -342,11 +342,15 @@ bool GpuClocks::set(bool lock) {
     bool all = true;
     for (const Gpu& g : gpus_) {
         int r = -1;
+        const char* clock = "graphics";   // the one a refusal is about
         if (g.nvml != nullptr && n.lock_graphics != nullptr && n.lock_memory != nullptr && n.reset_graphics != nullptr &&
             n.reset_memory != nullptr) {
             if (lock) {
                 r = n.lock_graphics(g.nvml, g.gr_min, g.gr_max);
-                if (r == 0 && g.mem > 0) r = n.lock_memory(g.nvml, g.mem, g.mem);
+                if (r == 0 && g.mem > 0) {
+                    clock = "memory";
+                    r = n.lock_memory(g.nvml, g.mem, g.mem);
+                }
             } else {
                 r = n.reset_graphics(g.nvml);
                 const int rm = g.mem > 0 ? n.reset_memory(g.nvml) : 0;
@@ -355,10 +359,13 @@ bool GpuClocks::set(bool lock) {
         }
         if (r == 0) continue;
         all = false;
+        // 4: NVML_ERROR_NO_PERMISSION.  NVML documents the graphics clock's lock from Volta on (the RTX 20 series) and
+        // the memory clock's from Ampere on (the RTX 30 series), "Not Supported" for a card without one.
         if (lock && !st_->off.exchange(true))
-            std::fprintf(stderr, "lamina: GPU %d's clocks could not be locked (%s): it runs at the driver's clocks "
-                                 "(the lock needs administrator rights)\n", g.device,
-                         g.nvml == nullptr || r < 0 ? "no NVML" : n.error != nullptr ? n.error(r) : "NVML refused");
+            std::fprintf(stderr, "lamina: GPU %d's %s clock could not be locked (%s%s): it runs at the driver's clocks\n",
+                         g.device, clock,
+                         g.nvml == nullptr || r < 0 ? "no NVML" : n.error != nullptr ? n.error(r) : "NVML refused",
+                         r == 4 ? ": the lock needs administrator rights, root on Linux" : "");
     }
     return all;
 }

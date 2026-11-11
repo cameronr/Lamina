@@ -125,7 +125,7 @@ The example configs' options, and the ones that pay on some PCs. `build/lamina -
 | `--prompt-split L` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk |
 | `--arena-place` | off by default: for RAM with slower regions (unpaired DIMMs), the experts the CPU reads are kept out of them |
 | `--no-file-cache` | off by default: the experts are read past the OS file cache, which then holds no second copy of the model |
-| `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz (`0`: that tier's stay the driver's); needs administrator rights |
+| `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz, the card's own (`0`: that tier's stay the driver's); needs administrator rights (root on Linux) |
 
 The last four are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
 keeping them.

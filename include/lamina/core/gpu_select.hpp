@@ -56,8 +56,9 @@ public:
     GpuClocks& operator=(const GpuClocks&) = delete;
 
     /// `spec` as "<graphics min>-<graphics max>/<memory>" MHz ("1395-2100/9751"; a memory clock of 0 leaves that
-    /// one to the driver): that lock for `device` (a CUDA ordinal).  False with `why` for another form.  Before
-    /// the first hold().
+    /// one to the driver): that lock for `device` (a CUDA ordinal).  False with `why` for another form; values
+    /// outside the card's range are NVML's to judge, and it takes them without a word (above the range: the card's
+    /// top clocks; below it: no lock).  Before the first hold().
     bool add(int device, const std::string& spec, std::string& why);
     /// Generation nears or runs: the locks are set unless they are, and a release that was coming is off.  Returns at
     /// once.

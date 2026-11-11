@@ -41,10 +41,22 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
   best layer at 23 (6-11% faster than 26), while through the API 26 was 2-4% faster than 23.
 - **`--second-gpu-clocks 0,1395-2100/9751`** (all three): a value per tier, here none for the first and, for the
   second, its graphics clock locked at 1395-2100 MHz and its memory clock at 9,751 while the engine generates (NVML's
-  locks, the ones `nvidia-smi -lgc` and `-lmc` set: the engine's process needs administrator rights, and says so
-  when it has none). It pays for a tier that gets nothing but the verify windows' short shares: under them the
-  Windows driver drops this PC's second RTX 3090 to its idle clocks between shares, its rows come late and its
-  moves copy at a quarter of the link's rate, and generation takes 4-22% longer. The engine sets the locks from a
-  request's start, or from a long prompt's last chunk, until 5 s after the request, so the card idles at ~12 W
-  instead of the ~110 W it draws locked. The clocks are a card's own: its full memory clock, and a graphics range
-  that starts well above its idle clock.
+  locks, the ones `nvidia-smi -lgc` and `-lmc` set). The engine sets them from a request's start, or from a long
+  prompt's last chunk, until 5 s after the request, so the card idles at ~12 W instead of the ~110 W it draws locked.
+  It pays for a tier whose work is sparse: this PC's second RTX 3090, as the third GPU, gets only the verify windows'
+  short shares, the Windows driver drops it to its idle clocks between them, its rows come late and its moves copy at
+  a quarter of the link's rate, and generation takes 4-22% longer (with an RTX 5060 Ti in that place: 0-7%). A tier
+  with more to do keeps its clocks: the same RTX 3090 as the only tier gains ~1% from the lock (1-3% on thinking
+  text), and the first of two tiers, the display's card, nothing. No Linux driver was measured.
+  - The clocks are a card's own: `nvidia-smi --query-gpu=name,clocks.max.graphics,clocks.max.memory --format=csv`
+    reads each card's highest. Here the memory clock is locked at its highest and the graphics range starts at two
+    thirds of its highest: under these shares the driver holds the clock at the range's floor, and a higher floor
+    draws more. NVML takes values outside a card's range without a word: a faster card's (`2700-3090/14001`) held
+    this RTX 3090 at 1,965 MHz and 149 W idle against 114 W, and values below its range lock nothing.
+  - The engine's process needs administrator rights (root on Linux). Without them, or on a card NVML has no lock
+    for (it documents the graphics clock's from the RTX 20 series on and the memory clock's from the RTX 30 series
+    on; a memory clock of `0`, as in `1395-2100/0`, leaves that one to the driver), the engine says so at the first
+    request and runs at the driver's clocks.
+  - The values go to the tiers in their order, the last one to the tiers past it. With `--second-gpu auto` the order
+    is the one the start's log lists: name the tiers to give each card its own values.
+  - An engine ended by force leaves its lock: the next engine's first release ends it, or `nvidia-smi -rgc -rmc`.
