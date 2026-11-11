@@ -17,13 +17,14 @@ namespace lamina::core {
 namespace {
 
 // the plan block: [groups of part 0, of part 1, ring, pad] [starts, part 0: cap+1] [part 1: cap+1] [dst: cap]
-// [tok: cap] (8-byte aligned) [slot addresses, part 0: cap] [part 1: cap] [out] [flag after part 0] [after part 1]
+// [tok: cap] (8-byte aligned) [slot addresses, part 0: cap] [part 1: cap] [out] [flag after part 0] [after part 1],
+// padded to whole 16-byte loads
 struct PlanLayout {
     int64_t starts[2], dst, tok, ptr;   // int32 offsets; `ptr` even
     size_t bytes;
     explicit PlanLayout(int64_t cap)
         : starts{4, 4 + cap + 1}, dst(4 + 2 * (cap + 1)), tok(dst + cap), ptr((tok + cap + 1) & ~1ll),
-          bytes((size_t) ptr * 4 + (size_t) (2 * cap + 3) * 8) {}
+          bytes(((size_t) ptr * 4 + (size_t) (2 * cap + 3) * 8 + 15) & ~(size_t) 15) {}
 };
 
 // the grouped kernels' grids are sized for the bucket a layer's group count falls in
@@ -161,13 +162,13 @@ bool SecondGpu::graph_for(int gu_type, int d_type, int gu_act, int d_act, int gr
     }
     try {
         if (prep) {
-            // kernels copy the plan and the activations (a copy node costs ~15 us on this link); the grouped kernels
-            // read the group count from the plan and skip the groups past it
-            lamina::kernels::copy_i32_from_mapped((int32_t*) d_plan_, (const int32_t*) m_plan_, (int64_t) P.bytes / 4,
-                                                  s_);
+            // one kernel copies the plan and the activations in (a copy node costs ~15 us on this link: one each
+            // made a share's rows ~10 us later); the grouped kernels read the group count from the plan and skip the
+            // groups past it
             const int64_t act_bytes = L.gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
-            lamina::kernels::copy_from_mapped((float*) d_xq_, (const float*) m_x_, (max_t_ * act_bytes / 4 + 3) & ~3ll,
-                                              s_);
+            const lamina::kernels::MappedCopy in[2] = {{d_plan_, m_plan_, (int64_t) P.bytes / 4},
+                                                       {d_xq_, m_x_, (max_t_ * act_bytes / 4 + 3) & ~3ll}};
+            lamina::kernels::copy_from_mapped_multi(in, 2, s_);
         }
         const int64_t xq_stride = L.gu_act == 15 ? (n_embd_ / 256) * 292 : (n_embd_ / 32) * 36;
         lamina::kernels::native_expert_grouped(L, p64 + part * cap_, pi + P.starts[part], pi + part, pi + P.dst,
