@@ -101,34 +101,44 @@ fit refusal at prod's expert-cache sizing with 0.72 GiB free**.
    Same 29,022-token prompt a second time: **TTFT 0.14 s**. The same prompt alone, cold: 6.6 s
    (4,400 tok/s).
 
-2. **P1, conversation resume fidelity and cost (option A's gate).** Measured 2026-11-12, results in
-   the section after this list. Cost answered (cheap: 0.16-0.93 s), mechanism answered (it has to be
-   ids, not a re-spelled chat turn), identity still open: `.e2e-p1c.py` cuts a generation at 1/2 and
-   3/4 of what the model actually produced, small (4K) and big (16K) conversations, so identity and
-   how the cost scales with context come back in one run.
+2. **P1, conversation resume fidelity and cost (option A's gate).** Measured 2026-11-12, results in the two
+   sections after this list. Closed: the park saves everything and its restore is byte-exact (362 of 362 tokens
+   reproduced from a checkpoint re-read), and re-issuing ids is *not* exact because the protocol must re-feed the
+   last produced token, which the decode path and the prompt path write differently. Exactness needs `reuse == n`
+   in `reusable()` plus a serve loop that can decode with nothing to feed.
 3. **P2, the peer card's prefill headroom** (design D), only if P1 shows preemption is not
    enough. Same question as before: how fast can a read run on GPU 0 while the main card
    decodes.
 4. **P3, prototype** behind a flag. Gates: solo runs token-identical (the phase-1 digest
    harness), then the P0 driver as the A/B, with warm-hit rate pinned as a guard.
 
-## P1 results (2026-11-12): the preemption card is real, at the id level
+## P1 results (2026-11-12): the mechanism is ids, and a resume can only enter at a checkpoint
 
 Two probes on the shipping binary, engine-direct (`GEN` on stdin, `.e2e-p1.py`) and through the API
 (`.e2e-p1b.py`); logs `~/strata-data/bench/2026-11-12/p1.log`, `p1b.log`.
 
-- **A parked conversation's K/V covers what decoding wrote.** Re-issuing a 5,596-token conversation
-  (prompt plus everything it had decoded) reached its first token in **0.16 s**, against 1.15-1.57 s to
-  cold-read a *smaller* prompt. The restore does not re-read the generation.
-- **Cheap with depth too:** 0.55 s resuming at 5,096 tokens, 0.16 s at 5,596, 0.93 s through the API at
-  about 6K including tokenization. Against the 15-17 s of decode-turn queue a preemption dodges, the
-  switch costs 1-6% of what it saves.
+- **What a park saves is everything. What a re-issue can enter is only a checkpoint.** A parked conversation
+  copies all its K/V cells to host memory and takes a checkpoint at its own end (`PromptCache::stash_live`,
+  `src/core/prompt_cache.cpp:136-186`). `reusable()` (`include/lamina/core/conversation_cache.hpp:77-100`) returns
+  only a position that has a checkpoint, capped at `ids.size() - 1`, and only the *live* sequence may re-enter at
+  its full length. A re-issue shorter than the conversation had reached therefore comes back at the last checkpoint
+  *below* the cut, and everything decoded after that is re-prefilled. Checkpoints exist at prompt and turn
+  boundaries, every `--prompt-cache-every` (default 16,384) inside long prompts, and at the end of a park. Nothing
+  checkpoints mid-generation.
+- **The 0.16 s number was not a decode-state restore, and the claim above it was wrong.** Corrected the same day,
+  after reading the engine log's cached-token counts rather than its TTFT. That probe re-issued the *same* ids
+  twice. The first re-issue had only the prompt checkpoint (`4559 prompt tokens (4095 cached) in 524 ms`, so its
+  464 decoded tokens were re-read at ~890 tok/s); the second hit the checkpoint the first had written at its own
+  prompt end (`4559 prompt tokens (4558 cached) in 146 ms`). The cheap number was a prompt-cache hit on a
+  re-issue. The TTFT-only reading of it was the mistake, so the cached count is now part of every probe here.
+- **What survives is the cost per token re-read:** 890-1,020 tok/s, against the 15-17 s of decode-turn queue a
+  preemption dodges. A preemption that has to re-read its whole generation pays about 1 s per 1,000 tokens, and
+  repeated preemptions compound it.
 - **A chat-template continuation is not byte-safe, so the mechanism has to be ids.** Feeding the partial
   answer back as a trailing assistant turn was a coin flip: cut at 1,369 chars the model *restarted its
   own count from 1*; cut at 1,200 chars it continued identically for all 500 compared characters. The
   template closes the assistant turn, so whether the model reads "continue" or "answer again" depends on
-  where the cut landed. The server holds the ids already, and `GEN prompt+produced` is both the cheap
-  path and the only exact one.
+  where the cut landed. The server holds the ids already, and `GEN prompt+produced` is the mechanism.
 - Parking is on by default and prod does not override it: `prompt_cache = 16`,
   `conversation_cache_mib = 16384`, `conversation_cache_min_tokens = 1024`
   (`src/program/generate.cpp:252-264`).
@@ -140,7 +150,62 @@ while the preempted conversation waits its turn, with the switch gated on the wa
 clearing the ~0.2-0.9 s restore plus a cap on preemptions per conversation so two long generations cannot
 ping-pong.
 
-## The host OOM this investigation caused (2026-11-12)
+## P1c and P1d (2026-11-12): identity settled, and it comes down to one token
+
+The first attempt (`.e2e-p1c.py`, log `p1c.log`) cut a *finished* generation at 1/2 and 3/4 and re-issued
+`prompt + produced`, in the prod-shaped config. It diverged at 284 and at 156 tokens in. It was not interpretable:
+phase 1 of the batching plan had already measured that greedy output "is not reproducible run to run with default
+flags: expert-cache adaptation re-tiers experts mid-run", and a plain re-read of the same 4,096-token prompt in that
+config diverged at token 1. So the ladder was rerun in the deterministic config (`--adapt-every 0`,
+`STRATA_IQ_MT_MIN=1`, frozen profile, `--pcie-frac 0`, fixed `--second-gpu-gib`; driver `.e2e-p1d.py`, log
+`p1d-det.log`, engine log `p1d-det-engine.log`), with a reproducibility gate in front of everything else.
+
+| probe | ids | cached | re-fed | verdict |
+| --- | --- | --- | --- | --- |
+| G, the same prompt twice | 4,096 | 4,095 | 1 prompt token | IDENTICAL, 362 tokens |
+| C0, run stopped at the cut (181) | 4,096 | 4,095 | 1 prompt token | IDENTICAL for 181 |
+| C0, run stopped at the cut (271) | 4,096 | 4,095 | 1 prompt token | IDENTICAL for 271 |
+| C1, park, re-issue `prompt+produced`+1 (cut 181) | 4,278 | 4,276 | 1 **decode** token | DIVERGES at 0 |
+| C1, the same at cut 271 | 4,368 | 4,366 | 1 decode token | DIVERGES at 10 |
+| C2, a resumed run preempted and resumed | 4,278 | 4,276 | 1 decode token | DIVERGES at 72 |
+
+The gate passed, so everything below it means something: the same prompt twice in one process is byte-identical.
+The pairs that agree and disagree differ in exactly one thing, and that is the finding.
+
+- **The restore machinery is byte-exact.** G re-entered at a checkpoint, restored 4,095 cells, re-fed the one prompt
+  token the engine always re-feeds (`[reuse, n-1)` plus the last token through a verify window), and reproduced all
+  362 tokens identically. C0 did the same and matched the control for 181 and 271 tokens. Whatever decode keeps that
+  a checkpoint misses (the MTP draft layer is carried: it is in `kv_`) provably does not affect the output.
+- **Re-computing a decode-written token is not exact, even one of them.** C1 made the parked conversation a prefix
+  of the re-issue by handing it one extra id, which is what lets `reusable()` land on the park's end checkpoint
+  (measured: `4278 prompt tokens (4276 cached) in 77 ms`, about 1.1 GB/s for ~4.3K cells). The state came back
+  verbatim. One token, the last produced one, had to be fed through the prompt path instead of the decode path, and
+  greedy flipped within 0 to 10 tokens. P1c was the same mechanism with 655 and 328 tokens re-fed instead of one.
+
+So the K/V a token gets from the verify/prompt path and the K/V the same token gets from decode are not the same
+bytes, and identity is lost as soon as a re-issue recomputes a single token decoding wrote. That closes the identity
+question, and it closes it against the policy-only version of preemption: stop, park, re-issue the ids is cheap
+(0.07-0.09 s measured) and can never be byte-exact, because the protocol always re-feeds the last token.
+
+### What exactness would take
+
+The state needed is already parked: all the sequence's K/V cells, plus a checkpoint at its end. What is missing is a
+way to re-enter a parked conversation at its full length and start decoding without feeding anything.
+
+- `reusable()` caps a match at `ids.size() - 1` (`include/lamina/core/conversation_cache.hpp:78`), so a re-issue of
+  exactly `prompt+produced` cannot reach a checkpoint at its own end.
+- The serve loop then always feeds `[reuse, n-1)` and the last token through a window
+  (`src/program/generate.cpp:3610`), so a request that supplies nothing to feed is not a case the loop handles.
+
+Allowing `reuse == n` for a parked conversation whose ids match exactly, and starting the decode loop when there is
+nothing to feed, is the whole engine change. It is narrow, it does not need the batching port's protocol work, and
+it is the only path to a preemption that is both exact and cheap. Measured cost of the restore it would use: 72-91 ms
+at ~4.3K cells, so about 0.6 s at 32K, against the 15-17 s of decode-turn queue preemption removes.
+
+The alternative reading is to accept drift: a preempted conversation resumes as a plausible continuation rather than
+the same token stream. On this corpus it stays close for tens to hundreds of tokens, which is a defensible product
+trade for a chat app and a poor one for anything that diffs output, caches by digest, or replays sessions.
+
 
 P1c took the machine down. Boot `-1` ends in a kernel OOM report (85 GiB anonymous, 113 MiB free, 86 GiB
 of swap untouched) after `lamina: page allocation failure` at 12:49:53, and the sequence is legible: P1b's
