@@ -132,11 +132,13 @@ hypothesis until something measures it.
   the engine's lazy start, `src/server/engine_batch.cpp`'s `admission()`;
   `docs/USING.md:248-251`). Kept as the reference for when the batch port
   needs the same semantics on slot admission.
-- [Phase 3, exact two-stage main head](phase-3-exact-main-head.md) - dropped
-  before building: prod samples (temperature 1.0) and `sample_tokens` consumes
-  every logit row, so bound-and-prune cannot skip the 248k-row read on sampled
-  windows (`src/core/verify.cpp:1340,1371`). The file keeps the reasoning in
-  case a greedy-only deployment ever wants it.
+- [Phase 3, exact two-stage main head](phase-3-exact-main-head.md) - killed
+  with measurement on 2026-11-12, after one wrong death (sampler semantics,
+  not call sites) and one resurrection. The Cauchy-Schwarz bound sits ~20x
+  over the 64th-largest logit for every head row: nothing certifiable.
+  Ceiling was 4-6% decode. The measurement kit (norm store, survivor
+  histogram, parity tests) is on `main` for the next bound idea to answer
+  the same question in one run.
 - [Phase 4, wide-window economics probe](phase-4-window-economics-probe.md) -
   needs a Flash-Next batch path to probe; blocked behind the port.
 
