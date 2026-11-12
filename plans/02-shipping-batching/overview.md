@@ -122,10 +122,11 @@ hypothesis until something measures it.
   baseline recorded (solo decode 148.1, repeat boot 138.6 - decode needs the
   deterministic recipe to repeat; 4-clients-serial 107.9 total).
 - [Phase 1, admission control](phase-1-admission-control.md) - blocked behind
-  the port: on main the Flash-Next engine has no batch path at all
-  (`parallel`/`--batch` is the q36 engine's), so there is nothing to admit.
-  What a pool exhaustion costs the new server (engine death vs a lazy
-  restart) needs its own forensics when the port starts.
+  the port, and reframed by its forensics: on main, over-cap is a clean 400 at
+  the API and within-cap exhaustion is unreachable at prod sizing (a 248K-token
+  request was served by yielding 1503 expert-cache slots, decode falling to
+  the K/V-bound 33 tok/s floor). What is left is QoS under batch slots, part
+  of the port's design, not a crash hunt.
 - [Phase 2, the context gate](phase-2-context-gate.md) - already superseded on
   `main`: the harness's gate landed in the new server's design (the queue plus
   the engine's lazy start, `src/server/engine_batch.cpp`'s `admission()`;

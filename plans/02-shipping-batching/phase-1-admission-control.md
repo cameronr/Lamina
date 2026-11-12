@@ -2,12 +2,37 @@
 
 Back-link: [overview.md](overview.md).
 
+## As found on main (2026-11-12), this phase is a QoS question now
+
+Measured on the current tree, pinned prod-shape config
+(`.e2e-ctxgate.py`, `.e2e-fullctx.py`, logs under
+`~/strata-data/bench/2026-11-11/`):
+
+- Over-cap requests never reach the engine: the API answers 400 "request
+  exceeds the context window ... requests are never truncated" in ~5 ms, and
+  the server keeps serving (cache hits on the follow-ups). The harness-era
+  over-long failure leg is already solved at the boundary.
+- Within-cap exhaustion is unreachable at this box's sizing: a 247,880-token
+  request against the 262144 cap was served by growing K/V to 253,952 cells,
+  with the expert cache giving 1503 slots and demoting 535 experts. Prefill
+  held 6538 tok/s; decode came out K/V-bound at 33.1 tok/s; the next request
+  was in step. The `ERR the K/V cannot grow` exit needs demand beyond the
+  biggest realistic prompt, so it is a tail path, not the everyday risk.
+- What that leaves is fairness: one full-context tenant drops decode to the
+  K/V-bound floor for itself, and when the batch port lands, its slots will
+  share that pressure. Admission control on the ported server should price
+  cells against decode expectations, not hunt a crash that no longer happens
+  at this sizing.
+
+Everything below is the harness-era design; keep it as the mechanics
+reference (protocol lines, refusal plumbing) for the port.
+
 ## Goal
 
 Batching cannot kill the server. A request whose K/V does not fit gets refused
-with a countable answer while every other request keeps running. Today an
-over-full pool reaches `kvg_ensure` failure and the engine exits; the branch
-cannot go near prod until that is gone. Design ported from Niko
+with a countable answer while every other request keeps running. On the harness
+base an over-full pool reached `kvg_ensure` failure and the engine exited (see
+the section above for what changed on main). Design ported from Niko
 `docs/BATCHING.md`; the old program scoped it in
 `plans/01-engine-batching/phase-11-long-context-batching.md` item 1.
 
