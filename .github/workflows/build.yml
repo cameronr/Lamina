@@ -1,0 +1,90 @@
+# Lamina for Windows and Linux on x64 and arm64.  The runners have no GPU: the CUDA code compiles, and the tests that
+# need no GPU run.  A v* tag publishes a release with, for each of them, the programs and the CUDA runtime as separate
+# downloads.  The steps are .github/ci.py's, which runs the same way on a PC.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**', 'examples/**', 'bench/**', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'examples/**', 'bench/**', 'LICENSE']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.cpu }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: win, cpu: x64, runner: windows-2022 }
+          - { os: win, cpu: arm64, runner: windows-11-arm }
+          # Ubuntu 22.04: the Linux programs run on glibc 2.35 and newer
+          - { os: linux, cpu: x64, runner: ubuntu-22.04 }
+          - { os: linux, cpu: arm64, runner: ubuntu-22.04-arm }
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      PYTHONUNBUFFERED: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Python packages, CMake and Ninja
+        run: python -m pip install -r requirements.txt -r requirements-build.txt regex==2026.9.10   # regex: the tools' tests
+      - name: OpenSSL's headers
+        if: matrix.os == 'linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libssl-dev
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.cpu }}
+          max-size: 2G
+      - name: CUDA toolkit
+        run: python .github/ci.py toolkit --dest "${{ runner.temp }}/cuda"
+      - name: Build
+        run: python .github/ci.py build
+      - name: Tests that need no GPU
+        run: python .github/ci.py test
+      - name: Package
+        run: python .github/ci.py package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lamina-${{ matrix.os }}-${{ matrix.cpu }}
+          path: dist/
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          NOTES: |
+            Each platform has two downloads: `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`, the programs, and `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`, the CUDA runtime and cuBLAS they load (the same in every release of that CUDA version). Extract both into a clone of this tag and run setup with `--no-build`: [docs/SETUP.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md#release-binaries). The programs are built for RTX 30, 40 and 50 GPUs.
+        run: |
+          ls -l dist
+          pre=; [[ "$TAG" == *-* ]] && pre=--prerelease
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --notes "$NOTES" $pre

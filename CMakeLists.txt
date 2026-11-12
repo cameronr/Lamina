@@ -721,6 +721,17 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
   endif()
 endif()
 
+# The tests that need no GPU (nor a CUDA driver): `ctest -L cpu`, what CI runs (.github/workflows/build.yml)
+if(LAMINA_BUILD_TESTS)
+  foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
+             q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
+             conversation_cache_test deterministic_adapt_help platform_memory_test ple_reader_selftest)
+    if(TEST ${_t})
+      set_tests_properties(${_t} PROPERTIES LABELS cpu)
+    endif()
+  endforeach()
+endif()
+
 # Windows: every program here runs with UTF-8 as its code page (cmake/utf8.manifest)
 if(MSVC)
   get_property(_lamina_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)

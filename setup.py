@@ -785,7 +785,8 @@ def main() -> int:
     ap.add_argument("--no-build", action="store_true", help="use the binaries already built")
     ap.add_argument("--cuda-archs", help="the CUDA architectures to build for, e.g. 86;120 (default: this PC's GPUs)")
     ap.add_argument("--portable", action="store_true",
-                    help="build the engine for other PCs (any AVX2 CPU), as the Docker image does")
+                    help="build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the "
+                         "release binaries and the Docker image are")
     a = ap.parse_args()
     if a.vision not in ("on", "off", "gpu") and not a.vision.startswith("gpu:"):
         ap.error(f"--vision {a.vision}: on, off, gpu or gpu:GPU")
@@ -859,7 +860,9 @@ def main() -> int:
     if a.check:
         return 0
     if problems:
-        fail("install what is missing (above), then run setup again")
+        built = (ROOT / "build" / f"lamina-server{EXE}").exists()
+        fail("install what is missing (above), then run setup again",
+             "or --no-build: the binaries in build/ as they are (a release's)" if built else None)
 
     if a.update:
         say("\nupdating this checkout")

@@ -38,11 +38,13 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
   Setup downloads none of them: [docs/SETUP.md](docs/SETUP.md) says how to run one.
 
 - **An SSD**: Flash-Next reads a 28.8 GB table of per-layer embeddings from the model file at every token.
-- **A 64-bit x86 CPU with AVX2** (AVX-512 is used when it is there). The CPU computes the experts no GPU holds, so its
-  cores and the RAM's bandwidth set much of the speed.
-- **Windows 10 / 11 or Linux.**
-- **To build:** the CUDA toolkit 13.0 or newer, Visual Studio 2022's C++ tools (Windows) or GCC (Linux), Python 3.10 or
-  newer, and Git.
+- **A 64-bit x86 CPU with AVX2** (AVX-512 is used when it is there), or a 64-bit Arm CPU with Armv8.2's dot product
+  and FP16 instructions, where the experts run on ggml's dot products (built and its CPU tests run, not yet run with a
+  GPU). The CPU computes the experts no GPU holds, so its cores and the RAM's bandwidth set much of the speed.
+- **Windows 10 / 11 or Linux**, and Python 3.10 or newer for setup.
+- **To build:** the CUDA toolkit 13.0 or newer, Visual Studio 2022's C++ tools (Windows; on Arm also LLVM's clang-cl)
+  or GCC (Linux), and Git. The [releases](https://github.com/eddoursul/Lamina/releases) have the programs built for
+  RTX 30, 40 and 50 GPUs.
 
 ## Install
 
@@ -56,7 +58,8 @@ setup.bat --model iq3_s          (Windows)
 Setup builds the engine and the image encoder for this PC's GPUs, downloads the model's files at pinned revisions and
 checks them, prepares them, and writes a config and a launcher. `--model ud-q4_k_xl`, `--model qwen36-ud-q4_k_xl` and
 `--model qwen38-27b-ud-q6_k_m` set up the others; `--check` says what the PC has and what a model needs, without
-changing anything. Setup asks nothing and installs no system software: it names what is missing. Details:
+changing anything. Setup asks nothing and installs no system software: it names what is missing. A release's programs,
+extracted into the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)). Details:
 [docs/SETUP.md](docs/SETUP.md).
 
 ## Run

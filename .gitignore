@@ -50,3 +50,6 @@ td.log
 .cursor/
 
 /.ccache/
+
+# .github/ci.py package
+/dist/
