@@ -127,6 +127,7 @@ if(LAMINA_ENABLE_CUDA)
                           src/kernels/cuda/quantize_act.cu
                           src/kernels/cuda/rope.cu
                           src/kernels/cuda/sampler.cu
+                          src/kernels/cuda/native_head_screen.cu
                           src/kernels/cuda/s2_gemv_q8.cu
     src/kernels/cuda/s2_expert_grouped.cu
                           src/kernels/cuda/shared_expert.cu
@@ -285,6 +286,8 @@ if(LAMINA_ENABLE_CUDA)
 
   # The verify window's batched kernels vs the per-token kernel sequences they replace, bitwise (synthetic data).
   lamina_kernel_test(verify_parity src/kernels/verify_parity.cpp LIBS lamina_prefill lamina_kernels_cpu ARGS --selftest)
+  # the head screen's measurement kernels against host references (phase 3, M1)
+  lamina_kernel_test(head_screen_parity src/kernels/head_screen_parity.cpp ARGS --selftest)
 
   # The QSA block scores and top-k against the kernels they replaced, kept in the test: bitwise (synthetic data).
   lamina_kernel_test(qsa_select_parity src/kernels/qsa_select_parity.cu)

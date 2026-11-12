@@ -16,6 +16,7 @@
 #include "lamina/kernels/gr.hpp"
 #include "lamina/kernels/kv_q8.hpp"
 #include "lamina/kernels/native_mmvq.hpp"
+#include "lamina/kernels/native_head_screen.hpp"
 #include "lamina/kernels/native_moe.hpp"
 #include "lamina/kernels/native_ple_postops.hpp"
 #include "lamina/kernels/native_qsa.hpp"
@@ -153,6 +154,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
+    {   // phase 3's M1: count what a conservative bound could have pruned, beside the full read
+        const char* screen = std::getenv("LAMINA_HEAD_SCREEN");
+        head_screen_ = screen != nullptr && std::strcmp(screen, "0") != 0 && shead_ == nullptr &&
+                       head != nullptr && head->loaded() && head->rows() == n_vocab_ &&
+                       lamina::kernels::head_screen_supported(head->type());
+    }
 
     const lamina::kernels::QsaShapes s = lamina::kernels::qsa_shapes(g);
     cap_ = lamina::kernels::qsa_selection_width(lamina::kernels::kTopkMaxCells, s);
@@ -287,6 +294,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        if (head_screen_) {   // the screen's measurement buffers (phase 3's M1)
+            hs_norms_ = b.take<float>((uint64_t) n_vocab_);
+            hs_xnorms_ = b.take<float>(T);
+            hs_tau_ = b.take<float>(T);
+            hs_cur_ = b.take<unsigned long long>(T);
+            hs_done_ = b.take<unsigned>(1);
+            hs_hist_ = b.take<unsigned long long>(T * (uint64_t) lamina::kernels::kHeadScreenBuckets);
+        }
         arg_scratch_ = b.take<uint8_t>(lamina::kernels::argmax_rows_scratch_bytes((int) T));
         if (shead_ != nullptr) head_full_ = b.take<float>(T * (uint64_t) n_vocab_);
         one_ = b.take<int32_t>(4);
@@ -316,6 +331,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             err = "verify: the arena could not be set";
             return false;
         }
+    }
+    if (head_screen_) {   // one pass over the head: the dequantized row norms are the screen's whole store
+        const int64_t chunk = 1024;
+        float* scratch = nullptr;
+        if (cudaMalloc((void**) &scratch, (size_t) chunk * N * sizeof(float)) != cudaSuccess) {
+            err = "verify: the head screen's dequant scratch";
+            return false;
+        }
+        const auto t0 = Clock::now();
+        lamina::kernels::head_screen_row_norms(head_->type(), head_->weights(), (int64_t) n_vocab_,
+                                               (int64_t) g.n_embd, chunk, hs_norms_, scratch, nullptr);
+        cudaStreamSynchronize(nullptr);
+        std::printf("lamina: head screen: %lld row norms, %lld rows, %.0f ms\n", (long long) n_vocab_,
+                    (long long) n_vocab_, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        cudaFree(scratch);
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
@@ -1020,6 +1050,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         argmax_rows(head_logits_, T, (int) head_rows_, arg_scratch_, m_out_, cs, m_val_, nan_guard_ ? m_bad_ : nullptr);
+        if (head_screen_) {   // measure beside the read: what a bound could have certified away (M1)
+            lamina::kernels::head_screen_input_norms(xq_, hs_xnorms_, (int) N, T, cs);
+            lamina::kernels::head_screen_kth(head_logits_, T, (int64_t) head_rows_, 64, hs_tau_, cs);
+            lamina::kernels::head_screen_count(hs_norms_, (int64_t) head_rows_, hs_xnorms_, T, hs_tau_, hs_cur_,
+                                               hs_done_, hs_hist_, cs);
+        }
     }
     if (host_rows_) copy_from_mapped(m_rows_, R_, (int64_t) T * HC * N, cs);   // a plain copy kernel, here to host
     stamp(g.n_layers, 3, cs);
@@ -1455,6 +1491,25 @@ void Verifier::print_profile() const {
                 "the six before \"rows + combine\")\n", "window profile", (long long) prof_windows_,
                 prof_window_ns_[0] / nw / 1e6, prof_window_ns_[1] / nw / 1e6, prof_window_ns_[2] / nw / 1e6,
                 prof_window_ns_[3] / nw / 1e3);
+    if (head_screen_ && hs_hist_ != nullptr) {   // M1: rows a bound would certify out of the top-64, per window
+        std::vector<unsigned long long> hist((size_t) max_t_ * lamina::kernels::kHeadScreenBuckets);
+        if (cudaMemcpy(hist.data(), hs_hist_, hist.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost) ==
+            cudaSuccess) {
+            std::vector<unsigned long long> all(lamina::kernels::kHeadScreenBuckets, 0);
+            for (int c = 0; c < max_t_; ++c)
+                for (int b = 0; b < lamina::kernels::kHeadScreenBuckets; ++b)
+                    all[b] += hist[(size_t) c * lamina::kernels::kHeadScreenBuckets + b];
+            std::printf("  %-22s", "head screen, survivors");
+            for (int b = 0; b < lamina::kernels::kHeadScreenBuckets; ++b) {
+                if (!all[b]) continue;
+                if (b == 0) std::printf(" <32 %llu", all[b]);
+                else if (b + 1 == lamina::kernels::kHeadScreenBuckets)
+                    std::printf(" >=%llu %llu", (unsigned long long) 1 << (b + 5), all[b]);
+                else std::printf(" <%llu %llu", (unsigned long long) 1 << (b + 6), all[b]);
+            }
+            std::printf(" per window column\n");
+        }
+    }
     std::printf("  %-22s %12s %12s %14s\n", "stage", "GDN us/layer", "QSA us/layer", "ms per window");
     for (int i = 0; i < kLayerStamps + 1 + n_tiers_; ++i) {
         const double a = prof_ns_[(size_t) i], b = prof_ns_[(size_t) kStamps + i];

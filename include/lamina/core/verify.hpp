@@ -354,6 +354,14 @@ private:
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
+    // the head screen's measurement set (`LAMINA_HEAD_SCREEN=1`, phase 3's M1): row norms, per-column bound
+    // inputs, and a histogram of the rows the Cauchy-Schwarz bound would certify out of the top-64. It runs
+    // beside the full read and changes nothing the window decides.
+    bool head_screen_ = false;
+    float *hs_norms_ = nullptr, *hs_xnorms_ = nullptr, *hs_tau_ = nullptr;
+    unsigned long long* hs_cur_ = nullptr;
+    unsigned* hs_done_ = nullptr;
+    unsigned long long* hs_hist_ = nullptr;   ///< kernels::kHeadScreenBuckets per window column
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
