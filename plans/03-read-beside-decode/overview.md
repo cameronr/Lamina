@@ -205,7 +205,47 @@ at ~4.3K cells, so about 0.6 s at 32K, against the 15-17 s of decode-turn queue 
 The alternative reading is to accept drift: a preempted conversation resumes as a plausible continuation rather than
 the same token stream. On this corpus it stays close for tens to hundreds of tokens, which is a defensible product
 trade for a chat app and a poor one for anything that diffs output, caches by digest, or replays sessions.
+### Why the narrow change first named cannot work (same day, from source)
 
+The obvious fix was to let a re-issue re-enter at its own end (`reuse == n`) and decode with nothing fed. It cannot
+work, and `SessionState` (`include/lamina/core/session.hpp:16-30`) is why. The checkpoint carries the GDN recurrent
+state, the QSA states, the residual streams and the PLE, but no logits and no final hidden row. To emit a token a
+resume has to process at least one token, and the only candidate is the last produced one, which is the token whose
+recomputation loses exactness.
+
+The mechanism the measurements point at, as a claim rather than a guess: this model is hybrid, and GDN state advances
+by a **chunked scan** over a verify window. A token processed alone (a resume's first window) and the same token
+processed inside a multi-token window reach numerically different GDN state. Decode windows are multi-token because
+speculation is mandatory on this path (the engine refuses to serve under `--spec 2`), so a resume cannot reproduce
+the window a token was computed in, and that grouping itself depended on draft acceptance.
+
+1. **No re-issue protocol is exact on this engine**, the `+1` form measured above included. Handing ids back and
+   expecting the same continuation is out, because recomputing the boundary token is not optional.
+2. **Storing the pick is worth one token and no more.** The first candidate narrow change was to checkpoint the
+   last logits row so a resume samples without processing anything. It makes exactly one token exact: to get the
+   logits *after* that token the resume must still process it, and the control processed it inside a multi-token
+   window, so the drift simply moves one step later. Deleted before building it.
+3. **Replaying the last window is the remaining narrow route.** If the checkpoint carried the last verify window's
+   composition (the accepted length, and the drafts that were offered with it), a resume could feed that same window
+   again. Its ≤ 1 + `--spec` tokens recompute deterministically into the cells they already occupy, so the state ends
+   up bit-identical, and decode continues from there. Cost is a handful of tokens. Uncertainty: whether
+   `Verifier` keeps any per-window state a checkpoint does not already hold.
+4. **The other exact route is never losing the decode state**, keeping the sequence resident and continuing its
+   decode loop in place, which is what the parked batching port's slots and BGEN carry do. This is exact by
+   construction, because the loop is the control's own loop.
+
+One more boundary worth stating, because it outranks all of the above: **prod cannot be byte-exact by any of these
+routes as it is configured today.** It runs `--adapt-every 1`, and phase 1 measured that greedy output is not
+reproducible run to run under adaptation (`adapt default FAIL x2`, `--adapt-every 0` PASS x2), because re-tiered
+experts round differently. A resident-slot preemption would be exact only in a deterministic config. Any promise of
+byte-identical preemption therefore has to name the config, not just the mechanism.
+
+
+The item's economics do not move: P0 still says a preempted small request wins 15-17 s of queue, and the park's
+restore is cheap at 72-91 ms for ~4.3K cells (about 1.1 GB/s, roughly 0.6 s at 32K). What is not free is doing
+it without the client noticing a different continuation, which is the standard this item has been held to.
+
+## The host OOM this investigation caused (2026-11-12)
 
 P1c took the machine down. Boot `-1` ends in a kernel OOM report (85 GiB anonymous, 113 MiB free, 86 GiB
 of swap untouched) after `lamina: page allocation failure` at 12:49:53, and the sequence is legible: P1b's
@@ -217,10 +257,11 @@ just summoned prod, so there was nothing to wait for.
 
 `run-e2e.sh` (gitignored, machine-local) now refuses to start a second arena until prod is *gone* and
 `MemAvailable` is back above 64 GiB, up to 300 s; runs a 3 s watchdog that `docker kill`s the test
-container the moment prod returns or free memory drops below 20 GiB mid-run; and caps the container at
-72 GiB so an unexpected overlap is a container OOM rather than a host one. `--probe` reports the same
-preconditions without pausing anything (`prod running: yes / 23941 MiB free` right now, so a run would
-correctly refuse). The `rare, accept it` line in the machine's AGENTS notes describes this same window and
+container the moment prod returns or free memory drops below 8 GiB mid-run (the test engine's own steady
+state is about 14 GiB available, so a higher floor only kills healthy runs); and runs the container under
+prod's 88 GiB envelope, since a tighter cap is itself a bug (at 72 GiB the engine is memcg-killed mid-load
+at the PLE table mapping). `--probe` reports the same preconditions without pausing anything.
+The `rare, accept it` line in the machine's AGENTS notes describes this same window and
 does not mention that on this box it costs a reboot.
 
 ## What the measurement settled (2026-11-12)
