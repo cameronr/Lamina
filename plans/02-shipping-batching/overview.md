@@ -119,21 +119,30 @@ hypothesis until something measures it.
 - [Phase 0, carry the batch path onto main](phase-0-merge-and-baseline.md),
   re-scoped by the 2026-11-11 run: the merge died because main replaced the
   serving layer; what remains is a multi-day port decision, with the fresh v31
-  baseline recorded (solo decode 148.1 tok/s, 4-clients-serial 107.9).
+  baseline recorded (solo decode 148.1, repeat boot 138.6 - decode needs the
+  deterministic recipe to repeat; 4-clients-serial 107.9 total).
 - [Phase 1, admission control](phase-1-admission-control.md) - blocked behind
   the port: on main the Flash-Next engine has no batch path at all
   (`parallel`/`--batch` is the q36 engine's), so there is nothing to admit.
   What a pool exhaustion costs the new server (engine death vs a lazy
   restart) needs its own forensics when the port starts.
-- [Phase 2, the context gate](phase-2-context-gate.md) - blocked behind the
-  port for the same reason.
-- [Phase 3, exact two-stage main head](phase-3-exact-main-head.md) - the one
-  unblocked item: `main`-branch solo-path work, no batching dependency.
+- [Phase 2, the context gate](phase-2-context-gate.md) - already superseded on
+  `main`: the harness's gate landed in the new server's design (the queue plus
+  the engine's lazy start, `src/server/engine_batch.cpp`'s `admission()`;
+  `docs/USING.md:248-251`). Kept as the reference for when the batch port
+  needs the same semantics on slot admission.
+- [Phase 3, exact two-stage main head](phase-3-exact-main-head.md) - dropped
+  before building: prod samples (temperature 1.0) and `sample_tokens` consumes
+  every logit row, so bound-and-prune cannot skip the 248k-row read on sampled
+  windows (`src/core/verify.cpp:1340,1371`). The file keeps the reasoning in
+  case a greedy-only deployment ever wants it.
 - [Phase 4, wide-window economics probe](phase-4-window-economics-probe.md) -
   needs a Flash-Next batch path to probe; blocked behind the port.
 
-Order after the run: Phase 3 now; the port (former Phases 0-2, 4) as a
-decision against the days-cost named in the phase 0 file.
+Order after the run: the port decision is the only door - Phases 1 and 4 wait
+behind it, Phase 2 already landed, Phase 3 is dead for sampled traffic. What
+was measured instead, this window: the fresh baseline, the warm-concurrency
+cost of serial serving, and the CPU prefetch flag, in the phase 0 file.
 
 ## Verification
 

@@ -25,10 +25,16 @@ and what phase 0 actually costs.
   (--parallel serve mode, BGEN protocol, batch verify windows, `--batch-mtp`,
   the 16-row kernel work), and it rides a server main deleted.
 - Fresh baseline on the current tree, pinned config (expert-cache 7440,
-  second-gpu-gib 21, frozen profile), medians: solo decode 148.1 tok/s, 4K
-  prefill 2946.5, 16K 3545.9, 32K 5259.5, 4-clients 107.9 (serial), agent
-  cache hit 70.6%. The old program's tables sit at 126-127 solo tok/s on the
-  pre-rewrite base; every one of its numbers needs restating against this.
+  second-gpu-gib 21, frozen profile), medians of `tools/lamina_bench.py
+  --clients 4 --long`, with the off-arm's repeat as the spread: solo decode
+  148.1 (124.4-183.8; repeat boot 138.6), 4K prefill 2946.5 (repeat 2948.0),
+  16K 3545.9 (repeat 3512.2), 32K 5143.0 (repeat 5147.9), 4-clients 107.9
+  total (serial), agent cache hit 70.6%. Prefill repeats within 1%, solo
+  decode drifts ~7% boot to boot: the numbers are reproducible only under the
+  deterministic recipe (`--adapt-every 0`), which is also why the overview's
+  ±3% speed gate cannot be met on the prod-shaped config. The old program's
+  tables sit at 126-127 solo tok/s on the pre-rewrite base; every one of its
+  numbers needs restating against this.
 - Robustness find, logged not fixed: `"parallel"` on a Flash-Next config
   crashes the engine at boot. `src/server/config.cpp` (the #465 block) appends
   `--batch` without a model-kind check; a refuse-with-warning is the honest
@@ -61,25 +67,41 @@ and warm-replay tables on v31.
 
 ## As run, warm replay and the CPU prefetch (2026-11-12)
 
-A 4 x 40K-token greedy replay (`.e2e-warm.sh`, conversations seeded then decoded
-in concurrent follow-up turns) against `LAMINA_IQ_PREFETCH` = 2048 (the code
-default) / 0 / 8192, two rounds per state, states alternating: every state
-landed 100-112 total tok/s, differences inside the noise. The per-request
-metrics explain it: expert `hit_rate` ~0.98 in this shape, so CPU-resident
-experts compute ~2% of the routed work and an L3 prefetch on them cannot move
-tokens. That closes the review round's "never tried on the X3D" item:
-measured, no win at this residency; worth revisiting only if a shape with real
-CPU exposure (single-GPU boot, tier collapse) is what prod actually runs.
-Two side observations, useful for the port decision:
+A 4 x 40K-token greedy replay (`.e2e-warm.sh`: conversations seeded, then
+decoded in concurrent follow-up turns, thinking off the way
+`tools/lamina_bench.py` requests it) against `LAMINA_IQ_PREFETCH` = 2048 (the
+code default) / 0 / 8192, three rounds per state, states alternating, first
+run of the first boot flagged cold. Per-state means over the six rounds:
+2048 -> 38.6, 0 -> 35.0, 8192 -> 33.1 total tok/s, with within-state spread
+24.8-50.6 - the state ordering sits well inside the spread, so the flag gets
+no win on this box and the default stays. (The first pass of this probe was
+re-run and replaces it: it left thinking on, which filled `completion_tokens`
+with reasoning and some saved answers empty, and its headline band excluded
+the cold first boot without saying so.)
 
-- Warm concurrency hurts hard without batch slots: 4 concurrent warm requests
-  serialized, first token p50 up to ~26 s cold-boot / ~8-10 s warm, per-request
-  decode fine at 150-190 tok/s. That is the pain the port would fix.
-- Byte-identity across state runs failed, and it is not evidence of a
-  numerical bug: with `--adapt-every 1` the tier placement differs per boot, so
-  the greedy text legitimately diverges. A digest gate needs the
-  `--adapt-every 0` deterministic recipe; recorded so nobody re-runs this
-  invalid gate.
+Why no win is not established. The `/metrics` `hit_rate` (~0.98 here) counts
+prompt-cache reuse, not expert residency; the residency signal is
+`expert_tiers`, which showed 1100-2200 of 2700-6000 second-tier experts
+CPU-parked with host CPU near 40% during decode, so CPU-computed experts are
+present. Prefetch distance not moving those numbers is unexplained; revisit
+with per-tier expert counters before claiming a mechanism. Caveats kept
+honest: six rounds per state is thin, one cold boot excluded as flagged, and
+the totals swing with answer length round to round.
+
+What the same run settled:
+
+- Warm concurrency hurts hard without batch slots. 4 concurrent warm 40K-token
+  follow-ups with thinking off: 25-50 total tok/s with first-token medians
+  4-5 s (25.7 s on the cold first boot), while solo decode stays 150-190
+  tok/s. With thinking on the totals read higher (100-112) only because long
+  reasoning answers amortize the serialized prefills. This is the pain the
+  batch port would fix, now quantified.
+- The digest-gate machinery works, and placement drift was the diverger, not
+  a numerical bug: two fresh boots of the same config with `--adapt-every 0`
+  answered byte-identically in all four sessions, while the `--adapt-every 1`
+  state runs legitimately diverged. Digest gates must use the deterministic
+  recipe; that recipe is now demonstrated end-to-end on this rig
+  (`lamina-e2e-det.json`, the d1/d2 pair in `warm/`).
 
 ## Cost
 
