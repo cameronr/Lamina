@@ -101,19 +101,62 @@ fit refusal at prod's expert-cache sizing with 0.72 GiB free**.
    Same 29,022-token prompt a second time: **TTFT 0.14 s**. The same prompt alone, cold: 6.6 s
    (4,400 tok/s).
 
-2. **P1, conversation resume fidelity and cost (option A's gate).** Stop a request mid
-   generation, let another run, re-issue the stopped one with the ids it produced, and check
-   the continuation is byte-identical to an uninterrupted run and that the restore is cheap.
-   Two unknowns it answers, and they are the whole design risk: whether the parked
-   conversation's K/V includes what *decoding* wrote (if not, resuming re-reads every token it
-   produced, about 1 s per 4K tokens, and repeated preemptions compound), and whether the API
-   will take a continuation as an assistant-prefix turn. Cheap on the existing digest harness:
-   one request of 2,000 tokens, cut at 1,000, resumed, against an uninterrupted control.
+2. **P1, conversation resume fidelity and cost (option A's gate).** Measured 2026-11-12, results in
+   the section after this list. Cost answered (cheap: 0.16-0.93 s), mechanism answered (it has to be
+   ids, not a re-spelled chat turn), identity still open: `.e2e-p1c.py` cuts a generation at 1/2 and
+   3/4 of what the model actually produced, small (4K) and big (16K) conversations, so identity and
+   how the cost scales with context come back in one run.
 3. **P2, the peer card's prefill headroom** (design D), only if P1 shows preemption is not
    enough. Same question as before: how fast can a read run on GPU 0 while the main card
    decodes.
 4. **P3, prototype** behind a flag. Gates: solo runs token-identical (the phase-1 digest
    harness), then the P0 driver as the A/B, with warm-hit rate pinned as a guard.
+
+## P1 results (2026-11-12): the preemption card is real, at the id level
+
+Two probes on the shipping binary, engine-direct (`GEN` on stdin, `.e2e-p1.py`) and through the API
+(`.e2e-p1b.py`); logs `~/strata-data/bench/2026-11-12/p1.log`, `p1b.log`.
+
+- **A parked conversation's K/V covers what decoding wrote.** Re-issuing a 5,596-token conversation
+  (prompt plus everything it had decoded) reached its first token in **0.16 s**, against 1.15-1.57 s to
+  cold-read a *smaller* prompt. The restore does not re-read the generation.
+- **Cheap with depth too:** 0.55 s resuming at 5,096 tokens, 0.16 s at 5,596, 0.93 s through the API at
+  about 6K including tokenization. Against the 15-17 s of decode-turn queue a preemption dodges, the
+  switch costs 1-6% of what it saves.
+- **A chat-template continuation is not byte-safe, so the mechanism has to be ids.** Feeding the partial
+  answer back as a trailing assistant turn was a coin flip: cut at 1,369 chars the model *restarted its
+  own count from 1*; cut at 1,200 chars it continued identically for all 500 compared characters. The
+  template closes the assistant turn, so whether the model reads "continue" or "answer again" depends on
+  where the cut landed. The server holds the ids already, and `GEN prompt+produced` is both the cheap
+  path and the only exact one.
+- Parking is on by default and prod does not override it: `prompt_cache = 16`,
+  `conversation_cache_mib = 16384`, `conversation_cache_min_tokens = 1024`
+  (`src/program/generate.cpp:252-264`).
+
+For implementation shape, the server already has the hard part: requests are *legs* in
+`src/server/engine_batch.cpp` (the `#1869` carry, `may_go_solo`), which already resume one request across
+a STOP and a re-issue. Preemption is a policy on top of legs that exist, holding the client's stream open
+while the preempted conversation waits its turn, with the switch gated on the waiting request's work
+clearing the ~0.2-0.9 s restore plus a cap on preemptions per conversation so two long generations cannot
+ping-pong.
+
+## The host OOM this investigation caused (2026-11-12)
+
+P1c took the machine down. Boot `-1` ends in a kernel OOM report (85 GiB anonymous, 113 MiB free, 86 GiB
+of swap untouched) after `lamina: page allocation failure` at 12:49:53, and the sequence is legible: P1b's
+wrapper resumed inference at 12:47:56, a request arrived 7 s later and llama-swap did its job and started
+prod at 12:48:03, and the e2e container began loading its own 56 GiB pinned arena about a minute after
+that. `pause` asks llama-swap to unload but does not wait for the 120 s `docker stop` grace and the arena
+to come back, so the two engines overlapped. The earlier runs of the same wrapper were lucky: nothing had
+just summoned prod, so there was nothing to wait for.
+
+`run-e2e.sh` (gitignored, machine-local) now refuses to start a second arena until prod is *gone* and
+`MemAvailable` is back above 64 GiB, up to 300 s; runs a 3 s watchdog that `docker kill`s the test
+container the moment prod returns or free memory drops below 20 GiB mid-run; and caps the container at
+72 GiB so an unexpected overlap is a container OOM rather than a host one. `--probe` reports the same
+preconditions without pausing anything (`prod running: yes / 23941 MiB free` right now, so a run would
+correctly refuse). The `rare, accept it` line in the machine's AGENTS notes describes this same window and
+does not mention that on this box it costs a reboot.
 
 ## What the measurement settled (2026-11-12)
 
