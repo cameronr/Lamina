@@ -59,6 +59,28 @@ Gates per the overview, restated: byte-identical digests with batch off vs
 prod on the deterministic recipe, speed within +/-3%, then the client-4 short
 and warm-replay tables on v31.
 
+## As run, warm replay and the CPU prefetch (2026-11-12)
+
+A 4 x 40K-token greedy replay (`.e2e-warm.sh`, conversations seeded then decoded
+in concurrent follow-up turns) against `LAMINA_IQ_PREFETCH` = 2048 (the code
+default) / 0 / 8192, two rounds per state, states alternating: every state
+landed 100-112 total tok/s, differences inside the noise. The per-request
+metrics explain it: expert `hit_rate` ~0.98 in this shape, so CPU-resident
+experts compute ~2% of the routed work and an L3 prefetch on them cannot move
+tokens. That closes the review round's "never tried on the X3D" item:
+measured, no win at this residency; worth revisiting only if a shape with real
+CPU exposure (single-GPU boot, tier collapse) is what prod actually runs.
+Two side observations, useful for the port decision:
+
+- Warm concurrency hurts hard without batch slots: 4 concurrent warm requests
+  serialized, first token p50 up to ~26 s cold-boot / ~8-10 s warm, per-request
+  decode fine at 150-190 tok/s. That is the pain the port would fix.
+- Byte-identity across state runs failed, and it is not evidence of a
+  numerical bug: with `--adapt-every 1` the tier placement differs per boot, so
+  the greedy text legitimately diverges. A digest gate needs the
+  `--adapt-every 0` deterministic recipe; recorded so nobody re-runs this
+  invalid gate.
+
 ## Cost
 
 Days of focused porting across engine, server, and kernels, with the exactness
