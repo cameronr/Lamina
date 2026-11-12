@@ -299,10 +299,10 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         if (f.had_gu) {   // run rotated dx in place: the kernel's floats against hadamard_rotate's
             std::vector<float> dr(x.size());
             cudaMemcpy(dr.data(), dx, dr.size() * 4, cudaMemcpyDeviceToHost);
-            size_t nd = 0;
-            for (size_t i = 0; i < dr.size(); ++i) nd += std::memcmp(&dr[i], &xr[i], 4) != 0;
-            std::printf("          GPU rotation vs the CPU's: %zu of %zu floats differ  %s\n", nd, dr.size(), nd == 0 ? "ok" : "FAIL");
-            failures += nd != 0;
+            size_t nrot = 0;
+            for (size_t i = 0; i < dr.size(); ++i) nrot += std::memcmp(&dr[i], &xr[i], 4) != 0;
+            std::printf("          GPU rotation vs the CPU's: %zu of %zu floats differ  %s\n", nrot, dr.size(), nrot == 0 ? "ok" : "FAIL");
+            failures += nrot != 0;
         }
         if (exact) {
             run(true, got_gx);

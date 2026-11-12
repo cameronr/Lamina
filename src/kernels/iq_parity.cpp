@@ -43,15 +43,20 @@ int main(int argc, char** argv) {
             ++missing;
             continue;
         }
-        int hdr[3];
-        std::fread(hdr, 4, 3, f);
+        int hdr[3] = {0, 0, 0};
+        const bool hdr_whole = std::fread(hdr, 4, 3, f) == 3;
         const int type = hdr[0], rows = hdr[1], cols = hdr[2];
         std::vector<uint8_t> raw;
         { uint8_t buf[1 << 16]; size_t n; while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) raw.insert(raw.end(), buf, buf + n); }
         std::vector<float> ref((size_t) rows * cols);
-        std::fread(ref.data(), 4, ref.size(), g);
+        const bool ref_whole = std::fread(ref.data(), 4, ref.size(), g) == ref.size();
         std::fclose(f);
         std::fclose(g);
+        if (!hdr_whole || !ref_whole) {
+            std::printf("%-8s short fixture: %s/%s.bin or %s/%s.f32\n", nm, dir.c_str(), nm, dir.c_str(), nm);
+            ++failures;
+            continue;
+        }
         void* dw = nullptr;
         float* dq = nullptr;
         cudaMalloc(&dw, raw.size());

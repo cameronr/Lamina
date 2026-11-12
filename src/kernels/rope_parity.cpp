@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
     std::vector<float> got(ref.size());
     check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "back");
 
-    // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  *c - b*s is one of the expressions the compiler is free to
+    // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  a*c - b*s is one of the expressions the compiler is free to
     // contract into an FMA, and the host and device compilers choose differently - so a handful of values
     // differ in the last bit.  Round 167 established this the hard way: a bit-equality expectation that a
     // kernel cannot meet is a test that reports a correct kernel as broken.  The residual is reported, and if
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
     long long rot_bad = 0;
     double worst = 0.0;
     long long first_bad = -1;
-    // The denominator is the ROW'S INPUT MAGNITUDE, not the element's own value.  *c - b*s cancels, so an
+    // The denominator is the ROW'S INPUT MAGNITUDE, not the element's own value.  a*c - b*s cancels, so an
     // element whose result is near zero reports a large relative error for a 1-ULP absolute one - which is the
     // same metric mistake round 169 found on Q4_K's dot products, where the fix was to measure against
     // sum|term| instead of the result.  Here the natural scale of the computation is the largest input in the
@@ -142,10 +142,8 @@ int main(int argc, char** argv) {
         check(cudaMemcpy(d_pos, &p7, sizeof(int), cudaMemcpyHostToDevice), "copy p7");
         lamina::kernels::rope_neox_apply(d_x, d_out, 1, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
         check(cudaMemcpy(o.data(), d_out, o.size() * sizeof(float), cudaMemcpyDeviceToHost), "back e");
-        int moved[4] = {0, 0, 0, 0};       // dims 0, 1, half, half+1
         const float* chk[4] = {&e[0], &e[1], &e[half], &e[half + 1]};
         (void) chk;
-        moved[0] = (o[0] != 0.0f || o[half] != 0.0f) ? 1 : 0;
         const bool adjacent_moved = (o[1] != 0.0f);
         const bool neox_moved = (o[half] != 0.0f);
         std::printf("  pairing: dim 0 set -> NEOX moves dim %d (o[half]=%.6f), adjacent would move dim 1 "
