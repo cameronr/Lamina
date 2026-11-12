@@ -6,8 +6,7 @@
 #include "lamina/kernels/elementwise.hpp"
 #include "lamina/kernels/native_mmvq.hpp"
 #include "lamina/kernels/verify_kernels.hpp"
-
-#include <immintrin.h>
+#include "lamina/platform/cpu_arch.hpp"
 
 #include <chrono>
 #include <exception>
@@ -147,7 +146,7 @@ bool SplitHead::submit(int T, bool logits, std::string& err) {
 bool SplitHead::wait(uint32_t n, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
     while (*(volatile uint32_t*) h_done_ < n) {
-        _mm_pause();
+        platform::cpu_relax();
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) {
             DeviceScope scope(dev_, main_);
             err = std::string("split head: its part never finished (") + cudaGetErrorString(cudaStreamQuery(s_)) + ")";

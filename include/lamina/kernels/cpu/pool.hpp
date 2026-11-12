@@ -20,13 +20,13 @@
 // claim a job from the NEXT batch.  Closing is what makes a late worker harmless: one that notices a phase
 // only after the host finished it (it was asleep, or descheduled) finds it closed and waits for the next.
 //
-// HOW A PARKED WORKER WAITS.  It spins on the word (`_mm_pause`) for `kParkSpinTicks`, which covers a layer's
-// phases, opened microseconds apart.  Past that, where the CPU has MONITORX / MWAITX (AMD: `cpu_mwaitx_ok`), it
-// waits in them for the next store to the word: through a round a worker is parked most of the time (a layer's
-// phases are a fraction of the main GPU's part of it), and the wait costs a Ryzen 7 9700X's package 4-7 W less
-// than the spin at the same speed: a wake takes 0.23 us instead of 0.04-0.10, and the host, which opens the
-// phase, starts on its tasks at once.  MWAITX's timer (`kWaitTicks`) ends a wait whose store was missed (about one
-// in 40,000 under a hypervisor): that worker joins late or not at all, which the protocol above allows.  Other
+// HOW A PARKED WORKER WAITS.  It spins on the word (`cpu_relax`: PAUSE, arm64's YIELD) for `kParkSpinTicks`, which
+// covers a layer's phases, opened microseconds apart.  Past that, where the CPU has MONITORX / MWAITX (AMD:
+// `cpu_mwaitx_ok`), it waits in them for the next store to the word: through a round a worker is parked most of the
+// time (a layer's phases are a fraction of the main GPU's part of it), and the wait costs a Ryzen 7 9700X's package
+// 4-7 W less than the spin at the same speed: a wake takes 0.23 us instead of 0.04-0.10, and the host, which opens
+// the phase, starts on its tasks at once.  MWAITX's timer (`kWaitTicks`) ends a wait whose store was missed (about
+// one in 40,000 under a hypervisor): that worker joins late or not at all, which the protocol above allows.  Other
 // CPUs keep the spin.
 //
 // IDLE WORKERS SLEEP.  After `kIdleSpin` parked, a worker blocks on the word (`std::atomic::wait`: WaitOnAddress,

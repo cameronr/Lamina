@@ -17,6 +17,7 @@
 #include "lamina/kernels/cpu/expert.hpp"
 #include "lamina/kernels/cpu/expert_layout.hpp"
 #include "lamina/kernels/cpu/iq_avx512.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 #include "ggml-cpu.h"
 #include "lamina/kernels/iq_kernels.hpp"
 #include "lamina/kernels/quantize_act.hpp"
@@ -143,6 +144,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             for (int i = 0; i < it; ++i) cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
             std::printf("          gate+up one thread, weights cache-resident: %.0f us one token (%.2f GB/s), %.0f us %d tokens\n",
                         us1, 2.0 * f.up_off / us1 / 1e3, us_since(t0, it), NT);
+#if LAMINA_X86
             size_t ndiff = 0;
             std::vector<std::vector<float>> refs(NT, std::vector<float>(FF)), gots(NT, std::vector<float>(FF));
             float* rp[NT];
@@ -172,8 +174,10 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             }
             std::printf("          trellis rows, AVX2 and AVX-512 against scalar: %zu differ  %s\n", ndiff, ndiff == 0 ? "ok" : "FAIL");
             failures += ndiff != 0;
+#endif
         }
         const auto* tc = tq ? nullptr : ggml_get_type_traits_cpu((ggml_type) f.gu_type);
+#if LAMINA_X86
         if (cpu::iq512_supported(f.gu_type) && cpu::cpu_avx512_ok()) {   // its kernel only where the CPU runs it
             // the AVX-512 rows against ggml's own vec_dot, same Q8_K activations: float-order differences only
             std::vector<float> g512((size_t) NT * FF), gref((size_t) NT * FF);
@@ -194,6 +198,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             std::printf("          gate+up one thread, weights cache-resident: avx512 %.0f us one token (%.2f GB/s), "
                         "%.0f us %d tokens\n", us1, 2.0 * f.up_off / us1 / 1e3, us_since(t0, it), NT);
         }
+#endif
         if (!tq) {   // ggml-cpu's own rows, one thread (what the pool runs for formats without an AVX-512 kernel)
             auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < it; ++i)
@@ -229,6 +234,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             }
             cpu::native_down_rows(f, blob.data(), hxp, NT, oxp, 0, (int) H);
         }
+#if LAMINA_X86
         if (f.d_type == 42) {
             // (b2) the AVX-512 GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections
             std::vector<cpu::ActQ> a2(NT);
@@ -243,6 +249,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             cpu::q2_0_gguf_rows_multi(blob.data() + f.down_off, f.d_row, (int) (FF / 64), ap, NT, altp, 0, (int) H);
             std::printf("          q2_0 AVX-512 down vs ggml down: rel %.2e\n", rel(alt, got_c));
         }
+#endif
     }
     // (c) the GPU: one group holding the NT entries, fast and (c2) exact; (d) its dequantizers
     {

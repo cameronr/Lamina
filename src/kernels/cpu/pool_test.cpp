@@ -20,6 +20,7 @@
 //      against a serial run of the same kernels.
 #include "lamina/kernels/cpu/pool.hpp"
 #include "lamina/kernels/cpu/expert.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 #if defined(LAMINA_NATIVE_EXPERTS)
 #include "ggml.h"
 #endif
@@ -40,6 +41,7 @@ namespace cpu = lamina::kernels::cpu;
 
 namespace {
 
+#if LAMINA_X86
 bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     out.assign(cpu::BLOB, 0);
     std::FILE* f = std::fopen(path, "rb");
@@ -53,6 +55,7 @@ bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     std::fclose(f);
     return got == out.size();
 }
+#endif
 
 double now_ms() {
     using namespace std::chrono;
@@ -100,6 +103,7 @@ void stress_report(const char* what, const StressStats& s, uint32_t sleeps) {
                 "  a one-expert batch", median(s.ms_spinning), median(s.ms_after_sleep));
 }
 
+#if LAMINA_X86
 /// `run()`: whole Q2_0 experts.  Random codes with finite scales: the protocol is under test, not the kernel.
 StressStats stress_run(cpu::ExpertPool& pool, std::mt19937& rng, int iters) {
     const int NB = 4, NA = 4, MAXJ = 16;
@@ -141,6 +145,7 @@ StressStats stress_run(cpu::ExpertPool& pool, std::mt19937& rng, int iters) {
     }
     return s;
 }
+#endif
 
 #if defined(LAMINA_NATIVE_EXPERTS)
 /// `run_split_multi_native` (or `run_fused_native`: both halves in one phase): one layer's experts in GGUF formats,
@@ -227,6 +232,7 @@ int stress(int iters) {
                 pool.workers(), pool.waits_in_mwaitx() ? "spin, then wait in MWAITX" : "spin",
                 (long long) cpu::ExpertPool::kIdleSpin.count());
     int bad = 0;
+#if LAMINA_X86
     if (cpu::cpu_features().usable()) {
         const uint32_t z0 = pool.sleeps();
         const StressStats s = stress_run(pool, rng, iters);
@@ -235,6 +241,9 @@ int stress(int iters) {
     } else {
         std::printf("  run(): SKIPPED, the CPU lacks %s\n", cpu::cpu_features().reason());
     }
+#else
+    std::printf("  run(): SKIPPED, the Q2_0 pack's kernel is x86-64 only\n");
+#endif
 #if defined(LAMINA_NATIVE_EXPERTS)
     const struct { ggml_type gu, dn; bool fused; const char* name; } fmts[] = {
         {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, false, "native rows, Q4_K / Q5_1"},             // ggml-cpu's dot products
@@ -282,6 +291,14 @@ int main(int argc, char** argv) {
         }
     }
     if (stress_iters > 0) return stress(stress_iters);
+#if !LAMINA_X86
+    (void) selftest;
+    (void) path;
+    (void) layer;
+    std::printf("  the Q2_0 pack's kernel is x86-64 only: pool test SKIPPED, not passed.\n");
+    std::printf("\npool: 0 failures, 1 SKIPPED\n");
+    return 0;
+#else
 
     const cpu::CpuFeatures feat = cpu::cpu_features();
     if (!feat.usable()) {
@@ -441,4 +458,5 @@ int main(int argc, char** argv) {
     if (bad) return 1;
     if (selftest) std::printf("pool_test OK\n");
     return 0;
+#endif
 }

@@ -2,17 +2,19 @@
 #include "lamina/kernels/cpu/pool.hpp"
 #include "lamina/kernels/cpu/expert_layout.hpp"
 
+#include "lamina/platform/cpu_arch.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
-#if defined(_MSC_VER)
+#if LAMINA_X86 && defined(_MSC_VER)
 #include <intrin.h>
-#else
+#elif LAMINA_X86
 #include <x86intrin.h>
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -209,7 +211,9 @@ GROUP_AFFINITY group_affinity(int core) {
 #endif
 
 // MONITORX arms a monitor on `word`'s cache line; MWAITX then waits, in C1, until a store to that line, an interrupt
-// or `ticks` of the TSC (ECX bit 1: EBX is a timer).  Only where cpu_mwaitx_ok().
+// or `ticks` of the TSC (ECX bit 1: EBX is a timer).  Only where cpu_mwaitx_ok(), which arm64 never is.
+#if LAMINA_X86
+inline uint64_t tsc() { return __rdtsc(); }
 inline void monitorx(const void* word) {
 #if defined(_MSC_VER)
     _mm_monitorx(word, 0, 0);
@@ -224,6 +228,12 @@ inline void mwaitx(uint32_t ticks) {
     __asm__ volatile(".byte 0x0f, 0x01, 0xfb" : : "a"(0u), "b"(ticks), "c"(2u));
 #endif
 }
+#else
+inline uint64_t tsc() { return 0; }
+inline void monitorx(const void*) {}
+inline void mwaitx(uint32_t) {}
+#endif
+using platform::cpu_relax;
 
 void pin_this_thread(int core) {
     if (core < 0) return;
@@ -323,13 +333,13 @@ ExpertPool::~ExpertPool() {
 void ExpertPool::worker(int id) {
     uint32_t seen = 0;   // the last epoch this worker joined
     for (;;) {
-        // Park: wait for an open phase this worker has not joined.  `_mm_pause` rather than a bare spin because
-        // it yields the pipeline to the sibling hyperthread; past `kParkSpinTicks`, MWAITX where the CPU has it
-        // (pool.hpp).  The loop writes nothing shared (see the note on the atomics in pool.hpp) until it joins, or
+        // Park: wait for an open phase this worker has not joined.  `cpu_relax` (PAUSE) rather than a bare spin
+        // because it yields the pipeline to the sibling hyperthread; past `kParkSpinTicks`, MWAITX where the CPU has
+        // it (pool.hpp).  The loop writes nothing shared (see the note on the atomics in pool.hpp) until it joins, or
         // goes to sleep after `kIdleSpin` without work.
         uint64_t s = state_.load(std::memory_order_acquire);
         auto idle_from = std::chrono::steady_clock::now();
-        const uint64_t parked_at = mwaitx_ ? __rdtsc() : 0;
+        const uint64_t parked_at = mwaitx_ ? tsc() : 0;
         for (uint32_t spins = 1;; ++spins) {
             if (stop_.load(std::memory_order_relaxed)) return;
             if (!(s & kClosed) && (uint32_t) (s >> 32) != seen) {
@@ -338,13 +348,13 @@ void ExpertPool::worker(int id) {
                 continue;
             }
             bool waited = false;
-            if (mwaitx_ && __rdtsc() - parked_at > kParkSpinTicks) {
+            if (mwaitx_ && tsc() - parked_at > kParkSpinTicks) {
                 // a store between the read of `s` and the monitor's arming would be waited out: read again
                 monitorx(&state_);
                 if (state_.load(std::memory_order_acquire) == s) mwaitx(kWaitTicks);
                 waited = true;
             } else {
-                _mm_pause();
+                cpu_relax();
             }
             // a wait returns at a store or at its timer, far apart when idle: the clock is read after each
             if ((waited || spins % 1024 == 0) && std::chrono::steady_clock::now() - idle_from > kIdleSpin) {
@@ -381,14 +391,18 @@ void ExpertPool::close_phase() {
     for (uint64_t s = open;
          !state_.compare_exchange_weak(s, open | kClosed, std::memory_order_acq_rel, std::memory_order_relaxed);
          s = open)
-        _mm_pause();
+        cpu_relax();
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch) {
     (void) id;
+#if !LAMINA_X86
+    (void) scratch;
+#endif
     for (;;) {
         const uint32_t i = head_.fetch_add(1, std::memory_order_relaxed);
         if (i >= (uint32_t) njobs_) break;
+#if LAMINA_X86   // the Q2_0 pack's whole experts and rows (run, run_split): expert.cpp's kernels, x86-64 only
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
@@ -400,7 +414,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
-        } else if (mode_ == 7) {
+        } else
+#endif
+        if (mode_ == 7) {
             // the fused native layer (run_fused_native): every expert's gate/up parts, then every expert's down
             // parts, claimed in that order; a down part waits (spins) for its expert's h, which the thread that
             // finishes the expert's last gate/up part quantizes.  Every gate/up part is claimed before any down
@@ -415,7 +431,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch) {
                 }
             } else {
                 const int j = (int) i - na, e = j / fb_, part = j % fb_, he = (int) nfmt_->n_embd;
-                while (fstate_[(size_t) e].ready.load(std::memory_order_acquire) == 0) _mm_pause();
+                while (fstate_[(size_t) e].ready.load(std::memory_order_acquire) == 0) cpu_relax();
                 native_down_part(e, he * part / fb_, he * (part + 1) / fb_);
             }
         } else if (mode_ >= 5) {
@@ -443,11 +459,16 @@ void ExpertPool::run_phase(int mode, int n_tasks, void (*first)(void*), void* ct
     open_phase();
     if (first != nullptr) first(ctx);
     if (host_works_) drain(-1, host_scratch_);
-    while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) _mm_pause();
+    while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) cpu_relax();
     close_phase();
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
+#if !LAMINA_X86
+    (void) jobs;
+    (void) n;
+    std::abort();   // the Q2_0 pack's kernels (expert.cpp) are x86-64 only: nothing on arm64 makes these jobs
+#else
     if (n <= 0) return;
     if (n > kMaxSplit || n_ == 1) { run(jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -461,6 +482,7 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     run_phase(2, n * parts_b_);
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+#endif
 }
 
 
@@ -565,6 +587,11 @@ void ExpertPool::run_fused_native(const NativeFmt& f, ExpertJobMulti* jobs, int 
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {
+#if !LAMINA_X86
+    (void) jobs;
+    (void) n;
+    std::abort();   // the Q2_0 pack's kernel (expert.cpp) is x86-64 only: nothing on arm64 makes these jobs
+#else
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
         for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
@@ -606,7 +633,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
         }
     }
 
-    while (done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
+    while (done_.load(std::memory_order_acquire) != (uint32_t) n) cpu_relax();
     // And close the phase, so the next `run` starts from a known state.  See the header for why `done` alone
     // is not enough.
     const auto t_c = std::chrono::steady_clock::now();
@@ -615,6 +642,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     ms_drain_ += std::chrono::duration<double, std::milli>(t_c - t_b).count();
     ms_close_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
+#endif
 }
 
 }  // namespace lamina::kernels::cpu

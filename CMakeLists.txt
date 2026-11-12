@@ -6,10 +6,21 @@ cmake_minimum_required(VERSION 3.24)
 project(lamina VERSION 0.1.43.1 LANGUAGES CXX)
 add_compile_definitions(LAMINA_VERSION="${PROJECT_VERSION}")
 
-# A build for other PCs (the Docker image): ggml's CPU backend for any AVX2 CPU instead of this machine's (the
-# engine's own AVX-512 kernels are per-file and chosen at run time either way), and the MSVC runtime linked in, so
-# no Visual C++ redistributable is needed.
-option(LAMINA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
+# x86-64 or arm64.  The CPU expert kernels (AVX-512, AVX2, AVX: expert.cpp and the *_avx*.cpp files) exist on x86-64
+# only; on arm64 the experts run on ggml-cpu's dot products (include/lamina/platform/cpu_arch.hpp).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+  set(LAMINA_CPU_X86 ON)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  set(LAMINA_CPU_X86 OFF)
+else()
+  message(FATAL_ERROR "Lamina builds for x86-64 and arm64 CPUs, not '${CMAKE_SYSTEM_PROCESSOR}'")
+endif()
+
+# A build for other PCs (the release binaries, the Docker image): ggml's CPU backend for any AVX2 CPU (arm64: any
+# Armv8.2 CPU with the dot product and FP16 instructions) instead of this machine's (the engine's own AVX-512 kernels
+# are per-file and chosen at run time either way), and the MSVC runtime linked in, so no Visual C++ redistributable is
+# needed.
+option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static MSVC runtime" OFF)
 if(LAMINA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
@@ -58,28 +69,30 @@ endif()
 # globally they would also hit FetchContent'd Catch2, whose -W4 warnings are not this project's to fix and
 # whose /WX failures would be indistinguishable from our own.
 #
-# Every flag is guarded by COMPILE_LANGUAGE:CXX.  Without that guard nvcc receives bare `/W4 /utf-8` and dies
-# with "A single input file is required for a non-link phase" - it parses them as inputs rather than host
-# flags.  Host flags for CUDA must go through -Xcompiler, which is what COMPILE_LANGUAGE:CUDA does below.
+# MSVC's flags go to clang-cl too (MSVC is set for both: Windows on Arm compiles with clang-cl), and nvcc's host
+# compiler on Windows is always MSVC's cl.  Every flag is guarded by COMPILE_LANGUAGE:CXX.  Without that guard nvcc
+# receives bare `/W4 /utf-8` and dies with "A single input file is required for a non-link phase" - it parses them as
+# inputs rather than host flags.  Host flags for CUDA must go through -Xcompiler, which is what COMPILE_LANGUAGE:CUDA
+# does below.
 add_library(lamina_warnings INTERFACE)
 target_compile_options(lamina_warnings INTERFACE
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/utf-8>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${MSVC}>>:/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${MSVC}>>:/utf-8>
   # C4324: a struct padded after an alignas member (the CPU pool's activation images), as intended; the CUDA
   # sources that include them (the Qwen3.6 path) see it through the host compiler.
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/wd4324>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/wd4324>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wall>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Wextra>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${MSVC}>>:/wd4324>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/wd4324>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MSVC}>>>:-Wall>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MSVC}>>>:-Wextra>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/W4>
   # C4211 comes from the host stubs nvcc generates for kernels with internal linkage (anonymous namespaces).
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/wd4211>)
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/wd4211>)
 # fopen, sscanf and getenv are standard C; MSVC deprecates them in favour of its own _s variants.
-target_compile_definitions(lamina_warnings INTERFACE $<$<CXX_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>)
+target_compile_definitions(lamina_warnings INTERFACE $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>)
 if(LAMINA_WERROR)
   target_compile_options(lamina_warnings INTERFACE
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
-    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-Werror>)
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${MSVC}>>:/WX>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MSVC}>>>:-Werror>)
 endif()
 
 # ---- lamina_artifact -------------------------------------------------------
@@ -307,16 +320,6 @@ if(LAMINA_ENABLE_CUDA)
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 endif()
 
-# ---- lamina_kernels_cpu (P2.S3) ----
-#
-# A SEPARATE LIBRARY from `lamina_kernels`, and `/arch:AVX512` is set on the SOURCE rather than on the target
-# so that the flag applies only to the TU that needs it.  Both parts matter:
-#
-#   * the CPU expert kernel uses `_mm256_dpbusd_epi32` (AVX512-VNNI) and `_mm256_multishift_epi64_epi8`
-#     (AVX512-VBMI); without the flag MSVC reports undeclared intrinsics and never mentions AVX-512;
-#   * a TU compiled WITH `/arch:AVX512` may use AVX-512 in ANY of its code, so the scalar fallback and the
-#     test drivers must NOT be in it - otherwise the fallback is not a fallback, it is the same bet with
-#     worse opt-out.
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(lamina_spec STATIC src/spec/suffix_drafter.cpp)
 target_include_directories(lamina_spec PUBLIC include)
@@ -330,31 +333,44 @@ if(LAMINA_BUILD_TESTS)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
-add_library(lamina_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+# ---- lamina_kernels_cpu (P2.S3) ----
+#
+# A SEPARATE LIBRARY from `lamina_kernels`, and `/arch:AVX512` is set on the SOURCE rather than on the target
+# so that the flag applies only to the TU that needs it.  Both parts matter:
+#
+#   * the CPU expert kernel uses `_mm256_dpbusd_epi32` (AVX512-VNNI) and `_mm256_multishift_epi64_epi8`
+#     (AVX512-VBMI); without the flag MSVC reports undeclared intrinsics and never mentions AVX-512;
+#   * a TU compiled WITH `/arch:AVX512` may use AVX-512 in ANY of its code, so the scalar fallback and the
+#     test drivers must NOT be in it - otherwise the fallback is not a fallback, it is the same bet with
+#     worse opt-out.
+# The x86 kernels exist on x86-64 only (LAMINA_CPU_X86); the pool and the probes build everywhere.
+add_library(lamina_kernels_cpu STATIC src/kernels/cpu/pool.cpp src/kernels/cpu/expert_layout.cpp
+            src/kernels/cpu/hadamard.cpp)
 target_include_directories(lamina_kernels_cpu PUBLIC include)
-# Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
-# and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
-  set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-  set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-else()
-  # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
-  set_source_files_properties(src/kernels/cpu/expert.cpp
-                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-  set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-endif()
-# AVX-VNNI (Alder Lake, Zen 5 and later): the AVX-2 expert kernels' vpdpwssd / vpdpbusd copies (q2_avx2.cpp,
-# iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok(); the same integer sums.  GCC and Clang compile
-# only those functions with target("avxvnni"), MSVC takes the intrinsics under /arch:AVX2.  A compiler without them
-# (GCC < 11, Clang < 12) builds the files without the copies.  (Upstream's, b211ba17.)
-include(CheckCXXSourceCompiles)
-if(MSVC)
-  set(CMAKE_REQUIRED_FLAGS "/arch:AVX2")
-else()
-  set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
-endif()
-check_cxx_source_compiles([=[
+if(LAMINA_CPU_X86)
+  target_sources(lamina_kernels_cpu PRIVATE src/kernels/cpu/expert.cpp src/kernels/cpu/q2_avx2.cpp)
+  # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
+  # and the engine picks the kernels at run time (cpu_avx512_ok).
+  if(MSVC)
+    set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  else()
+    # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
+    set_source_files_properties(src/kernels/cpu/expert.cpp
+                                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+    set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  endif()
+  # AVX-VNNI (Alder Lake, Zen 5 and later): the AVX-2 expert kernels' vpdpwssd / vpdpbusd copies (q2_avx2.cpp,
+  # iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok(); the same integer sums.  GCC and Clang compile
+  # only those functions with target("avxvnni"), MSVC takes the intrinsics under /arch:AVX2.  A compiler without them
+  # (GCC < 11, Clang < 12) builds the files without the copies.  (Upstream's, b211ba17.)
+  include(CheckCXXSourceCompiles)
+  if(MSVC)
+    set(CMAKE_REQUIRED_FLAGS "/arch:AVX2")
+  else()
+    set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
+  endif()
+  check_cxx_source_compiles([=[
 #include <immintrin.h>
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avxvnni")))
@@ -365,13 +381,14 @@ int main() {
     return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
 }
 ]=] LAMINA_HAVE_AVXVNNI_INTRINSICS)
-unset(CMAKE_REQUIRED_FLAGS)
-if(LAMINA_HAVE_AVXVNNI_INTRINSICS)
-  set(_lamina_avxvnni LAMINA_AVXVNNI=1)
-else()
-  set(_lamina_avxvnni LAMINA_AVXVNNI=0)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(LAMINA_HAVE_AVXVNNI_INTRINSICS)
+    set(_lamina_avxvnni LAMINA_AVXVNNI=1)
+  else()
+    set(_lamina_avxvnni LAMINA_AVXVNNI=0)
+  endif()
+  set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_lamina_avxvnni})
 endif()
-set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_lamina_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(lamina_kernels_cpu PUBLIC Threads::Threads)
 # The expert pool against serial runs; `--stress` needs no pack (synthetic experts, idle gaps that put the workers
@@ -396,10 +413,8 @@ if(LAMINA_NATIVE_EXPERTS)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   if(LAMINA_PORTABLE)
-    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-    foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
-      set(${_f} ON CACHE BOOL "" FORCE)
-    endforeach()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/lamina_ggml_portable.cmake)
+    lamina_ggml_portable()
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
@@ -437,43 +452,47 @@ if(LAMINA_NATIVE_EXPERTS)
   add_subdirectory(${_lamina_llama_root} ${CMAKE_BINARY_DIR}/llama EXCLUDE_FROM_ALL)
   # part of lamina_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(lamina_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
-                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp
-                                           src/kernels/cpu/tq_avx512.cpp)
+  target_sources(lamina_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/tq_cpu.cpp)
   target_include_directories(lamina_kernels_cpu PRIVATE third_party/ggml third_party/ggml-tq)
-  if(MSVC)
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    # older CPUs' kernels (AVX1, called behind cpu_avx1_ok() && !cpu_avx2_ok()): no FMA, no 256-bit integer ops
-    set_source_files_properties(src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
-  else()
-    set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-    set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-    set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-    set_source_files_properties(src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS
-                                "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+  if(LAMINA_CPU_X86)
+    target_sources(lamina_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
+                                             src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/q2_avx1.cpp
+                                             src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/tq_avx2.cpp
+                                             src/kernels/cpu/tq_avx512.cpp)
+    if(MSVC)
+      set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+      set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+      set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+      # older CPUs' kernels (AVX1, called behind cpu_avx1_ok() && !cpu_avx2_ok()): no FMA, no 256-bit integer ops
+      set_source_files_properties(src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+    else()
+      set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                  "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+      set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+      set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+      set_source_files_properties(src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp PROPERTIES COMPILE_OPTIONS
+                                  "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+    endif()
+    set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_lamina_avxvnni})
   endif()
-  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_lamina_avxvnni})
   target_link_libraries(lamina_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(lamina_kernels_cpu PUBLIC LAMINA_NATIVE_EXPERTS=1)
   if(TARGET ple_reader_test)   # the PLE table's rows against ggml's to_float
     target_link_libraries(ple_reader_test PRIVATE ggml-base)
     target_compile_definitions(ple_reader_test PRIVATE LAMINA_NATIVE_EXPERTS=1)
   endif()
-  # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp; with AVX-VNNI where the CPU has it) bit for bit
-  # against each other at 1..8 tokens and against ggml-cpu's dot, on random blocks; --bench: ms per expert on one
-  # thread, the weights streamed from DRAM
-  add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
-  target_link_libraries(iq_avx2_parity PRIVATE lamina_kernels_cpu)
-  add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
-  # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
-  add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
-  target_link_libraries(q8k_quant_parity PRIVATE lamina_kernels_cpu)
-  add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
+  if(LAMINA_CPU_X86)
+    # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp; with AVX-VNNI where the CPU has it) bit for bit
+    # against each other at 1..8 tokens and against ggml-cpu's dot, on random blocks; --bench: ms per expert on one
+    # thread, the weights streamed from DRAM
+    add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+    target_link_libraries(iq_avx2_parity PRIVATE lamina_kernels_cpu)
+    add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+    # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
+    add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
+    target_link_libraries(q8k_quant_parity PRIVATE lamina_kernels_cpu)
+    add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
+  endif()
   if(LAMINA_ENABLE_CUDA)
     # llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, from the same checkout as ggml: mmq.cuh's
     # instances for the expert types of ISTA-DASLab's and unsloth's files and the quantizer, with the few host
@@ -598,19 +617,23 @@ if(LAMINA_BUILD_TESTS)
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the 38 GB model; run it by hand or from tools/gpu_session.py)
-  add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
-  target_link_libraries(dequant_bf16_test PRIVATE lamina_kernels lamina_artifact CUDA::cudart)
+  if(LAMINA_ENABLE_CUDA)
+    add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
+    target_link_libraries(dequant_bf16_test PRIVATE lamina_kernels lamina_artifact CUDA::cudart)
+  endif()
 
-  add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
-  target_link_libraries(expert_multi_test PRIVATE lamina_kernels_cpu)
-  add_test(NAME expert_multi_test COMMAND expert_multi_test)
+  if(LAMINA_CPU_X86)   # the AVX-512 Q2_0 kernel's (expert.cpp)
+    add_executable(expert_multi_test src/kernels/cpu/expert_multi_test.cpp)
+    target_link_libraries(expert_multi_test PRIVATE lamina_kernels_cpu)
+    add_test(NAME expert_multi_test COMMAND expert_multi_test)
 
-  add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
-  target_link_libraries(expert_parity PRIVATE lamina_kernels_cpu)
-  # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
-  # missing file would otherwise be reported as a pass by a test that skipped everything.
-  add_test(NAME expert_parity COMMAND expert_parity --selftest
-           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
+    target_link_libraries(expert_parity PRIVATE lamina_kernels_cpu)
+    # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
+    # missing file would otherwise be reported as a pass by a test that skipped everything.
+    add_test(NAME expert_parity COMMAND expert_parity --selftest
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
 
   add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME pool_stress COMMAND pool_test --stress)
@@ -684,9 +707,15 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
     # rules of llama.cpp's libraries)
     install(TARGETS lamina lamina-server RUNTIME DESTINATION bin COMPONENT lamina)
     if(WIN32)
+      if(LAMINA_CPU_X86)
+        set(_lamina_dll_dir x64)
+      else()
+        set(_lamina_dll_dir arm64)
+      endif()
       file(GLOB _lamina_cuda_dlls "${CUDAToolkit_BIN_DIR}/cudart64_*.dll" "${CUDAToolkit_BIN_DIR}/cublas64_*.dll"
-           "${CUDAToolkit_BIN_DIR}/cublasLt64_*.dll" "${CUDAToolkit_BIN_DIR}/x64/cudart64_*.dll"
-           "${CUDAToolkit_BIN_DIR}/x64/cublas64_*.dll" "${CUDAToolkit_BIN_DIR}/x64/cublasLt64_*.dll")
+           "${CUDAToolkit_BIN_DIR}/cublasLt64_*.dll" "${CUDAToolkit_BIN_DIR}/${_lamina_dll_dir}/cudart64_*.dll"
+           "${CUDAToolkit_BIN_DIR}/${_lamina_dll_dir}/cublas64_*.dll"
+           "${CUDAToolkit_BIN_DIR}/${_lamina_dll_dir}/cublasLt64_*.dll")
       install(FILES ${_lamina_cuda_dlls} DESTINATION bin COMPONENT lamina)
     endif()
   endif()

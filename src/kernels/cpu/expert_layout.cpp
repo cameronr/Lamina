@@ -1,16 +1,16 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "lamina/kernels/cpu/expert_layout.hpp"
 #include "lamina/kernels/cpu/hadamard.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#if defined(_MSC_VER)
+#if LAMINA_X86 && defined(_MSC_VER)
 #include <intrin.h>
-#include <immintrin.h>
-#else
+#elif LAMINA_X86
 #include <cpuid.h>
 #endif
 #include <sstream>
@@ -38,6 +38,42 @@ int cpu_isa_cap() {
     return cap;
 }
 
+const char* isa_floor_build() {
+#if defined(LAMINA_ISA_FLOOR_AVX)
+    return "avx";
+#elif defined(LAMINA_ISA_FLOOR_NONE)
+    return "sse4.2";
+#else
+    return "";
+#endif
+}
+
+int iq256_gather_setting() {
+    static const int s = [] {
+        const char* v = std::getenv("LAMINA_IQ256_GATHER");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    return s;
+}
+
+const char* CpuFeatures::reason() const {
+    if (usable()) return "ok";
+    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
+    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
+    static char buf[160];
+    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
+                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
+                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
+    return buf;
+}
+
+#if LAMINA_X86
+// ---- the AVX-512 probe (#795) ----
+//
+// expert.cpp and iq_avx512.cpp are compiled for AVX-512, and a TU compiled that way may use AVX-512 in ANY of its
+// code.  The code that decides whether this CPU has AVX-512 therefore lives here, in a file compiled for the
+// x86-64 baseline.
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("LAMINA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
@@ -60,9 +96,7 @@ bool cpu_avx512_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64: no XCR0; cpuid reads zero there, so this is never reached
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-#endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
 #endif
         if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
@@ -96,9 +130,7 @@ bool cpu_avx2_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64: no XCR0; cpuid reads zero there, so this is never reached
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-#endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
 #endif
         if ((xcr0 & 0x6) != 0x6) return false;            // the OS saves the SSE and AVX state
@@ -126,24 +158,12 @@ bool cpu_avx1_ok() {
         const unsigned long long xcr0 = _xgetbv(0);
 #else
         unsigned lo = 0, hi = 0;
-#if !defined(__aarch64__)   // arm64: no XCR0; cpuid reads zero there, so this is never reached
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-#endif
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
 #endif
         return (xcr0 & 0x6) == 0x6;
     }();
     return ok;
-}
-
-const char* isa_floor_build() {
-#if defined(LAMINA_ISA_FLOOR_AVX)
-    return "avx";
-#elif defined(LAMINA_ISA_FLOOR_NONE)
-    return "sse4.2";
-#else
-    return "";
-#endif
 }
 
 namespace {
@@ -157,15 +177,6 @@ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
 #endif
 }
 }  // namespace
-
-int iq256_gather_setting() {
-    static const int s = [] {
-        const char* v = std::getenv("LAMINA_IQ256_GATHER");
-        if (v == nullptr || v[0] == '\0') return -1;
-        return std::atoi(v) != 0 ? 1 : 0;
-    }();
-    return s;
-}
 
 bool cpu_gather_fast() {
     static const bool ok = [] {
@@ -258,22 +269,6 @@ std::string cpu_name() {
     return b0 == std::string::npos ? std::string("unknown") : name.substr(b0, b1 - b0 + 1);
 }
 
-// ---- the AVX-512 probe (#795) ----
-//
-// expert.cpp and iq_avx512.cpp are compiled for AVX-512, and a TU compiled that way may use AVX-512 in ANY of its
-// code.  The code that decides whether this CPU has AVX-512 therefore lives here, in a file compiled for the
-// x86-64 baseline.
-const char* CpuFeatures::reason() const {
-    if (usable()) return "ok";
-    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
-    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
-    static char buf[160];
-    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
-                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
-                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
-    return buf;
-}
-
 CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
@@ -309,6 +304,22 @@ void act_quant_any(const float* x, int n, ActQ& a) {
     else if (cpu_avx2_ok()) act_quant_q8_1_avx2(x, n, a);
     else act_quant_q8_1_avx1(x, n, a);   // issue #1699
 }
+#else
+// arm64: none of the x86 kernels exist, so every probe answers no and the experts run on ggml-cpu's dot products
+// (native_expert.cpp) or the scalar references (tq_cpu.cpp)
+bool cpu_avx512_ok() { return false; }
+bool cpu_avx2_ok() { return false; }
+bool cpu_avx1_ok() { return false; }
+bool cpu_gather_fast() { return false; }
+bool cpu_gather_fast_here() { return false; }
+bool cpu_avxvnni_ok() { return false; }
+bool cpu_mwaitx_ok() { return false; }
+std::string cpu_name() { return "unknown"; }
+CpuFeatures cpu_features() { return {}; }
+// q2_native_kernels() is false here: a Q2_0 layer runs on ggml-cpu's Q2_0 dot
+void q2_rows_any(const uint8_t*, size_t, int, const ActQ* const*, int, float* const*, int, int) { std::abort(); }
+void act_quant_any(const float*, int, ActQ&) { std::abort(); }
+#endif
 
 #if !defined(LAMINA_NATIVE_EXPERTS)
 // Without ggml-cpu no native pack loads (expert_layout_load_text refuses), so these are never reached.

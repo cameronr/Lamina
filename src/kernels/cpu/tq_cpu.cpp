@@ -1,8 +1,9 @@
 // src/kernels/cpu/tq_cpu.cpp - see include/lamina/kernels/cpu/tq_cpu.hpp: the state table, the scalar reference kernel, the
 // activation scales and the run-time ISA choice.  Compiled for the baseline x86-64, so everything here runs on any CPU; the
-// AVX2 and AVX-512 kernels are in their own translation units.
+// AVX2 and AVX-512 kernels are in their own translation units (x86-64 only: arm64 runs the scalar kernel).
 #include "lamina/kernels/cpu/tq_cpu.hpp"
 #include "lamina/kernels/cpu/expert_layout.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 
 #include "tq_states.hpp"
 #include "ggml-common-tq.h"
@@ -99,8 +100,10 @@ ActSet& unpack_all(const void* const* act, int n, int nt) {
 
 void rows_on(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* a, int nt, float* const* out, int r0, int r1) {
     switch (isa()) {
+#if LAMINA_X86
         case Isa::avx512: tq_detail::tq_rows_avx512(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
         case Isa::avx2: tq_detail::tq_rows_avx2(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
+#endif
         default: tq_detail::tq_rows_scalar(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
     }
 }

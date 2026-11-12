@@ -47,6 +47,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
 EXE = ".exe" if WIN else ""
+ARM = platform.machine().lower() in ("arm64", "aarch64")
 LLAMA = ROOT / "third_party" / "llama.cpp"
 LLAMA_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"   # the engine's CMakeLists.txt checks its mmq.cuh
 CUDA_MIN = (13, 0)   # RTX 50 engines built with CUDA 12.8 crashed in long prompts (upstream #220, #224)
@@ -313,21 +314,42 @@ def nvcc_build(nvcc) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def find_vcvars(cuda_v):
-    """Visual Studio's vcvars64.bat with the C++ tools: 2019 or 2022, or 2026 with CUDA 13.3 or newer (the versions
-    CUDA accepts). LAMINA_VCVARS=<path to vcvars64.bat> picks one."""
-    if os.environ.get("LAMINA_VCVARS"):
-        v = Path(os.environ["LAMINA_VCVARS"])
-        return v if v.exists() else None
+def find_vs(cuda_v) -> Path | None:
+    """Visual Studio with the C++ tools for this PC's CPU: 2019 or 2022, or 2026 with CUDA 13.3 or newer (the versions
+    CUDA accepts)."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / \
         "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
     if not vswhere.exists():
         return None
     upper = "19.0" if cuda_v and cuda_v >= (13, 3) else "18.0"
-    p = out([str(vswhere), "-latest", "-products", "*", "-version", f"[16.0,{upper})", "-requires",
-             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
-    v = Path(p) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat" if p else None
+    tools = "Microsoft.VisualStudio.Component.VC.Tools." + ("ARM64" if ARM else "x86.x64")
+    p = out([str(vswhere), "-latest", "-products", "*", "-version", f"[16.0,{upper})", "-requires", tools,
+             "-property", "installationPath"]).strip()
+    return Path(p) if p else None
+
+
+def find_vcvars(cuda_v):
+    """The Visual Studio's vcvars64.bat (vcvarsarm64.bat on Windows on Arm). LAMINA_VCVARS=<path to it> picks one."""
+    if os.environ.get("LAMINA_VCVARS"):
+        v = Path(os.environ["LAMINA_VCVARS"])
+        return v if v.exists() else None
+    vs = find_vs(cuda_v)
+    v = vs / "VC" / "Auxiliary" / "Build" / ("vcvarsarm64.bat" if ARM else "vcvars64.bat") if vs else None
     return v if v and v.exists() else None
+
+
+def find_clang_cl(cuda_v):
+    """Windows on Arm: LLVM's clang-cl for the C and C++ code (ggml's CPU code for Arm does not build with MSVC; nvcc
+    keeps MSVC's cl): Visual Studio's own (its C++ Clang tools), LLVM's install, or the PATH's. LAMINA_CLANG_CL=<path to
+    clang-cl.exe> picks one."""
+    pick = os.environ.get("LAMINA_CLANG_CL")
+    if pick:
+        return pick if Path(pick).exists() else None
+    vs = find_vs(cuda_v)
+    cands = [vs / "VC" / "Tools" / "Llvm" / "ARM64" / "bin" / "clang-cl.exe"] if vs else []
+    cands.append(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "LLVM" / "bin" / "clang-cl.exe")
+    found = next((str(c) for c in cands if c.exists()), None)
+    return found or shutil.which("clang-cl")
 
 
 def vs_environment(vcvars: Path) -> dict:
@@ -355,6 +377,7 @@ class Toolchain:
     cuda: tuple | None
     vcvars: Path | None    # Windows
     cxx: str | None        # Linux
+    clang_cl: str | None = None   # Windows on Arm
 
     def problems(self) -> list:
         """What the build needs and setup does not install (CMake and Ninja come from requirements-build.txt)."""
@@ -366,7 +389,10 @@ class Toolchain:
             p.append(f"the CUDA toolkit {CUDA_MIN[0]}.{CUDA_MIN[1]} or newer: {self.nvcc} is {self.cuda[0]}.{self.cuda[1]}")
         if WIN and not self.vcvars:
             p.append("Visual Studio 2022's C++ tools (the free Build Tools, workload 'Desktop development with C++';"
-                     " LAMINA_VCVARS=<path to vcvars64.bat> picks one)")
+                     f" LAMINA_VCVARS=<path to {'vcvarsarm64' if ARM else 'vcvars64'}.bat> picks one)")
+        if WIN and ARM and not self.clang_cl:
+            p.append("LLVM's clang-cl (Visual Studio's 'C++ Clang Compiler for Windows', or LLVM for Windows on Arm;"
+                     " LAMINA_CLANG_CL=<path to clang-cl.exe> picks one): ggml's CPU code for Arm needs it")
         if not WIN and not self.cxx:
             p.append("a C++ compiler (Debian and Ubuntu: build-essential)")
         return p
@@ -375,7 +401,8 @@ class Toolchain:
 def toolchain() -> Toolchain:
     nvcc, cuda = find_nvcc()
     return Toolchain(find_tool("cmake"), find_tool("ninja"), nvcc, cuda,
-                     find_vcvars(cuda) if WIN else None, None if WIN else shutil.which("g++"))
+                     find_vcvars(cuda) if WIN else None, None if WIN else shutil.which("g++"),
+                     find_clang_cl(cuda) if WIN and ARM else None)
 
 
 def install_requirements(build: bool):
@@ -426,17 +453,34 @@ def cuda_archs(usable: list) -> str:
     return ";".join(str(c) for c in sorted({g.cc for g in usable}))
 
 
-def cuda_defs(nvcc: str) -> list:
-    """The CUDA compiler, the toolkit its libraries come from (CMake can otherwise link another toolkit's cudart,
-    e.g. the distribution's CUDA 12 beside /opt/cuda-13.0), and the host compilers CC, CXX and CUDAHOSTCXX name, as
-    definitions, so that a build folder made before takes them too."""
-    root = Path(nvcc).resolve().parent.parent
+def compilers(tc: Toolchain) -> tuple:
+    """The C and C++ compilers CC and CXX name, else on Windows on Arm clang-cl (tc.clang_cl), else CMake's choice."""
     cc, cxx = os.environ.get("CC", "").strip(), os.environ.get("CXX", "").strip()
-    host = os.environ.get("CUDAHOSTCXX", "").strip() or cxx
-    return [f"-DCMAKE_CUDA_COMPILER={Path(nvcc).as_posix()}"] + \
-        ([] if root == Path("/usr") else [f"-DCUDAToolkit_ROOT={root.as_posix()}"]) + \
-        ([f"-DCMAKE_C_COMPILER={cc}"] if cc else []) + ([f"-DCMAKE_CXX_COMPILER={cxx}"] if cxx else []) + \
-        ([f"-DCMAKE_CUDA_HOST_COMPILER={host}"] if host else [])
+    if WIN and ARM and tc.clang_cl:
+        cc, cxx = cc or tc.clang_cl, cxx or tc.clang_cl
+    return cc, cxx
+
+
+def compiler_defs(tc: Toolchain) -> list:
+    """compilers() as definitions, so that a build folder made before takes them too."""
+    cc, cxx = compilers(tc)
+    return ([f"-DCMAKE_C_COMPILER={Path(cc).as_posix()}"] if cc else []) + \
+        ([f"-DCMAKE_CXX_COMPILER={Path(cxx).as_posix()}"] if cxx else [])
+
+
+def cuda_defs(tc: Toolchain, env: dict) -> list:
+    """The CUDA compiler, the toolkit its libraries come from (CMake can otherwise link another toolkit's cudart,
+    e.g. the distribution's CUDA 12 beside /opt/cuda-13.0), the C and C++ compilers (compiler_defs) and nvcc's host
+    compiler: CUDAHOSTCXX, else the C++ compiler, but on Windows MSVC's cl (nvcc takes no other there)."""
+    root = Path(tc.nvcc).resolve().parent.parent
+    host = os.environ.get("CUDAHOSTCXX", "").strip()
+    if not host:
+        cxx = compilers(tc)[1]
+        path = next((v for k, v in env.items() if k.upper() == "PATH"), None)   # vcvars' environment has "Path"
+        host = (shutil.which("cl.exe", path=path) or "") if WIN and cxx else cxx
+    return [f"-DCMAKE_CUDA_COMPILER={Path(tc.nvcc).as_posix()}"] + \
+        ([] if root == Path("/usr") else [f"-DCUDAToolkit_ROOT={root.as_posix()}"]) + compiler_defs(tc) + \
+        ([f"-DCMAKE_CUDA_HOST_COMPILER={Path(host).as_posix()}"] if host else [])
 
 
 def cmake_build(tc: Toolchain, src: Path, b: Path, target: str, defs: list, env: dict):
@@ -453,11 +497,13 @@ def cmake_build(tc: Toolchain, src: Path, b: Path, target: str, defs: list, env:
         run(build, env=env)
 
 
-def build_engine(tc: Toolchain, archs: str, portable: bool, env: dict):
+def build_engine(tc: Toolchain, archs: str, portable: bool, env: dict, tests: bool = False, extra: tuple = ()):
+    """The engine and the server into build/; `tests`: every program of the tree, the tests among them (CI)."""
     b = ROOT / "build"
-    cmake_build(tc, ROOT, b, "lamina lamina-server", ["-DLAMINA_ENABLE_CUDA=ON", "-DLAMINA_BUILD_TESTS=OFF",
-                                         f"-DCMAKE_CUDA_ARCHITECTURES={archs}", f"-DLAMINA_GGML_DIR={LLAMA.as_posix()}",
-                                         f"-DLAMINA_PORTABLE={'ON' if portable else 'OFF'}", *cuda_defs(tc.nvcc)], env)
+    cmake_build(tc, ROOT, b, "all" if tests else "lamina lamina-server",
+                ["-DLAMINA_ENABLE_CUDA=ON", f"-DLAMINA_BUILD_TESTS={'ON' if tests else 'OFF'}",
+                 f"-DCMAKE_CUDA_ARCHITECTURES={archs}", f"-DLAMINA_GGML_DIR={LLAMA.as_posix()}",
+                 f"-DLAMINA_PORTABLE={'ON' if portable else 'OFF'}", *cuda_defs(tc, env), *extra], env)
     if WIN:   # the CUDA runtime beside the engine
         for dll in cuda_dlls(tc.nvcc):
             shutil.copy2(dll, b / dll.name)
@@ -465,24 +511,27 @@ def build_engine(tc: Toolchain, archs: str, portable: bool, env: dict):
 
 
 def cuda_dlls(nvcc: str) -> list:
-    """Windows: the CUDA runtime and cuBLAS DLLs of nvcc's toolkit (CUDA 13 keeps them in bin\\x64, 12 in bin)."""
+    """Windows: the CUDA runtime and cuBLAS DLLs of nvcc's toolkit (CUDA 13 keeps them in bin\\x64 or bin\\arm64, 12
+    in bin)."""
     tk = Path(nvcc).parent
     return [dll for pat in ("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")
-            for dll in [*(tk / "x64").glob(pat), *tk.glob(pat)]]
+            for dll in [*(tk / ("arm64" if ARM else "x64")).glob(pat), *tk.glob(pat)]]
 
 
 def build_vision(tc: Toolchain, env: dict, cuda_archs: str | None = None):
-    """The image encoder runs on the CPU, built for any AVX2 CPU: a native build on an AVX-512 CPU runs without flash
-    attention, about half as fast. With --vision gpu (`cuda_archs`) it is built with CUDA, into build-vision-cuda."""
+    """The image encoder runs on the CPU, built for any AVX2 CPU (arm64: Armv8.2 with dotprod and fp16): a native build
+    on an AVX-512 CPU runs without flash attention, about half as fast. With --vision gpu (`cuda_archs`) it is built
+    with CUDA, into build-vision-cuda."""
     if not cuda_archs:
         cmake_build(tc, ROOT / "tools" / "vision", ROOT / "build-vision", "lamina-vision",
-                    [f"-DLLAMA_DIR={LLAMA.as_posix()}", "-DLAMINA_VISION_CUDA=OFF", "-DLAMINA_PORTABLE=ON"], env)
+                    [f"-DLLAMA_DIR={LLAMA.as_posix()}", "-DLAMINA_VISION_CUDA=OFF", "-DLAMINA_PORTABLE=ON",
+                     *compiler_defs(tc)], env)
         ok(f"the image encoder: build-vision/bin/lamina-vision{EXE}")
         return
     b = ROOT / "build-vision-cuda"
     cmake_build(tc, ROOT / "tools" / "vision", b, "lamina-vision",
                 [f"-DLLAMA_DIR={LLAMA.as_posix()}", "-DLAMINA_VISION_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                 "-DLAMINA_PORTABLE=ON", *cuda_defs(tc.nvcc)], env)
+                 "-DLAMINA_PORTABLE=ON", *cuda_defs(tc, env)], env)
     if WIN:   # the CUDA runtime beside the encoder
         for dll in cuda_dlls(tc.nvcc):
             shutil.copy2(dll, b / "bin" / dll.name)
@@ -494,7 +543,8 @@ def cuda_lib_dir(nvcc: str | None):
     if not nvcc:
         return None
     tk = Path(nvcc).resolve().parent.parent
-    for d in (tk / "lib64", tk / "targets" / "x86_64-linux" / "lib"):
+    targets = tk / "targets"
+    for d in (tk / "lib64", tk / "lib", *(targets / t / "lib" for t in ("x86_64-linux", "sbsa-linux", "aarch64-linux"))):
         if list(d.glob("libcudart.so*")):
             return str(d)
     return None
@@ -741,8 +791,8 @@ def main() -> int:
         ap.error(f"--vision {a.vision}: on, off, gpu or gpu:GPU")
 
     say(f"Lamina setup in {ROOT}")
-    if platform.machine().lower() not in ("amd64", "x86_64"):
-        fail(f"{platform.machine()}: Lamina runs on x86-64 PCs")
+    if platform.machine().lower() not in ("amd64", "x86_64", "arm64", "aarch64"):
+        fail(f"{platform.machine()}: Lamina runs on x86-64 and arm64 PCs")
     gl = gpus()
     usable = [g for g in gl if g.cc >= 80]
     for g in gl:
@@ -750,12 +800,14 @@ def main() -> int:
             f"{', drives a display' if g.display else ''}{'' if g.cc >= 80 else ' (too old: left out)'}")
     if gl:
         say(f"  NVIDIA driver {driver_version()}")
-    say(f"  RAM {ram_gb():.0f} GB, CPU {'with' if cpu_avx2() else 'WITHOUT'} AVX2, Python {platform.python_version()}")
+    say(f"  RAM {ram_gb():.0f} GB, CPU {'arm64' if ARM else 'with AVX2' if cpu_avx2() else 'WITHOUT AVX2'}, "
+        f"Python {platform.python_version()}")
     tc = toolchain()
     say(f"  CMake and Ninja {'ok' if tc.cmake and tc.ninja else 'to install'}, CUDA "
         f"{'.'.join(map(str, tc.cuda)) if tc.cuda else 'missing'}, "
-        + (f"MSVC {'ok' if tc.vcvars else 'missing'}" if WIN else f"g++ {'ok' if tc.cxx else 'missing'}"))
-    if not cpu_avx2():
+        + (f"MSVC {'ok' if tc.vcvars else 'missing'}" if WIN else f"g++ {'ok' if tc.cxx else 'missing'}")
+        + (f", clang-cl {'ok' if tc.clang_cl else 'missing'}" if WIN and ARM else ""))
+    if not ARM and not cpu_avx2():
         fail("the CPU has no AVX2: the engine's CPU kernels need it")
     if not usable and (a.model or not a.cuda_archs):
         fail("no NVIDIA GPU of compute capability 8.0 or newer (RTX 30 series or newer) was found by nvidia-smi")

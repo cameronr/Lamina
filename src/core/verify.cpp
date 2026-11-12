@@ -32,6 +32,7 @@
 #include "lamina/kernels/sampler.hpp"
 #include "lamina/kernels/shared_expert.hpp"
 #include "lamina/kernels/verify_kernels.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -42,7 +43,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <immintrin.h>
 
 namespace lamina::core {
 namespace {
@@ -1194,7 +1194,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         bool ok = true;
         for (int t = 0; t < T && ok; ++t) ok = ss.ple.table->ahead_collect(t, h_ple_ + (size_t) t * g.n_embd, err);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        platform::device_store_fence();
         *(volatile uint32_t*) h_pleflag_ = 1;
         ms_host += ms_since(tp);
         if (!ok) return release();
@@ -1236,7 +1236,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         uint32_t spins = 0;
         while (*seq < want) {
             settle(false);
-            _mm_pause();
+            platform::cpu_relax();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -1268,7 +1268,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                  ss.k, h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         VDBG("layer %lld served\n", (long long) l);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        platform::device_store_fence();
         if (pcie_share_ && *(volatile uint32_t*) h_flagA_ != want) {   // no PCIe share published: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -1307,7 +1307,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 while (*(volatile uint32_t*) h_pseq_ < (uint32_t) (l + 1) &&
                        Clock::now() - c < std::chrono::milliseconds(50)) {
                     settle(false);
-                    _mm_pause();
+                    platform::cpu_relax();
                 }
             }
             if (*(volatile uint32_t*) h_pseq_ >= (uint32_t) (l + 1)) {
@@ -1326,7 +1326,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // running when the engine ends can leave the GPU lost until a power cycle (upstream #267)
     for (const Clock::time_point w0 = Clock::now(); !tiers_in((uint32_t) (g.n_layers * G));) {
         settle(false);
-        _mm_pause();
+        platform::cpu_relax();
         if (ms_since(w0) > 5000.0) {
             err = "verify: a GPU tier's rows of the last layer never came";
             return release();
@@ -1334,7 +1334,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     for (const Clock::time_point w0 = Clock::now(); any_late() && ms_since(w0) < 50.0;) {   // the last layer's
         settle(false);
-        _mm_pause();
+        platform::cpu_relax();
     }
     settle(true);
     const bool sampled = head_sampling_ && ((!sampling_.greedy && sampling_.temperature > 0.0f) || hist_d_ != nullptr);
@@ -1343,7 +1343,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++hand_n_;
         const Clock::time_point h0 = Clock::now();
         while (*(volatile uint32_t*) shead_->handoff() < hand_n_) {
-            _mm_pause();
+            platform::cpu_relax();
             if (ms_since(h0) > 5000.0) {
                 err = std::string("verify: the head's input never came (") + cudaGetErrorString(cudaStreamQuery(cs_)) +
                       ")";
@@ -1534,7 +1534,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    _mm_sfence();
+    platform::device_store_fence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 

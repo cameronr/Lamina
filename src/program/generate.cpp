@@ -45,6 +45,7 @@
 #include "lamina/spec/suffix_drafter.hpp"
 #include "lamina/core/native_dense.hpp"
 #include "lamina/core/pack_image.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 #include "lamina/kernels/cpu/hadamard.hpp"
 #include "lamina/platform/console_quit.hpp"
 #include "lamina/platform/memory.hpp"
@@ -1510,8 +1511,10 @@ int lamina::program::run(int argc, char** argv) {
     }
     // the PCIe share of the missed experts (the paper, finding on PCIe)
     if (o.pcie_frac < 0.0) o.pcie_frac = 0.55;
+#if LAMINA_X86
     if (!lamina::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "lamina: this CPU has no AVX-512: the expert kernels run on AVX2\n");
+#endif
     lamina::core::NativeEmbed native_embed;
     {
         if (o.spec < 2 || (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {

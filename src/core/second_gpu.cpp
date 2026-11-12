@@ -7,8 +7,7 @@
 #include "lamina/kernels/cpu/tq_cpu.hpp"
 #include "lamina/kernels/elementwise.hpp"
 #include "lamina/kernels/iq_kernels.hpp"
-
-#include <immintrin.h>
+#include "lamina/platform/cpu_arch.hpp"
 
 #include <cstring>
 #include <exception>
@@ -201,7 +200,7 @@ bool SecondGpu::submit(int64_t layer, const uint8_t* x, int64_t x_stride, int n_
     const int n = starts[n_groups];
     if (n_groups <= 0 || n > cap_ || n_tok > max_t_) { err = "second GPU: a layer's share is out of range"; return false; }
     cudaError_t q;
-    while ((q = cudaEventQuery(ev_)) == cudaErrorNotReady) _mm_pause();
+    while ((q = cudaEventQuery(ev_)) == cudaErrorNotReady) platform::cpu_relax();
     if (q != cudaSuccess) {
         err = std::string("second GPU: ") + cudaGetErrorString(q);
         return false;
