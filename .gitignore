@@ -51,5 +51,6 @@ td.log
 
 /.ccache/
 
-# .github/ci.py package
+# .github/ci.py package; a release's programs (docs/SETUP.md, Release binaries)
 /dist/
+/bin/

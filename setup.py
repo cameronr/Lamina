@@ -21,6 +21,8 @@ The steps:
 4. Their preparation: for Flash-Next the draft layer and the Q8_0 image projector. The engine reads the rest from
    the GGUF files.
 5. lamina-<model>.json and run-<model>.bat (or .sh) beside this file, from examples/<model>.json.
+With --no-build and a release's programs in bin/ (docs/SETUP.md, Release binaries) step 2 builds nothing and the
+config and the launcher run those.
 A step whose result is already there is skipped. Files already in place are checked and kept: setup moves or deletes
 nothing.
 """
@@ -49,6 +51,7 @@ WIN = os.name == "nt"
 EXE = ".exe" if WIN else ""
 ARM = platform.machine().lower() in ("arm64", "aarch64")
 LLAMA = ROOT / "third_party" / "llama.cpp"
+RELEASE = ROOT / "bin"   # a release's programs, both its archives extracted here: lamina-server, lamina, lamina-vision
 LLAMA_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"   # the engine's CMakeLists.txt checks its mmq.cuh
 CUDA_MIN = (13, 0)   # RTX 50 engines built with CUDA 12.8 crashed in long prompts (upstream #220, #224)
 
@@ -690,10 +693,12 @@ def prepare(key: str, m: Model, data: Path, vision: bool):
 EXAMPLE_DATA = "../Lamina-data"   # the data folder of examples/*.json
 
 
-def vision_section(v: dict, gpu: Gpu | None) -> dict:
-    """The config's `vision` section from the example's: the CPU encoder on this PC's logical cores, or the CUDA build
-    on `gpu` (`cuda_device`: the server runs the encoder on that card alone, #408)."""
+def vision_section(v: dict, gpu: Gpu | None, release: bool) -> dict:
+    """The config's `vision` section from the example's: the CPU encoder on this PC's logical cores (a release's in
+    bin/), or the CUDA build on `gpu` (`cuda_device`: the server runs the encoder on that card alone, #408)."""
     v = dict(v)
+    if release:
+        v["exe"] = v["exe"].replace("./build-vision/bin/", "./bin/", 1)
     if gpu is None:
         v["threads"] = os.cpu_count() or 8
         return v
@@ -705,7 +710,7 @@ def vision_section(v: dict, gpu: Gpu | None) -> dict:
 
 
 def write_config(key: str, data: Path, main_gpu: str, port: int, vision: bool, context, nvcc,
-                 vision_gpu: Gpu | None = None) -> Path:
+                 vision_gpu: Gpu | None = None, release: bool = False) -> Path:
     """lamina-<key>.json from examples/<key>.json. The example's keys are written anew; the other keys of a config
     written before (an API key, the "images" of tools/image/install.py) are kept."""
     cfg = json.loads((ROOT / "examples" / f"{key}.json").read_text(encoding="utf-8"))
@@ -731,7 +736,7 @@ def write_config(key: str, data: Path, main_gpu: str, port: int, vision: bool, c
     if context:
         args[args.index("--max-context") + 1] = str(context)
     if vision:
-        cfg["vision"] = vision_section({k: fix(v) for k, v in cfg["vision"].items()}, vision_gpu)
+        cfg["vision"] = vision_section({k: fix(v) for k, v in cfg["vision"].items()}, vision_gpu, release)
     else:
         args = [a for a in args if a != "--vision"]
         cfg.pop("vision", None)
@@ -748,17 +753,18 @@ def write_config(key: str, data: Path, main_gpu: str, port: int, vision: bool, c
     return path
 
 
-def write_launcher(key: str, m: Model, cfg: Path, port: int) -> Path:
+def write_launcher(key: str, m: Model, cfg: Path, port: int, progs: str) -> Path:
+    """run-<key>.bat (.sh): the server in `progs` (build, or bin for a release's) with the config."""
     if WIN:
         p = ROOT / f"run-{key}.bat"
         lines = ["@echo off", f"title Lamina {m.title}",
                  f"rem {m.title} on http://127.0.0.1:{port}/v1 ({cfg.name}, written by setup.py).",
-                 'cd /d "%~dp0"', f'build\\lamina-server.exe --config {cfg.name} %*', "pause"]
+                 'cd /d "%~dp0"', f'{progs}\\lamina-server.exe --config {cfg.name} %*', "pause"]
         p.write_bytes(("\r\n".join(lines) + "\r\n").encode())
     else:
         p = ROOT / f"run-{key}.sh"
         lines = ["#!/bin/sh", f"# {m.title} on http://127.0.0.1:{port}/v1 ({cfg.name}, written by setup.py).",
-                 'cd "$(dirname "$0")" || exit 1', f'exec build/lamina-server --config {cfg.name} "$@"']
+                 'cd "$(dirname "$0")" || exit 1', f'exec {progs}/lamina-server --config {cfg.name} "$@"']
         p.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
         p.chmod(0o755)
     return p
@@ -782,7 +788,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, help="the server's port (default: 8081 to 8084 by model)")
     ap.add_argument("--check", action="store_true", help="say what this PC has and what the model needs; change nothing")
     ap.add_argument("--update", action="store_true", help="git pull this checkout first")
-    ap.add_argument("--no-build", action="store_true", help="use the binaries already built")
+    ap.add_argument("--no-build", action="store_true",
+                    help="use the programs as they are: a release's in bin/, else those already built")
     ap.add_argument("--cuda-archs", help="the CUDA architectures to build for, e.g. 86;120 (default: this PC's GPUs)")
     ap.add_argument("--portable", action="store_true",
                     help="build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the "
@@ -840,7 +847,8 @@ def main() -> int:
             warn(f"it takes ~{m.ram_gb} GB of RAM while running, and this PC has {ram_gb():.0f} GB")
         if free_gb(data) < missing / 1e9 + 5:
             warn("the data folder's drive is short of room for the downloads")
-    build = not (a.no_build and (ROOT / "build" / f"lamina-server{EXE}").exists())
+    release = a.no_build and (RELEASE / f"lamina-server{EXE}").exists()
+    build = not (a.no_build and (release or (ROOT / "build" / f"lamina-server{EXE}").exists()))
     archs = a.cuda_archs or cuda_archs(usable)
     vision_gpu = None
     if a.vision.startswith("gpu"):
@@ -860,9 +868,9 @@ def main() -> int:
     if a.check:
         return 0
     if problems:
-        built = (ROOT / "build" / f"lamina-server{EXE}").exists()
+        built = any((d / f"lamina-server{EXE}").exists() for d in (RELEASE, ROOT / "build"))
         fail("install what is missing (above), then run setup again",
-             "or --no-build: the binaries in build/ as they are (a release's)" if built else None)
+             "or --no-build: the programs in bin/ (a release's) or build/ as they are" if built else None)
 
     if a.update:
         say("\nupdating this checkout")
@@ -883,7 +891,7 @@ def main() -> int:
         build_engine(tc, archs, a.portable, env)
         build_vision(tc, env, archs if vision_gpu else None)
     else:
-        say("\n2. the binaries as they are (--no-build)")
+        say("\n2. the programs as they are (--no-build): " + ("a release's, in bin/" if release else "build/'s"))
         if vision_gpu and not (ROOT / "build-vision-cuda" / "bin" / f"lamina-vision{EXE}").exists():
             fail("--vision gpu: build-vision-cuda/bin/lamina-vision is not built: run setup without --no-build")
     if not m:
@@ -896,8 +904,8 @@ def main() -> int:
     prepare(a.model, m, data, vision)
     say("\n5. the config and the launcher")
     port = a.port or m.port
-    cfg = write_config(a.model, data, gpu_spec(main_gpu, gl), port, vision, a.context, tc.nvcc, vision_gpu)
-    launcher = write_launcher(a.model, m, cfg, port)
+    cfg = write_config(a.model, data, gpu_spec(main_gpu, gl), port, vision, a.context, tc.nvcc, vision_gpu, release)
+    launcher = write_launcher(a.model, m, cfg, port, "bin" if release else "build")
     ok(f"{cfg.name}, {launcher.name}")
     say(f"\nDone. Start it with {launcher.name}: the API on http://127.0.0.1:{port}/v1 (OpenAI and Anthropic), "
         f"a chat page on http://127.0.0.1:{port}/")

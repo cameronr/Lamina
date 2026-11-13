@@ -59,8 +59,8 @@ Setup builds the engine and the image encoder for this PC's GPUs, downloads the 
 checks them, prepares them, and writes a config and a launcher. `--model ud-q4_k_xl`, `--model qwen36-ud-q4_k_xl` and
 `--model qwen38-27b-ud-q6_k_m` set up the others; `--check` says what the PC has and what a model needs, without
 changing anything. Setup asks nothing and installs no system software: it names what is missing. A release's programs,
-extracted into the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)). Details:
-[docs/SETUP.md](docs/SETUP.md).
+extracted into `bin` in the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)).
+Details: [docs/SETUP.md](docs/SETUP.md).
 
 ## Run
 

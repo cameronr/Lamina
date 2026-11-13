@@ -33,7 +33,7 @@ Without `--model`, setup builds the engine only.
 | `--context N` | the context in tokens (default: the example config's) |
 | `--port N` | the server's port (default 8081 to 8084 by model) |
 | `--update` | `git pull` this clone first |
-| `--no-build` | use the binaries already built, or a release's ([Release binaries](#release-binaries)) |
+| `--no-build` | use the programs as they are: a release's in `bin/` ([Release binaries](#release-binaries)), else those already built |
 | `--cuda-archs A` | the CUDA architectures to build for, e.g. `86;120` (default: this PC's GPUs) |
 | `--portable` | build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the releases and the Docker image are |
 
@@ -72,22 +72,24 @@ MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or
 Each [release](https://github.com/eddoursul/Lamina/releases) has the programs built for Windows and Linux, on x64 and
 arm64, in two downloads a platform:
 
-- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`build/lamina-server`), the engine alone
-  (`build/lamina`) and the CPU image encoder (`build-vision/bin/lamina-vision`), with their licenses;
-- `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, into `build/` beside them (the same
-  in every release of that CUDA version: one download serves the next releases).
+- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`lamina-server`), the engine alone
+  (`lamina`) and the CPU image encoder (`lamina-vision`), with their licenses;
+- `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, beside them (the same in every
+  release of that CUDA version: one download serves the next releases).
 
-Extract both into a clone of the release's tag (or its source archive) and run setup without the build:
+Both are flat: extract them into one folder, `bin` in a clone of the release's tag (or of its source archive), and run
+setup without the build:
 
 ```
 git clone --branch <version> https://github.com/eddoursul/Lamina
 cd Lamina
-(extract both archives here)
+(extract both archives into bin\)
 setup.bat --no-build --model iq3_s          (Windows)
 ./setup.sh --no-build --model iq3_s         (Linux)
 ```
 
-Setup then needs neither the CUDA toolkit nor a compiler. The programs are built for RTX 30, 40 and 50 GPUs (compute
+Setup then needs neither the CUDA toolkit nor a compiler, and the config and the launcher it writes run the programs
+in `bin/`. The programs are built for RTX 30, 40 and 50 GPUs (compute
 capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
 kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
 13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the
@@ -214,5 +216,5 @@ RAM, hence `--ulimit memlock=-1`.
 ## Updating
 
 `setup --update --model <model>` pulls this clone, rebuilds what changed and keeps the config's own keys. A model's
-files stay where they are. With release binaries: check out the new release's tag, extract its archives over the old
-ones and run setup with `--no-build`.
+files stay where they are. With release binaries: check out the new release's tag, extract its archives into `bin/`
+over the old ones and run setup with `--no-build`.
