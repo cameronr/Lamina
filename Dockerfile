@@ -33,11 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/lamina
 COPY . .
-RUN python3 -m venv .venv && .venv/bin/pip install --no-cache-dir -r requirements.txt
+RUN python3 -m venv .venv
 COPY --from=build /opt/lamina/build/lamina /opt/lamina/build/lamina-server build/
 COPY --from=build /opt/lamina/build-vision/bin/lamina-vision build-vision/bin/
-COPY --from=build /opt/lamina/third_party/llama.cpp/gguf-py third_party/llama.cpp/gguf-py/
-COPY --from=build /opt/lamina/third_party/llama.cpp/.lamina-commit third_party/llama.cpp/
 VOLUME ["/data"]
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/lamina/docker/entrypoint.sh"]

@@ -12,8 +12,8 @@ setup.bat --model iq3_s          (Windows)
 ./setup.sh --model iq3_s         (Linux)
 ```
 
-`setup.bat` and `setup.sh` make a Python environment, `.venv`, install the server's packages and CMake and Ninja into
-it, and run `setup.py` with the same arguments. The models: `iq3_s` (Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S),
+`setup.bat` and `setup.sh` make a Python environment, `.venv` (setup takes the standard library only; a build's
+CMake and Ninja go into it), and run `setup.py` with the same arguments. The models: `iq3_s` (Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S),
 `ud-q4_k_xl` (Qwen3.8-Flash-Next, unsloth's UD-Q4_K_XL), `qwen36-ud-q4_k_xl` (Qwen3.6-35B-A3B, unsloth's UD-Q4_K_XL)
 and `qwen38-27b-ud-q6_k_m` (Qwen3.8-27B, unsloth's UD-Q6_K_M). The engine also runs Flash-Next's other GGUF files, most of unsloth's quants and
 [Agention's Gyro-L](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) among them: setup downloads none of those, so copy a
@@ -40,8 +40,8 @@ Without `--model`, setup builds the engine only.
 Setup asks nothing, installs no system software (it names what is missing) and moves or deletes no file. A step whose
 result is already there is skipped, so setup runs again after an interruption or for another model:
 
-1. llama.cpp at the commit the engine is built against, into `third_party/llama.cpp`: ggml for the engine, mtmd for
-   the image encoder, gguf-py for the preparation tools.
+1. For a build, CMake and Ninja into `.venv` and llama.cpp at the commit the engine is built against, into
+   `third_party/llama.cpp`: ggml for the engine, mtmd for the image encoder. With `--no-build` nothing.
 2. The server with the engine, `build/lamina-server` (`.exe`, with the CUDA runtime DLLs beside it; `build/lamina` is
    the engine alone), for this PC's GPUs, and the image encoder, `build-vision/bin/lamina-vision`: llama.cpp's mtmd
    library with the model's projector, run on the CPU beside the engine so the GPUs keep their VRAM for experts. The encoder is built for any AVX2 CPU: a native build on an AVX-512
@@ -55,7 +55,8 @@ result is already there is skipped, so setup runs again after an interruption or
    [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). `HF_ENDPOINT` names a mirror.
 4. Their preparation, for Flash-Next only: the MTP draft layer, `mtp/rt-distilled`, from
    [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP); with
-   pictures, ISTA-DASLab's image projector converted to Q8_0 (`tools/mmproj_q8.py`), which the CPU encodes ~20% faster.
+   pictures, from the same repository the image projector in Q8_0 (ISTA-DASLab's BF16 one through `tools/mmproj_q8.py`),
+   which the CPU encodes ~20% faster.
    Everything else comes from the GGUF files at start: the server reads the tokenizer and the chat template, the engine
    the experts, the projections and the float tensors (put in the forms it takes in memory, in milliseconds).
    Qwen3.6 and Qwen3.8-27B with pictures use their repositories' projectors (`mmproj-F16.gguf`) as they are.
@@ -88,8 +89,8 @@ setup.bat --no-build --model iq3_s          (Windows)
 ./setup.sh --no-build --model iq3_s         (Linux)
 ```
 
-Setup then needs neither the CUDA toolkit nor a compiler, and the config and the launcher it writes run the programs
-in `bin/`. The programs are built for RTX 30, 40 and 50 GPUs (compute
+Setup then needs neither the CUDA toolkit nor a compiler, nor llama.cpp or a Python package (the standard library
+does), and the config and the launcher it writes run the programs in `bin/`. The programs are built for RTX 30, 40 and 50 GPUs (compute
 capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
 kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
 13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the

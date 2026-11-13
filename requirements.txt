@@ -1,7 +1,6 @@
-# Runtime Python packages setup.py installs into .venv, pinned so a checkout installs the same ones on any day (#214):
-# what preparing a model needs (gguf-py's numpy, PyYAML and tqdm; the image projector's conversion). The server is
-# lamina-server, a program of its own. CMake and Ninja are in requirements-build.txt and are installed only if a local
-# build needs them. setup.py's pip step reads this file.
+# The tools' Python packages (tools/*.py and their tests: gguf-py's numpy, PyYAML and tqdm), pinned so a checkout
+# installs the same ones on any day (#214). Setup takes none of them (the Python standard library only); the CMake and
+# Ninja of a build are in requirements-build.txt, which it installs for one.
 # Python 3.10+ (numpy's newest releases need a newer Python: one line per range).
 numpy==2.5.3; python_version >= "3.12"
 numpy==2.4.6; python_version == "3.11"
