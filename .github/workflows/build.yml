@@ -48,7 +48,7 @@ jobs:
       - name: OpenSSL's headers
         if: matrix.os == 'linux'
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libssl-dev
-      - uses: hendrikmuhs/ccache-action@v1.2
+      - uses: hendrikmuhs/ccache-action@v1.2.25   # the v1.2 tag still runs on Node.js 20
         with:
           key: ${{ matrix.os }}-${{ matrix.cpu }}
           max-size: 2G
