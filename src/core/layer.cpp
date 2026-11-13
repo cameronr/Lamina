@@ -38,12 +38,7 @@
 #include <memory>
 namespace lamina::core {
 namespace {
-constexpr int Q8K_BYTES_PER_BLOCK = 292;
-constexpr int Q8K_ELEMS_PER_BLOCK = 256;
 const std::string EMBEDDING_NAME = "token_embd.weight";
-/// A Q8_K buffer needs `n` a multiple of 256 and `n/256` blocks of 292 bytes.
-uint64_t q8k_bytes(int64_t n) { return (uint64_t) (n / Q8K_ELEMS_PER_BLOCK) * Q8K_BYTES_PER_BLOCK; }
-
 }
 // namespace
 namespace { KvFormat g_kv_format = KvFormat::F16; }

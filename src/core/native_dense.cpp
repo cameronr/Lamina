@@ -2,9 +2,9 @@
 #include "lamina/core/weights.hpp"
 #include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/kernels/native_mmvq.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 
 #include <cuda_runtime.h>
-#include <immintrin.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -256,6 +256,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     }
 }
 namespace {
+#if LAMINA_X86
 // GCC/Clang only take the F16C intrinsics below in a function compiled for F16C (MSVC takes them anywhere); every
 // CPU with the engine's AVX2 floor has F16C.
 #if defined(__GNUC__) && !defined(__F16C__)
@@ -263,22 +264,39 @@ namespace {
 #else
 #define LAMINA_F16C_FN
 #endif
+LAMINA_F16C_FN uint16_t f32_to_f16(float f) {
+    return (uint16_t) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(f), _MM_FROUND_TO_NEAREST_INT), 0);
+}
+LAMINA_F16C_FN float f16_to_f32(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))); }
+#else
+// arm64's conversion instructions through __fp16, rounding to nearest even as F16C's above
+uint16_t f32_to_f16(float f) {
+    const __fp16 h = (__fp16) f;
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return b;
+}
+float f16_to_f32(uint16_t b) {
+    __fp16 h;
+    std::memcpy(&h, &b, 2);
+    return (float) h;
+}
+#endif
 bool hc_matrix(const std::string& name) {
     if (name.rfind("blk.", 0) != 0) return name == "output_hc_down.weight" || name == "output_hc_up.weight";
     return name.ends_with(".hc_attn_down.weight") || name.ends_with(".hc_attn_up.weight") ||
            name.ends_with(".hc_ffn_down.weight") || name.ends_with(".hc_ffn_up.weight");
 }
 // one row's values as ggml's quantize_row_q8_0_ref: per 32, d = amax / 127 stored as f16, codes round(x / d)
-LAMINA_F16C_FN void q8_0_row(const float* x, int64_t n, int8_t* q, uint16_t* s) {
+void q8_0_row(const float* x, int64_t n, int8_t* q, uint16_t* s) {
     for (int64_t b = 0; b < n / 32; ++b) {
         float amax = 0.0f;
         for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[b * 32 + j]));
         const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
-        s[b] = (uint16_t) _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(d), _MM_FROUND_TO_NEAREST_INT), 0);
+        s[b] = f32_to_f16(d);
         for (int j = 0; j < 32; ++j) q[b * 32 + j] = (int8_t) std::roundf(x[b * 32 + j] * id);
     }
 }
-LAMINA_F16C_FN float f16_to_f32(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))); }
 }  // namespace
 
 bool HcQ8::names(const std::vector<std::string>& shards, std::set<std::string>& out, std::string& err) {

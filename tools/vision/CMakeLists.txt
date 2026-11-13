@@ -5,18 +5,18 @@
 #         [-DLAMINA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DLAMINA_PORTABLE=OFF]
 #   cmake --build build-vision --target lamina-vision
 #
-# Portable (AVX2 baseline) is the default, so an encoder built without extra flags runs on any AVX2 PC: the 0.1.32
-# release's encoder was built native on an AVX-512 machine and stopped with an illegal instruction elsewhere
-# (#411 #412 #419).  setup.py builds it portable too, into build-vision (the CPU encoder: a native build on an
-# AVX-512 CPU runs without flash attention, about half as fast) or, with --vision gpu, with CUDA for the PC's GPUs into
-# build-vision-cuda.  The option is kept in CMakeCache.txt, so a build folder configured before this default still
-# needs the flag (or a fresh folder).
+# Portable (AVX2 baseline; arm64: Armv8.2 + dotprod + fp16) is the default, so an encoder built without extra flags
+# runs on any AVX2 PC: the 0.1.32 release's encoder was built native on an AVX-512 machine and stopped with an illegal
+# instruction elsewhere (#411 #412 #419).  setup.py builds it portable too, into build-vision (the CPU encoder: a
+# native build on an AVX-512 CPU runs without flash attention, about half as fast) or, with --vision gpu, with CUDA for
+# the PC's GPUs into build-vision-cuda.  The option is kept in CMakeCache.txt, so a build folder configured before
+# this default still needs the flag (or a fresh folder).
 cmake_minimum_required(VERSION 3.21)
 project(lamina_vision C CXX)
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
 option(LAMINA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
-option(LAMINA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" ON)
+option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static MSVC runtime" ON)
 if(LAMINA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
@@ -32,17 +32,10 @@ set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 if(LAMINA_PORTABLE)
-  set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/lamina_ggml_portable.cmake)
+  lamina_ggml_portable()   # AVX2 and nothing above it (arm64: Armv8.2 + dotprod + fp16), even when a -D asks for more
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no vcomp140.dll / libgomp needed on the user's PC
-  foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
-    set(${_f} ON CACHE BOOL "" FORCE)
-  endforeach()
-  # nothing above AVX2 either, even when a -D asks for it (a 9900K or a Zen 3 has neither AVX-512 nor AVX-VNNI)
-  foreach(_f GGML_AVX512 GGML_AVX512_VBMI GGML_AVX512_VNNI GGML_AVX512_BF16 GGML_AVX_VNNI
-             GGML_AMX_TILE GGML_AMX_INT8 GGML_AMX_BF16)
-    set(${_f} OFF CACHE BOOL "" FORCE)
-  endforeach()
-  message(STATUS "lamina-vision: portable build (AVX2 baseline, runs on other PCs)")
+  message(STATUS "lamina-vision: portable build (runs on other PCs)")
 else()
   # this PC's instruction set; a build folder that was portable before gets a fresh native build's settings back
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)

@@ -50,6 +50,8 @@ td.log
 .cursor/
 
 /.ccache/
+# .github/ci.py package
+/dist/
 
 # archived planning trees (local scratch, not committed)
 .trash/

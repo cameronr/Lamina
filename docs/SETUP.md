@@ -1,7 +1,7 @@
 # Setup
 
-What a PC needs: [the README](../README.md#what-you-need). This page covers what setup does, the config it writes, the
-GPUs, the engine options worth knowing, Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
+What a PC needs: [the README](../README.md#what-you-need). This page covers what setup does, the release binaries, the
+config it writes, the GPUs, the engine options worth knowing, Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
 
 ## Setup
 
@@ -33,9 +33,9 @@ Without `--model`, setup builds the engine only.
 | `--context N` | the context in tokens (default: the example config's) |
 | `--port N` | the server's port (default 8081 to 8084 by model) |
 | `--update` | `git pull` this clone first |
-| `--no-build` | use the binaries already built |
+| `--no-build` | use the binaries already built, or a release's ([Release binaries](#release-binaries)) |
 | `--cuda-archs A` | the CUDA architectures to build for, e.g. `86;120` (default: this PC's GPUs) |
-| `--portable` | build the engine for other PCs (any AVX2 CPU), as the Docker image does |
+| `--portable` | build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the releases and the Docker image are |
 
 Setup asks nothing, installs no system software (it names what is missing) and moves or deletes no file. A step whose
 result is already there is skipped, so setup runs again after an interruption or for another model:
@@ -62,6 +62,42 @@ result is already there is skipped, so setup runs again after an interruption or
 5. The config, `lamina-<model>.json`, and its launcher, `run-<model>.bat` (`run-<model>.sh` on Linux), from
    `examples/<model>.json` with this PC's GPUs and data folder. A config written before keeps the keys the example
    lacks (an `api_key`, an `images` section).
+
+On Windows on Arm the build takes LLVM's clang-cl for the C and C++ code (ggml's CPU code for Arm does not build with
+MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or LLVM's own install
+(`LAMINA_CLANG_CL` names another).
+
+## Release binaries
+
+Each [release](https://github.com/eddoursul/Lamina/releases) has the programs built for Windows and Linux, on x64 and
+arm64, in two downloads a platform:
+
+- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`build/lamina-server`), the engine alone
+  (`build/lamina`) and the CPU image encoder (`build-vision/bin/lamina-vision`), with their licenses;
+- `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, into `build/` beside them (the same
+  in every release of that CUDA version: one download serves the next releases).
+
+Extract both into a clone of the release's tag (or its source archive) and run setup without the build:
+
+```
+git clone --branch <version> https://github.com/eddoursul/Lamina
+cd Lamina
+(extract both archives here)
+setup.bat --no-build --model iq3_s          (Windows)
+./setup.sh --no-build --model iq3_s         (Linux)
+```
+
+Setup then needs neither the CUDA toolkit nor a compiler. The programs are built for RTX 30, 40 and 50 GPUs (compute
+capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
+kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
+13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the
+runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a GH200's 9.0), a
+native build for the PC's CPU and `--vision gpu` (the encoder with CUDA) need setup's build. The arm64 programs are
+built and their CPU tests run on each release, not yet run with a GPU.
+
+The releases come from the GitHub workflow `.github/workflows/build.yml` at a `v*` tag; it also builds every push to
+`main` and every pull request, and runs the tests that need no GPU. Its steps are `.github/ci.py`'s, which runs on a PC
+the same way (`toolkit`, `build`, `test`, `package`).
 
 ## The config
 
@@ -178,4 +214,5 @@ RAM, hence `--ulimit memlock=-1`.
 ## Updating
 
 `setup --update --model <model>` pulls this clone, rebuilds what changed and keeps the config's own keys. A model's
-files stay where they are.
+files stay where they are. With release binaries: check out the new release's tag, extract its archives over the old
+ones and run setup with `--no-build`.

@@ -11,6 +11,7 @@
 #include "lamina/kernels/cpu/hadamard.hpp"
 #include "lamina/kernels/cpu/tq_cpu.hpp"
 #include "lamina/kernels/expf_contract.hpp"
+#include "lamina/platform/cpu_arch.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -118,6 +119,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 namespace {
+#if LAMINA_X86
 // Q8_K (the activations of every i-quant row): ggml-cpu's x86 quantizer is the scalar reference, ~3 us per token
 // and layer on the host before the pool can start; q8k_quant_avx2 writes the same bytes.  cpu_avx2_ok() too:
 // iq_avx2.cpp is compiled for AVX2 (an AVX-only CPU, or LAMINA_FORCE_ISA=avx, keeps ggml's).  LAMINA_NO_Q8K_AVX2=1:
@@ -132,6 +134,7 @@ bool q8k_avx1(int type) {
     static const bool on = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("LAMINA_NO_Q8K_AVX1") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
 }
+#endif
 
 bool g_exact_swiglu = false;
 }  // namespace
@@ -183,8 +186,10 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
         traits(f.gu_act)->from_float(r, dst, f.n_embd);
         return;
     }
+#if LAMINA_X86
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     if (q8k_avx1(f.gu_act)) { q8k_quant_avx1(x, dst, f.n_embd); return; }
+#endif
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
@@ -196,8 +201,10 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
         traits(f.d_act)->from_float(r, dst, f.n_ff);
         return;
     }
+#if LAMINA_X86
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
+#endif
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
@@ -226,6 +233,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         tq_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+#if LAMINA_X86
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  LAMINA_NO_IQ512 drops an AVX-512 CPU to the
@@ -275,6 +283,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+#endif
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const int n = (int) f.n_embd;
     const bool exact = g_exact_swiglu;
@@ -296,6 +305,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         tq_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
+#if LAMINA_X86
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  LAMINA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("LAMINA_NO_IQ4NL") == nullptr;
@@ -318,6 +328,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq128_down_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
+#endif
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
     const int n = (int) f.n_ff;
     for (int r = r0; r < r1; ++r) {
