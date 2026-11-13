@@ -50,3 +50,9 @@ td.log
 .cursor/
 
 /.ccache/
+
+# archived planning trees (local scratch, not committed)
+.trash/
+
+# planning docs are local-only; never sent upstream
+plans/
