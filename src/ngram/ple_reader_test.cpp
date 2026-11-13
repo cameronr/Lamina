@@ -400,35 +400,67 @@ int selftest(const std::string& dir, uint32_t rb) {
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
     }
-    // fault injection: a 3 ms delay must be observed, and must not change the bytes
+    // fault injection: no read completes sooner than the injected delay (one that would have is held back, and its
+    // latency counts to its release), and the bytes stay the same. 200 ms, longer than a busy machine holds up the
+    // thread that takes the completions: with every logical processor loaded, 3 ms always and 30 ms once in three
+    // runs saw every read come in after the delay, none held back
     for (bool thr : {false, true}) {
         ng::PleReader rd;
         std::string err;
         CHECK(rd.open(path, HEADER, N, 16, 0, err, thr, rb), "open: %s", err.c_str());
-        rd.set_injected_delay_us(3000);
+        const double delay_us = 200e3;
+        rd.set_injected_delay_us(delay_us);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
         const double t0 = now_us();
         check_rows(rd, rows, N, rb, "delayed");
-        CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
-        CHECK(rd.stats().late_injected > 0, "no read was held back");
+        CHECK(now_us() - t0 >= delay_us, "injected delay not observed (%.0f us)", now_us() - t0);
+        const ng::ReaderStats st = rd.snapshot();
+        const double fastest = st.read_us.empty() ? 0.0 : *std::min_element(st.read_us.begin(), st.read_us.end());
+        CHECK(!st.read_us.empty() && fastest >= delay_us, "a read completed %.0f us after its issue, inside the delay",
+              fastest);
+        CHECK(st.late_injected > 0, "no read was held back");
     }
     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the
     // window after the last issue has passed, starts again with the next issue (even one the row cache serves),
-    // and never shows up as a row read or changes a row
+    // and never shows up as a row read or changes a row. Its reads are judged against the time that passed, by what
+    // they are for - no 250 ms without one, the SSDs' sleep - and by the period, never faster: a loaded machine
+    // stretches a round past the period (GitHub's Windows runner: 7 in 300 ms), so a count in a fixed sleep fails there
     {
         ng::PleReader rd;
         std::string err;
         CHECK(rd.open(path, HEADER, N, 16, 4096, err, true, rb), "open: %s", err.c_str());
-        rd.set_keepalive(20.0, 0.5);
+        const double period_ms = 20.0;
+        rd.set_keepalive(period_ms, 0.5);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
+        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        // `ms` of the keep-alive watched: its reads, and the longest time without one (from the start, between them,
+        // to the end) as the SSD sees it, less the longest this thread was held up itself (the machine's stall, not
+        // the reader's); returns the count so far
+        const auto watch = [&](const char* what, int ms) {
+            const uint64_t k0 = rd.snapshot().keepalive_reads;
+            const double t0 = now_us();
+            double t = t0, prev = t0, last = t0, gap = 0, stall = 0;
+            uint64_t k = k0;
+            while ((t = now_us()) - t0 < ms * 1e3) {
+                stall = std::max(stall, t - prev);
+                prev = t;
+                const uint64_t kn = rd.snapshot().keepalive_reads;
+                if (kn != k) { gap = std::max(gap, t - last); last = t; k = kn; }
+                nap(1);
+            }
+            gap = std::max(gap, t - last);
+            const uint64_t n = k - k0;
+            CHECK(n >= 2 && gap < 250e3 + stall, "%s: %llu keep-alive reads in %.0f ms, %.0f ms without one (%.0f ms "
+                  "this thread was held up)", what, (unsigned long long) n, (t - t0) / 1e3, gap / 1e3, stall / 1e3);
+            CHECK(n <= (t - t0) / (period_ms * 1e3) + 3, "%s: %llu keep-alive reads in %.0f ms, past its %.0f ms period",
+                  what, (unsigned long long) n, (t - t0) / 1e3, period_ms);
+            return k;
+        };
         check_rows(rd, rows, N, rb, "keep-alive, first ticket");
         const uint64_t reads0 = rd.snapshot().reads;
-        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
-        nap(300);
-        const uint64_t k1 = rd.snapshot().keepalive_reads;
-        CHECK(k1 >= 8 && k1 <= 20, "keep-alive: %llu reads in 300 ms at a 20 ms period", (unsigned long long) k1);
+        const uint64_t k1 = watch("keep-alive", 300);
         CHECK(rd.snapshot().reads == reads0, "keep-alive reads were counted as row reads");
         nap(600);                                          // the 0.5 s window has passed
         const uint64_t k2 = rd.snapshot().keepalive_reads;
@@ -439,9 +471,7 @@ int selftest(const std::string& dir, uint32_t rb) {
         CHECK(k2 <= k1 + 20, "keep-alive: %llu reads by the end of a 0.5 s window", (unsigned long long) k2);
         check_rows(rd, rows, N, rb, "keep-alive, cached ticket");   // the row cache serves all 16: no row read
         CHECK(rd.snapshot().reads == reads0, "cached rows were read again");
-        nap(200);
-        CHECK(rd.snapshot().keepalive_reads >= k3 + 5, "the keep-alive did not start again (%llu -> %llu)",
-              (unsigned long long) k3, (unsigned long long) rd.snapshot().keepalive_reads);
+        watch("keep-alive started again by a cached ticket", 300);
         std::vector<uint32_t> more(2000);
         for (auto& r : more) r = rng() % N;
         check_rows(rd, more, N, rb, "keep-alive, rows afterwards");
