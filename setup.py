@@ -693,7 +693,7 @@ def prepare(key: str, m: Model, data: Path, vision: bool):
 EXAMPLE_DATA = "../Lamina-data"   # the data folder of examples/*.json
 
 
-def vision_section(v: dict, gpu: Gpu | None, release: bool) -> dict:
+def vision_section(v: dict, gpu: Gpu | None, release: bool = False) -> dict:
     """The config's `vision` section from the example's: the CPU encoder on this PC's logical cores (a release's in
     bin/), or the CUDA build on `gpu` (`cuda_device`: the server runs the encoder on that card alone, #408)."""
     v = dict(v)
