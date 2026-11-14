@@ -65,6 +65,8 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 void gather_rows16_f32(const uint16_t* x16, const int32_t* src, float* dst, int64_t n, int64_t width, void* stream);
 /// y = FP16 bits of x, saturated at +-65504 (the second GPU's expert sums on their way back: below ~20 measured)
 void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+/// x[i] += the FP16 value y[i] (a later tier's expert sums into this GPU's MoE output, before the FFN write)
+void add_f16(float* x, const uint16_t* y, int64_t n, void* stream);
 /// In place: x[t, :] *= sigmoid(sg[t])   (the shared expert's scalar gate)
 void moe_shared_gate(float* x, const float* sg, int64_t T, void* stream);
 /// sum[src[r], :] += w[r] * rows[r, :] for n rows (one expert's rows: no token twice).

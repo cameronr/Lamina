@@ -1052,6 +1052,14 @@ void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     sums_to_f16_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
     check("sums_to_f16");
 }
+__global__ void add_f16_kernel(float* __restrict__ x, const uint16_t* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += __half2float(__ushort_as_half(y[i]));
+}
+void add_f16(float* x, const uint16_t* y, int64_t n, void* stream) {
+    add_f16_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    check("add_f16");
+}
 void moe_shared_gate(float* x, const float* sg, int64_t T, void* stream) {
     moe_shared_gate_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(x, sg, T);
     check("moe_shared_gate");

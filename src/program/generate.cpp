@@ -219,6 +219,9 @@ struct Options {
     /// With the split: a batched part of this many tokens or more that fits one chunk is read in two chunks of one
     /// size, through the stages (0: a part of one chunk runs on the main GPU's stage alone).
     double prompt_split_from = 0.0;
+    /// The GPU tiers that compute their experts in prompts, counted from the first (1: the second GPU alone, which
+    /// streams the later tiers' experts; 2: the tier after it computes the ones its cache holds).
+    double prompt_tiers = 1.0;
     /// The elastic K/V (--kv-grow, LAMINA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
     bool no_kv_grow = false;   ///< --no-kv-grow: off whatever LAMINA_KV_GROW says
@@ -440,6 +443,10 @@ void usage() {
                  "  --prompt-split-from N  with --prompt-split: a prompt part of N tokens or more that fits one chunk\n"
                  "                       (--prefill) is read in two chunks of one size through the stages too (the\n"
                  "                       stages' own costs set N: by default, 0, such a part is read in one chunk)\n"
+                 "  --prompt-tiers N     with two or more GPU tiers: the first N of them compute their experts in\n"
+                 "                       prompts (default 1: the first tier alone, the experts of the later ones\n"
+                 "                       streaming to it; 2: the tier after it computes the ones its cache holds,\n"
+                 "                       their input and sums over its own link)\n"
                  "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
                  "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
                  "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
@@ -1003,17 +1010,45 @@ struct PromptBuffers {
     // experts its cache lacks, on this runner; its region comes from that tier's cache (loan3, where it may lend)
     lamina::prefill::ExpertRunner offload_mid;
     bool mid = false, borrow3 = false;
+    // --prompt-tiers 2: the later tier's runner for the main GPU's stage, set up or not (`help`); its buffers in its
+    // cache's last slots (loan3) unless the card has the room beside its cache (own3: allocated once, nothing to
+    // refill after a prompt).  `helping`: this prompt has it (use_helper: not while that tier runs a middle stage)
+    lamina::prefill::ExpertRunner helper;
+    bool help = false, helping = false;
     SlotLoan loan3;
+    bool lend3 = false, own3 = false;
 
+    uint64_t helper_bytes(int64_t chunk) const {
+        return (lamina::prefill::ExpertRunner::bytes_needed(chunk, g->n_expert, true, false) + 255) & ~255ull;
+    }
     /// After the prompt path and its second GPU's runner have been initialized.
     bool init(int64_t max_chunk, bool borrow, std::string& err) {
+        if (help) {   // (a card with neither the room nor the slots: the prompts run without its share)
+            lend3 = !own3 && borrow && loan3.cache != nullptr && loan3.res != nullptr && !loan3.res->empty() &&
+                    loan3.plan(helper_bytes(max_chunk));
+            std::string he;
+            if (!lend3 && !helper.bind(nullptr, 0, max_chunk, he)) {
+                std::fprintf(stderr, "lamina: --prompt-tiers off: %s\n", he.c_str());
+                help = false;
+                prefill->set_helpers({});
+            }
+        }
+        helping = help;
         borrow3 = borrow && loan3.cache != nullptr && loan3.res != nullptr && !loan3.res->empty();
         lend = borrow && loan.cache != nullptr && loan.res != nullptr && !loan.res->empty() &&
-               loan.plan(lamina::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, offload != nullptr));
+               loan.plan(lamina::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, offload != nullptr, help ? 1 : 0));
         lend2 = offload != nullptr && borrow && loan2.cache != nullptr && loan2.res != nullptr && !loan2.res->empty() &&
                 loan2.plan(lamina::prefill::ExpertRunner::bytes_needed(max_chunk, g->n_expert, true, true));
         return (lend || prefill->bind(nullptr, 0, max_chunk, err)) &&
                (offload == nullptr || lend2 || offload->bind(nullptr, 0, max_chunk, err));
+    }
+    /// Before take: whether this prompt's main stage has the later tier's runner (--prompt-tiers 2).
+    void use_helper(bool on) {
+        on = on && help;
+        if (on == helping) return;
+        helping = on;
+        prefill->set_helpers(on ? std::vector<lamina::prefill::ExpertRunner*>{&helper}
+                                : std::vector<lamina::prefill::ExpertRunner*>{});
     }
     /// Before a prompt whose chunks hold up to `chunk` tokens; `split_need`: with a split, each stage's bytes
     /// (PromptSplit::bytes_for, in its order), which `split_regions` then hold when the stages' caches could lend
@@ -1032,25 +1067,34 @@ struct PromptBuffers {
         // so neither the last loan's slots, refilled since, nor another chunk size stays bound
         if (!prefill->bind(loan.base(), loan.bytes(), chunk, err)) return false;
         if (offload == nullptr) return true;
-        // the second GPU's cache lends its runner for the main GPU's stage, then with a split the middle stage's
-        // runner and its own stage's region; the later tier's cache the middle stage's region
+        // the later tier's cache lends its --prompt-tiers runner's buffers (unless they are its own) and a middle
+        // stage's region; the second GPU's its runner for the main GPU's stage, then with a split the middle stage's
+        // runner and its own stage's region
+        const uint64_t one3 = helping ? helper_bytes(chunk) : 0;
+        const uint64_t h3 = lend3 ? one3 : 0;
         const bool want = !split_need.empty() && split_need.size() == (mid ? 2u : 1u);
         const uint64_t r2 = up(need2);
         const uint64_t r2m = want && mid ? up(offload_mid.bytes_for(chunk, loan3.res ? loan3.res->data() : nullptr)) : 0;
         bool with_split = want && lend2 && loan2.plan(r2 + r2m + up(split_need.back()));
-        if (with_split && mid) with_split = borrow3 && loan3.plan(up(split_need.front()));
+        if (with_split && mid) with_split = borrow3 && loan3.plan(h3 + up(split_need.front()));
         if (lend2) {
             if (!with_split) loan2.plan(need2);
             loan2.lend();
         }
-        if (!(with_split && mid)) loan3.first = -1;
+        if (!(with_split && mid)) {
+            if (h3 > 0) loan3.plan(h3);
+            else loan3.first = -1;
+        }
         loan3.lend();
         if (!offload->bind(loan2.base(), with_split ? r2 : loan2.bytes(), chunk, err)) return false;
         uint8_t* const base2 = (uint8_t*) loan2.base();
+        uint8_t* const base3 = (uint8_t*) loan3.base();
+        const bool in3 = lend3 && base3 != nullptr;   // the later tier's runner in its cache's last slots, else its own
+        if (helping && !helper.bind(in3 ? base3 : nullptr, in3 ? one3 : 0, chunk, err)) return false;
         if (with_split) {
             if (mid) {
                 if (!offload_mid.bind(base2 + r2, r2m, chunk, err)) return false;
-                split_regions.push_back({loan3.base(), loan3.bytes()});
+                split_regions.push_back({base3 + h3, loan3.bytes() - h3});
             }
             split_regions.push_back({base2 + r2 + r2m, loan2.bytes() - r2 - r2m});
         }
@@ -1262,7 +1306,8 @@ int lamina::program::run(int argc, char** argv) {
                 o.prompt_split2 = comma == std::string::npos ? 0.0 : std::atof(v.c_str() + comma + 1);
                 continue;
             }
-            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-split-from" ? &o.prompt_split_from
+            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-tiers" ? &o.prompt_tiers
+                         : a == "--prompt-split-from" ? &o.prompt_split_from
                          : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
                          : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
@@ -2675,6 +2720,8 @@ int lamina::program::run(int argc, char** argv) {
         for (int t = 0; t < n_tiers; ++t) o.tier_gpus.push_back(tiers[(size_t) t].gpu.device());
         o.second_gpu = n_tiers > 0 ? o.tier_gpus[0] : -1;
     }
+    // --prompt-tiers 2: the main GPU's prompt buffers hold a later tier's sums too
+    const int prompt_helpers = o.prompt_tiers >= 2 && n_tiers >= 2 && !o.no_prompt_offload ? 1 : 0;
     // The largest loan the main GPU's prompt path can take: its buffers for the longest chunk with a whole layer
     // streamed (the prefetch area grows with the experts the cache does not hold).  The elastic K/V stays below it.
     auto worst_loan = [&](bool off) {
@@ -2685,7 +2732,7 @@ int lamina::program::run(int argc, char** argv) {
         // (with pinned experts and the second GPU's share of the prompt path, no layer streams here: the loan is its
         // buffers alone, Prefill::bytes_for)
         const uint64_t worst_pre = !pin1.empty() && off ? 0 : stride * (uint64_t) g.n_expert;
-        return lamina::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off) + worst_pre + worst_pre / 10;
+        return lamina::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off, prompt_helpers) + worst_pre + worst_pre / 10;
     };
     // --arena-place: the RAM's slow places go to the experts that stay on a GPU: below the slots each GPU's prompt
     // path borrows at every batched prompt (its cache's last ones) and, with the elastic K/V, below the slots the whole
@@ -2715,7 +2762,7 @@ int lamina::program::run(int argc, char** argv) {
         const int64_t chunk = o.prefill_chunk;
         const int32_t* res1 = host_res.empty() ? nullptr : host_res.data();
         const int32_t* res2 = host_res2.empty() ? nullptr : host_res2.data();
-        const uint64_t need1 = lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off) +
+        const uint64_t need1 = lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off, prompt_helpers) +
                                (off ? 0 : std::min(ExpertRunner::prefetch_need(res1, nullptr, g.n_expert, true),
                                                    ExpertRunner::area_cap(chunk, false)));
         const uint64_t need2 = ExpertRunner::bytes_needed(chunk, g.n_expert, true, true) +
@@ -2775,8 +2822,8 @@ int lamina::program::run(int argc, char** argv) {
             probe.cache = &xcache;
             probe.keep = (int64_t) pin1.size();   // the pinned slots are never lent
             int64_t chunk = o.prefill_chunk;
-            while (chunk > 256 && !probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off))) chunk /= 2;
-            if (chunk != o.prefill_chunk && probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off))) {
+            while (chunk > 256 && !probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off, prompt_helpers))) chunk /= 2;
+            if (chunk != o.prefill_chunk && probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off, prompt_helpers))) {
                 std::fprintf(stderr, "lamina: prompt chunk %lld -> %lld tokens so its buffers fit in the expert "
                                      "cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
@@ -2810,6 +2857,21 @@ int lamina::program::run(int argc, char** argv) {
         }
         pbuf.prefill = &prefill;
         pbuf.offload = off ? &offload : nullptr;
+        // --prompt-tiers 2: the tier after the first computes the experts its cache holds, for the main GPU's stage
+        if (off && o.prompt_tiers >= 2 && n_tiers >= 2) {
+            std::string he;
+            if (pbuf.helper.init(o.tier_gpus[1], o.main_gpu, nullptr, srcp, &tiers[1].gpu.cache(), tiers[1].res.data(),
+                                 g.n_expert, o.prefill_chunk, false, he)) {
+                pbuf.help = true;
+                prefill.set_helpers({&pbuf.helper});
+            } else {
+                std::fprintf(stderr, "lamina: --prompt-tiers: the %s GPU's share of prompts is off: %s\n", kTierName[1],
+                             he.c_str());
+                pbuf.helper.~ExpertRunner();
+                new (&pbuf.helper) lamina::prefill::ExpertRunner();
+                cudaSetDevice(o.main_gpu);
+            }
+        }
         if (off && o.prompt_split > 0) {
             const auto ts = Clock::now();
             std::string se;
@@ -2903,11 +2965,24 @@ int lamina::program::run(int argc, char** argv) {
             pbuf.loan2.main_device = o.main_gpu;
             pbuf.loan2.keep = (int64_t) pin2.size();
         }
-        if (pbuf.mid) {
+        if (pbuf.help || pbuf.mid) {
             pbuf.loan3.cache = &tiers[1].gpu.cache();
             pbuf.loan3.res = &tiers[1].res;
             pbuf.loan3.device = o.tier_gpus[1];
             pbuf.loan3.main_device = o.main_gpu;
+        }
+        if (pbuf.help) {
+            // its own buffers where the card has the room beside its cache and its reserve: nothing to refill
+            size_t free3 = 0, total3 = 0;
+            cudaSetDevice(o.tier_gpus[1]);
+            cudaMemGetInfo(&free3, &total3);
+            cudaSetDevice(o.main_gpu);
+            const uint64_t need3 = pbuf.helper_bytes(o.prefill_chunk);
+            pbuf.own3 = free3 >= need3 + ((uint64_t) 512 << 20);
+            std::fprintf(stderr, "lamina: --prompt-tiers: the %s GPU computes the experts it holds for the main GPU's "
+                                 "layers of a prompt%s, %.2f GiB of buffers %s\n", kTierName[1],
+                         pbuf.mid ? " that runs unsplit" : "", (double) need3 / 1073741824.0,
+                         pbuf.own3 ? "of its own" : "in its cache's last slots");
         }
         if (!pbuf.init(o.prefill_chunk, !o.no_prefill_borrow, e)) return false;
         if (pin1.empty() && pin2.empty()) return true;
@@ -3894,6 +3969,7 @@ int lamina::program::run(int argc, char** argv) {
                                     part >= (int64_t) o.prompt_split_from;
                 int64_t chunk = halves ? half_chunk(part) : prompt_chunk(part, o.prefill_chunk, pbuf.offload != nullptr);
                 const bool split_try = pbuf.split != nullptr && (part > o.prefill_chunk || halves);
+                pbuf.use_helper(!(split_try && pbuf.mid));   // (that tier runs a stage of its own then)
                 std::vector<uint64_t> split_need;
                 for (int st = 0; split_try && st < psplit.stages(); ++st)
                     split_need.push_back(psplit.bytes_for(st, chunk, batched_end));
@@ -3909,9 +3985,9 @@ int lamina::program::run(int argc, char** argv) {
                                          ? part : std::max<int64_t>(1, o.prompt_cache_every / o.prefill_chunk) * chunk;
                 pp_chunk = chunk;
                 tr("prompt slots lent", chunk);
-                // (a later tier that runs a stage of the prompt works from its first chunk on; a part in two halves is
-                // held from its start, as in one chunk)
-                hold_from = (split_on && pbuf.mid) || halves ? reuse : batched_end - chunk;
+                // (a later tier that computes its experts in the prompt, or runs a stage of it, works from its first
+                // chunk on; a part in two halves is held from its start, as in one chunk)
+                hold_from = pbuf.helping || (split_on && pbuf.mid) || halves ? reuse : batched_end - chunk;
                 // a return on an error below lets the second stage end first: its worker writes checkpoints into
                 // pcache's buffers, which go before psplit (finish after a finish does nothing)
                 struct SplitEnd {
@@ -3986,6 +4062,9 @@ int lamina::program::run(int argc, char** argv) {
                                              "ms GPU", (long long) offload.experts_streamed,
                                      (long long) offload.experts_prefetched, (long long) offload.experts_resident,
                                      offload.ms_host, offload.ms_gpu);
+                    if (pbuf.help)
+                        std::fprintf(stderr, "; %s GPU resident %lld, %.1f ms queuing, %.1f ms GPU", kTierName[1],
+                                     (long long) pbuf.helper.experts_resident, pbuf.helper.ms_host, pbuf.helper.ms_gpu);
                     for (int st = 0; pbuf.split != nullptr && st < psplit.stages(); ++st) {
                         const lamina::prefill::PrefillStats& p2 = psplit.stats(st);
                         std::fprintf(stderr, "; stage %d %lld chunks in %.0f ms, streamed %lld (%lld ahead), resident %lld, "
@@ -4314,6 +4393,7 @@ int lamina::program::run(int argc, char** argv) {
         int64_t chunk = !path_ok ? 0 : halves ? half_chunk(n_batched)
                                               : prompt_chunk(n_batched, o.prefill_chunk, pbuf.offload != nullptr);
         const bool split_try = path_ok && pbuf.split != nullptr && (n_batched > o.prefill_chunk || halves);
+        if (path_ok) pbuf.use_helper(!(split_try && pbuf.mid));
         std::vector<uint64_t> split_need;
         for (int st = 0; split_try && st < psplit.stages(); ++st)
             split_need.push_back(psplit.bytes_for(st, chunk, n_batched));
@@ -4349,7 +4429,8 @@ int lamina::program::run(int argc, char** argv) {
         const int64_t cut = cut_env != nullptr ? std::min<int64_t>(std::max<int64_t>(std::atoll(cut_env), 0), n_batched) : 0;
         int64_t run_at = 0, run_chunks = 0;   // --second-gpu-clocks: held from the prompt's last chunk on
         prefill.should_stop = [&] {
-            if ((split_on && pbuf.mid) || run_at + run_chunks++ * chunk >= n_batched - chunk) clocks.hold();
+            if (pbuf.helping || (split_on && pbuf.mid) || run_at + run_chunks++ * chunk >= n_batched - chunk)
+                clocks.hold();
             return false;
         };
         for (int64_t a = 0; a < n_batched;) {
@@ -4399,6 +4480,9 @@ int lamina::program::run(int argc, char** argv) {
                                  "resident %lld; %.1f ms queuing, %.1f ms GPU\n", (long long) offload.experts_streamed,
                          (long long) offload.experts_prefetched, (long long) offload.experts_resident, offload.ms_host,
                          offload.ms_gpu);
+        if (pbuf.helping)
+            std::fprintf(stderr, "lamina: prefill on the %s GPU: resident %lld; %.1f ms queuing, %.1f ms GPU\n", kTierName[1],
+                         (long long) pbuf.helper.experts_resident, pbuf.helper.ms_host, pbuf.helper.ms_gpu);
         if (split_on) {
             const lamina::prefill::PrefillStats& s2 = psplit.stats();
             std::fprintf(stderr, "lamina: prefill split at layer %lld: the second stage %.1f ms (its experts "

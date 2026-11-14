@@ -77,9 +77,17 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t max_chunk,
               void* stream, ExpertRunner* offload, std::string& err);
 
-    /// Device bytes of the buffers for chunks of `chunk` tokens.
+    /// Device bytes of the buffers for chunks of `chunk` tokens (`helpers`: with that many of set_helpers' runners).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                 bool offload);
+                                 bool offload, int helpers = 0);
+    /// Runners on other GPUs that take the experts their caches hold (initialized, bound by the caller; nothing
+    /// streams to them): an expert this GPU's cache lacks goes to the `offload` runner when that GPU holds it, else to
+    /// the first of these that holds it, and only the rest stream.  Each takes its share in two passes as `offload`
+    /// does, from one host copy of the input (ExpertRunner::set_host_input), and its sums come back to this GPU
+    /// beside the others', added to the MoE output before the FFN write.  Between prompts (it changes the buffers'
+    /// size: bytes_for); empty: none.
+    static constexpr int kMaxHelpers = 2;
+    void set_helpers(const std::vector<ExpertRunner*>& helpers);
     /// The same with the area its experts are prefetched into (without a second GPU), for the residency as it is now.
     uint64_t bytes_for(int64_t chunk) const;
     /// The buffers for chunks of up to `chunk` tokens, carved from `region` (`bytes` long: lent expert-cache

@@ -64,9 +64,9 @@ struct Bufs {
     uint16_t* hc16 = nullptr;   // a layer's hyper-connection down and up matrices without a BF16 copy, dequantized
     void* gemm_ws = nullptr;
     // the chunk's: residual stream, the MoE's input (FP16) and output, the FFN half's injection, routing, steps, PLE
-    // rows, the second GPU's sums (FP16), its token ids
+    // rows, the second GPU's sums and each helper's (FP16), its token ids
     float *R = nullptr, *bo_moe = nullptr, *inj_f = nullptr, *w = nullptr, *ple_emb = nullptr;
-    uint16_t *mixed_h = nullptr, *sums = nullptr;
+    uint16_t *mixed_h = nullptr, *sums = nullptr, *hsums[Prefill::kMaxHelpers] = {};
     int32_t *ids = nullptr, *steps = nullptr, *tok = nullptr;
     // a sub-chunk's: the mixer's BF16 input, its output, the mixer half's injection, a read's row scales
     uint16_t* mixed_bf = nullptr;
@@ -94,7 +94,7 @@ bool g_hc_q8 = false;   // set_hc_q8
 // Chunks of T tokens: the chunk-long buffers, the sub-chunk ones, then the union of the steps a layer takes one after
 // the other on the stream.  (Staging copies run ahead on a copy stream only while the routed experts run, after the
 // host has waited for the stream, and the stream waits for them before the next step.)
-Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) {
+Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload, int helpers) {
     const size_t t = (size_t) T, p = (size_t) std::min(T, SUB);
     Bufs b;
     b.w16 = a.take<uint16_t>((size_t) W16);
@@ -110,6 +110,7 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     b.steps = a.take<int32_t>(t * lamina::kernels::kStepCount);
     b.ple_emb = a.take<float>(t * N);
     b.sums = offload ? a.take<uint16_t>(t * N) : nullptr;   // read by the next layer's sub-chunks
+    for (int h = 0; h < helpers; ++h) b.hsums[h] = a.take<uint16_t>(t * N);
     b.mixed_bf = a.take<uint16_t>(p * N);
     b.bo = a.take<float>(p * N);
     b.inj_a = a.take<float>(p * HC);
@@ -174,6 +175,7 @@ struct Prefill::Impl {
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     ExpertRunner* offload = nullptr;
+    std::vector<ExpertRunner*> helpers;   // set_helpers: other GPUs' runners for the experts their caches hold
     ExpertRunner local;
     int64_t max_chunk = 0, T = 0;   // T: the chunk the buffers are bound for
     lamina::kernels::QsaShapes s;
@@ -198,6 +200,10 @@ struct Prefill::Impl {
     std::vector<int32_t> tok_host;   // a chunk's token ids, pageable (its copy is staged at once)
     // this GPU's experts; the second GPU's, the tokens of the first half and of the second (run_layer's passes)
     std::vector<int32_t> ex1, off1, src1, ex2[2], off2[2], src2[2];
+    struct Share {   // a helper's, its passes as the second GPU's
+        std::vector<int32_t> ex[2], off[2], src[2];
+        std::vector<float> w[2];
+    } hshare[Prefill::kMaxHelpers];
     double shift = 0.0;              // set_shift
     std::vector<uint8_t> shifted;    // per expert of the layer: held here, computed by the second GPU (set_shift)
     std::vector<float> w1, w2[2];
@@ -292,6 +298,13 @@ void set_hc_q8(bool on) { g_hc_q8 = on; }
 
 void Prefill::set_order(std::vector<int32_t> order) { impl_->order = std::move(order); }
 void Prefill::set_shift(double fraction) { impl_->shift = std::min(1.0, std::max(0.0, fraction)); }
+void Prefill::set_helpers(const std::vector<ExpertRunner*>& helpers) {
+    Impl& m = *impl_;
+    m.helpers.assign(helpers.begin(), helpers.begin() + std::min<size_t>(helpers.size(), (size_t) kMaxHelpers));
+    // one host copy of the input for every runner on another GPU
+    uint16_t* in = m.offload ? m.offload->host_input() : m.helpers.empty() ? nullptr : m.helpers[0]->host_input();
+    for (ExpertRunner* h : m.helpers) h->set_host_input(in);
+}
 const std::vector<uint32_t>& Prefill::routed() const { return impl_->routed; }
 void Prefill::clear_routed() { std::fill(impl_->routed.begin(), impl_->routed.end(), 0u); }
 void Prefill::add_routed(const std::vector<uint32_t>& counts) {
@@ -318,18 +331,19 @@ cudaEvent_t Prefill::out_done(int64_t k) const {
     return m.out_live && k >= 0 && (size_t) k < m.ev_out.size() ? m.ev_out[(size_t) k] : nullptr;
 }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload) {
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload,
+                               int helpers) {
     const lamina::kernels::QsaShapes s = lamina::kernels::qsa_shapes(g);
     Alloc a;
     layout(a, chunk, lamina::kernels::qsa_selection_width(lamina::kernels::kTopkMaxCells, s),
-           ss.qsa_states[0].max_cells / s.idx_block + 2, offload);
+           ss.qsa_states[0].max_cells / s.idx_block + 2, offload, std::min(helpers, kMaxHelpers));
     return a.used;
 }
 
 uint64_t Prefill::bytes_for(int64_t chunk) const {
     const Impl& m = *impl_;
     Alloc a;
-    layout(a, chunk, m.cap, m.max_blocks, m.offload != nullptr);   // as bind carves them
+    layout(a, chunk, m.cap, m.max_blocks, m.offload != nullptr, (int) m.helpers.size());   // as bind carves them
     return a.used + (m.offload == nullptr ? m.local.prefetch_area(chunk, nullptr) : 0);
 }
 
@@ -337,7 +351,8 @@ bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err
     Impl& m = *impl_;
     if (region == nullptr) {   // its own buffers, allocated once for the longest chunk, carved for this one
         if (m.owned == nullptr) {
-            const uint64_t need = bytes_needed(*m.g, *m.ss, m.max_chunk, m.offload != nullptr);
+            // (with room for every helper: set_helpers may come after the first bind)
+            const uint64_t need = bytes_needed(*m.g, *m.ss, m.max_chunk, m.offload != nullptr, kMaxHelpers);
             if (cudaMalloc(&m.owned, need) != cudaSuccess) {
                 m.owned = nullptr;
                 err = "prefill: " + std::to_string(need >> 20) + " MiB of device buffers";
@@ -355,7 +370,7 @@ bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err
     Alloc a;
     a.base = (uint8_t*) region;
     a.cap = bytes;
-    m.b = layout(a, chunk, m.cap, m.max_blocks, m.offload != nullptr);
+    m.b = layout(a, chunk, m.cap, m.max_blocks, m.offload != nullptr, (int) m.helpers.size());
     if (!a.ok) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
@@ -616,11 +631,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const float* pending_cv = nullptr;   // that layer's control vector (core/control_vector.hpp): after the write
         auto ffn_write = [&](int64_t t0, int64_t P, const float* norm) {
             const uint16_t* part = nullptr;
-            if (m.offload) {
-                cudaStreamWaitEvent(m.cs, m.ev_piece[(size_t) (t0 / SUB)], 0);
-                part = b.sums + t0 * N;
-            }
             float *R = b.R + t0 * D, *bo = b.bo_moe + t0 * N, *inj = b.inj_f + t0 * HC;
+            if (m.offload || !m.helpers.empty()) {
+                cudaStreamWaitEvent(m.cs, m.ev_piece[(size_t) (t0 / SUB)], 0);
+                if (m.offload) part = b.sums + t0 * N;
+                for (size_t h = 0; h < m.helpers.size(); ++h) add_f16(bo, b.hsums[h] + t0 * N, P * N, m.cs);
+            }
             if (pending_cv != nullptr) {
                 lamina::kernels::CvecRows r;
                 r.R = R; r.T = P; r.n_embd = N; r.hc = HC;
@@ -662,10 +678,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                 }
             }
+            auto helper_of = [&](int32_t e) -> int {   // the helper whose cache holds it, or -1
+                for (size_t h = 0; h < m.helpers.size(); ++h)
+                    if (m.helpers[h]->holds(l, e)) return (int) h;
+                return -1;
+            };
             m.ex1.clear();
             for (int32_t i = 0; i < NE; ++i) {
                 const int32_t e = m.order.empty() ? i : m.order[(size_t) l * NE + i];
-                if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.shifted[(size_t) e]) m.ex1.push_back(e);
+                const bool held = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0 && !m.shifted[(size_t) e];
+                if (!held && (m.shifted[(size_t) e] || helper_of(e) < 0)) m.ex1.push_back(e);
             }
             if (!streamer->prefetch_begin(l, T, m.ex1, err)) return false;
             mark(kPsPle);
@@ -843,13 +865,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     gr_write_norm_rs(b.R + t0 * D, b.bo, b.inj_a, HC, (const float*) wfn->data, EPS, b.rs, b.xn16, P,
                                      m.cs);
                 }
-                // ---- the FFN half's input is ready: its trip to the second GPU starts here
-                if (m.offload) {
+                // ---- the FFN half's input is ready: its trip to the other GPUs starts here (one host copy)
+                if (m.offload || !m.helpers.empty()) {
                     cudaEventRecord(m.ev_mixed, m.cs);
                     cudaStreamWaitEvent(m.xfer, m.ev_mixed, 0);
-                    cudaMemcpyAsync(m.offload->host_input() + t0 * N, mixed_h, (size_t) P * N * 2,
-                                    cudaMemcpyDeviceToHost, m.xfer);
-                    cudaEventRecord(m.ev_in[(size_t) (t0 / SUB)], m.xfer);   // on to the second GPU below
+                    cudaMemcpyAsync((m.offload ? m.offload : m.helpers[0])->host_input() + t0 * N, mixed_h,
+                                    (size_t) P * N * 2, cudaMemcpyDeviceToHost, m.xfer);
+                    cudaEventRecord(m.ev_in[(size_t) (t0 / SUB)], m.xfer);   // on to the other GPUs below
                 }
                 // ---- the router, and the shared expert (its gated output starts the MoE sum)
                 mark(kPsRouter);
@@ -872,11 +894,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             // order, whatever their stream), and the copies ahead, at most two pieces queued
             cudaEventRecord(m.ev_routed, m.cs);
             const int64_t n_sub = (T + SUB - 1) / SUB;
-            int64_t k_in = m.offload ? 0 : n_sub;
+            int64_t k_in = m.offload || !m.helpers.empty() ? 0 : n_sub;
             for (;;) {
                 cudaError_t q = cudaSuccess;
                 while (k_in < n_sub && (q = cudaEventQuery(m.ev_in[(size_t) k_in])) == cudaSuccess) {
-                    m.offload->stage_input(k_in * SUB, std::min(SUB, T - k_in * SUB), m.ev_in[(size_t) k_in]);
+                    const int64_t rows = std::min(SUB, T - k_in * SUB);
+                    if (m.offload) m.offload->stage_input(k_in * SUB, rows, m.ev_in[(size_t) k_in]);
+                    for (ExpertRunner* h : m.helpers) h->stage_input(k_in * SUB, rows, m.ev_in[(size_t) k_in]);
                     ++k_in;
                 }
                 const cudaError_t r = cudaEventQuery(m.ev_routed);
@@ -934,6 +958,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 m.src2[h].clear();
                 m.w2[h].clear();
                 m.off2[h].assign(1, 0);
+                for (Impl::Share& sh : m.hshare) {
+                    sh.ex[h].clear();
+                    sh.src[h].clear();
+                    sh.w[h].clear();
+                    sh.off[h].assign(1, 0);
+                }
             }
             // the experts by their row count, most first, where a second GPU takes the experts this one lacks or
             // this one copies most of its streamed experts ahead over an x16 link (a second stage): a batch of
@@ -949,13 +979,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                  [&](int32_t x, int32_t y) { return m.cnt[(size_t) x] > m.cnt[(size_t) y]; });
             for (const int32_t e : by_rows) {
                 if (m.cnt[(size_t) e] == 0) continue;
-                const bool here = !m.offload || (m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0 &&
-                                                 !m.shifted[(size_t) e]);
+                // held here: this GPU's; else the second GPU's where its cache holds it, else a helper's that does,
+                // else it streams (to the second GPU, or here without one)
+                const bool held = m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0 && !m.shifted[(size_t) e];
+                const int hp = held || m.shifted[(size_t) e] || (m.offload && m.offload->holds(l, e)) ? -1 : helper_of(e);
+                const bool here = hp < 0 && (!m.offload || held);
                 for (int h = 0; h < (here ? 1 : 2); ++h) {
-                    std::vector<int32_t>& ex = here ? m.ex1 : m.ex2[h];
-                    std::vector<int32_t>& of = here ? m.off1 : m.off2[h];
-                    std::vector<int32_t>& sr = here ? m.src1 : m.src2[h];
-                    std::vector<float>& wv = here ? m.w1 : m.w2[h];
+                    Impl::Share* const sh = hp >= 0 ? &m.hshare[hp] : nullptr;
+                    std::vector<int32_t>& ex = here ? m.ex1 : sh ? sh->ex[h] : m.ex2[h];
+                    std::vector<int32_t>& of = here ? m.off1 : sh ? sh->off[h] : m.off2[h];
+                    std::vector<int32_t>& sr = here ? m.src1 : sh ? sh->src[h] : m.src2[h];
+                    std::vector<float>& wv = here ? m.w1 : sh ? sh->w[h] : m.w2[h];
                     const size_t n0 = sr.size();
                     for (int32_t p = m.off[(size_t) e]; p < m.off[(size_t) e + 1]; ++p) {
                         const int32_t i = m.entry_of[(size_t) p], t = i / (int32_t) K;
@@ -968,20 +1002,38 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     of.push_back((int32_t) sr.size());
                 }
             }
+            auto helpers_run = [&](int pass, int64_t t_begin, int64_t t_end) -> bool {
+                for (size_t h = 0; h < m.helpers.size(); ++h) {
+                    const Impl::Share& sh = m.hshare[h];
+                    if (!m.helpers[h]->run_layer(l, T, t_begin, t_end, sh.ex[pass], sh.off[pass], sh.src[pass], sh.w[pass],
+                                                 SUB, nullptr, nullptr, err))
+                        return false;
+                }
+                return true;
+            };
             if (m.offload &&
                 !m.offload->run_layer(l, T, 0, th, m.ex2[0], m.off2[0], m.src2[0], m.w2[0], SUB, nullptr, nullptr, err))
                 return false;
+            if (!helpers_run(0, 0, th)) return false;
             if (!m.local.run_layer(l, T, 0, T, m.ex1, m.off1, m.src1, m.w1, SUB, b.mixed_h, b.bo_moe, err)) return false;
             if (m.offload && th < T &&
                 !m.offload->run_layer(l, T, th, T, m.ex2[1], m.off2[1], m.src2[1], m.w2[1], SUB, nullptr, nullptr, err))
                 return false;
-            // ---- the MoE output (+ the second GPU's sums) goes into the residual stream as the next layer reads it
-            if (m.offload) {
+            if (th < T && !helpers_run(1, th, T)) return false;
+            // ---- the MoE output (+ the other GPUs' sums) goes into the residual stream as the next layer reads it
+            if (m.offload || !m.helpers.empty()) {
                 for (int64_t t0 = 0; t0 < T; t0 += SUB) {
-                    cudaStreamWaitEvent(m.xsum, m.offload->piece_done(t0 / SUB), 0);
                     const size_t bytes = (size_t) std::min(SUB, T - t0) * N * 2;
-                    cudaMemcpyAsync(b.sums + t0 * N, m.offload->host_sum() + t0 * N, bytes, cudaMemcpyHostToDevice,
-                                    m.xsum);
+                    if (m.offload) {
+                        cudaStreamWaitEvent(m.xsum, m.offload->piece_done(t0 / SUB), 0);
+                        cudaMemcpyAsync(b.sums + t0 * N, m.offload->host_sum() + t0 * N, bytes, cudaMemcpyHostToDevice,
+                                        m.xsum);
+                    }
+                    for (size_t h = 0; h < m.helpers.size(); ++h) {
+                        cudaStreamWaitEvent(m.xsum, m.helpers[h]->piece_done(t0 / SUB), 0);
+                        cudaMemcpyAsync(b.hsums[h] + t0 * N, m.helpers[h]->host_sum() + t0 * N, bytes,
+                                        cudaMemcpyHostToDevice, m.xsum);
+                    }
                     cudaEventRecord(m.ev_piece[(size_t) (t0 / SUB)], m.xsum);
                 }
             }

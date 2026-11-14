@@ -131,6 +131,7 @@ struct ExpertRunner::Impl {
     bool up_live[2] = {};
     int up_cur = 0;
     uint16_t *h_input = nullptr, *h_sum = nullptr;
+    bool own_input = true;   // h_input is its own (set_host_input: another runner's)
     // a layer's blobs copied ahead: at pre_off[e] in `pre` (-1: not there), covered by event pre_ev[pre_grp[e]] (its
     // piece); pre_list the experts to copy in order, pre_next the next one, pre_at the area's next free byte
     uint8_t* pre = nullptr;
@@ -191,7 +192,7 @@ ExpertRunner::~ExpertRunner() {
     for (cudaEvent_t e : {m.t0, m.t1, m.pre_used, m.up_done[0], m.up_done[1]}) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.pre_ev) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.piece_ev) if (e) cudaEventDestroy(e);
-    if (m.h_input) cudaFreeHost(m.h_input);
+    if (m.h_input && m.own_input) cudaFreeHost(m.h_input);
     if (m.h_sum) cudaFreeHost(m.h_sum);
     for (uint8_t* p : m.h_up) if (p) cudaFreeHost(p);
     if (m.owned) cudaFree(m.owned);
@@ -436,6 +437,20 @@ bool ExpertRunner::prefetch_next(std::string& err) {
 
 uint16_t* ExpertRunner::host_input() const { return impl_->h_input; }
 uint16_t* ExpertRunner::host_sum() const { return impl_->h_sum; }
+
+void ExpertRunner::set_host_input(uint16_t* host) {
+    Impl& m = *impl_;
+    if (host == m.h_input) return;
+    if (m.h_input && m.own_input) cudaFreeHost(m.h_input);
+    m.h_input = host;
+    m.own_input = false;
+}
+
+bool ExpertRunner::holds(int64_t layer, int32_t e) const {
+    const Impl& m = *impl_;
+    return m.res != nullptr && m.cache != nullptr && m.res[(size_t) layer * (size_t) m.n_expert + (size_t) e] >= 0;
+}
+
 cudaEvent_t ExpertRunner::piece_done(int64_t k) const { return impl_->piece_ev[(size_t) k]; }
 
 void ExpertRunner::stage_input(int64_t t0, int64_t rows, cudaEvent_t ready) {
