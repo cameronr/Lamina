@@ -75,6 +75,19 @@ without its files, and warns in its window with the script's command. It then ge
 or prompt lookup's drafts (`--spec-lookup`). On the development PC, new text came at 44-61% of IQ3_S's speed with
 the layer and 50-68% of UD-Q4_K_XL's, an edit that quotes its prompt at 92-96%.
 
+**A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 5 MB instead of the CUDA build's
+~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone, with `third_party/llama.cpp` in place
+(setup's step 1; on Windows in a Visual Studio developer prompt):
+
+```
+cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
+cmake --build build-vision --target lamina-vision
+```
+
+Copy `build-vision/bin/lamina-vision` (`.exe`) beside `lamina-server`, over the one there, and keep `"gpu": false` in
+the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. Setup with
+`--no-build` keeps an encoder it finds beside the server; setup with a build replaces it with the CUDA one it builds.
+
 On Windows on Arm the build takes LLVM's clang-cl for the C and C++ code (ggml's CPU code for Arm does not build with
 MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or LLVM's own install
 (`LAMINA_CLANG_CL` names another).

@@ -49,6 +49,10 @@ config's port: close it, or start this one with `--port`.
 there. Put it back (a release's programs archive extracted whole, or setup run again), or take the `vision` section
 and `"--vision"` out of the config to run without pictures.
 
+**"the vision encoder did not start: ERR this lamina-vision was built without CUDA ...".** The `lamina-vision` beside
+the server is a CPU-only build and the config's `vision` section asks for a GPU (`"gpu": true`). Set `"gpu"` to
+`false` (and remove `cuda_device`), or put the CUDA build back: a release's programs archive, or setup run again.
+
 **"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's config names no draft layer (`"--mtp", "<folder>"` in its
 `args`), or a folder without the layer's files. The server runs, and the model writes new text at roughly half to two
 thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`, `./download-draft-layer.sh FOLDER`

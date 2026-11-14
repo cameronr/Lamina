@@ -161,5 +161,40 @@ class PlaceVision(unittest.TestCase):
         self.assertEqual(self.placed(["build-vision"]), (False, None))
 
 
+class VisionBesideServer(unittest.TestCase):
+    """--no-build: the encoder beside the server (vision_beside_server), on a temporary tree."""
+    NAME = "lamina-vision" + setup.EXE
+
+    def run_in(self, files, release=False, vision=True):
+        """build/'s or bin/'s encoder after the call (its text), or "stopped"; `files`: {path in the tree: text}."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "ROOT", Path(d)), \
+                mock.patch.object(setup, "RELEASE", Path(d) / "bin"):
+            (Path(d) / "build").mkdir()
+            for rel, text in files.items():
+                (Path(d) / rel).parent.mkdir(parents=True, exist_ok=True)
+                (Path(d) / rel).write_text(text)
+            try:
+                quiet(setup.vision_beside_server, release, vision)
+            except SystemExit:
+                return "stopped"
+            copy = Path(d) / ("bin" if release else "build") / self.NAME
+            return copy.read_text() if copy.exists() else None
+
+    def test_the_encoder_built_before_is_placed(self):
+        self.assertEqual(self.run_in({f"build-vision-cuda/bin/{self.NAME}": "cuda"}), "cuda")
+
+    def test_one_put_there_by_hand_stays(self):   # a CPU-only build, say
+        self.assertEqual(self.run_in({f"build-vision-cuda/bin/{self.NAME}": "cuda", f"build/{self.NAME}": "custom"}),
+                         "custom")
+
+    def test_none_stops_with_pictures_and_not_without(self):
+        self.assertEqual(self.run_in({}), "stopped")
+        self.assertIsNone(self.run_in({}, vision=False))
+
+    def test_a_release_is_used_as_it_is(self):
+        self.assertEqual(self.run_in({f"bin/{self.NAME}": "release"}, release=True), "release")
+        self.assertEqual(self.run_in({f"build-vision-cuda/bin/{self.NAME}": "cuda"}, release=True), "stopped")
+
+
 if __name__ == "__main__":
     unittest.main()

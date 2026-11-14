@@ -532,6 +532,19 @@ def place_vision() -> bool:
     return True
 
 
+def vision_beside_server(release: bool, vision: bool):
+    """--no-build: the image encoder beside the server. A release's bin/ is used as it is; build/ gets the encoder built
+    before (build-vision-cuda) only when it has none, so one put there by hand (a CPU-only build) stays. Stops when
+    pictures are asked for and no lamina-vision is there."""
+    progs = RELEASE if release else ROOT / "build"
+    if not release and not (progs / f"lamina-vision{EXE}").exists():
+        place_vision()
+    if vision and not (progs / f"lamina-vision{EXE}").exists():
+        fail(f"{progs.name}/ has no lamina-vision beside the server",
+             "extract the release's programs archive there whole, or --vision off" if release else
+             "run setup without --no-build, or with --vision off")
+
+
 def build_vision(tc: Toolchain, env: dict, cuda_archs: str):
     """The image encoder, built with CUDA for the engine's architectures in build-vision-cuda and copied beside the
     server. One build runs either way, as the config's vision section says: on the CPU ("gpu": false: it hides the GPUs,
@@ -883,12 +896,7 @@ def main() -> int:
         build_vision(tc, env, archs)
     else:
         say("\n2. the programs as they are (--no-build): " + ("a release's, in bin/" if release else "build/'s"))
-        if not release:
-            place_vision()   # the encoder built before, beside the server again
-        if vision and not ((RELEASE if release else ROOT / "build") / f"lamina-vision{EXE}").exists():
-            fail(("bin/" if release else "build/") + " has no lamina-vision beside the server",
-                 "extract the release's programs archive there whole, or --vision off" if release else
-                 "run setup without --no-build, or with --vision off")
+        vision_beside_server(release, vision)
     if not m:
         say("\nDone: the engine is built. Prepare a model with --model (" + ", ".join(MODELS) + ").")
         return 0

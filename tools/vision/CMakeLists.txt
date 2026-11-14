@@ -7,7 +7,8 @@
 #
 # lamina-server starts the lamina-vision in its own folder and no other: copy build-vision-cuda/bin's there (setup.py
 # and .github/ci.py do).  A CUDA build runs either way, as the config's vision section says: without --gpu it hides the
-# GPUs and runs on the CPU; LAMINA_VISION_CUDA=OFF builds one for the CPU alone.
+# GPUs and runs on the CPU; LAMINA_VISION_CUDA=OFF (the default here) builds one for the CPU alone, which refuses --gpu
+# (src/docs/SETUP.md, A CPU-only image encoder).
 #
 # Portable (AVX2 baseline; arm64: Armv8.2 + dotprod + fp16) is the default, so an encoder built without extra flags
 # runs on any AVX2 PC: the 0.1.32 release's encoder was built native on an AVX-512 machine and stopped with an illegal
@@ -59,6 +60,8 @@ if(MSVC)   # UTF-8 as its code page: image and model paths outside the ANSI code
 endif()
 target_link_libraries(lamina-vision PRIVATE mtmd llama)
 target_compile_features(lamina-vision PRIVATE cxx_std_17)
+# a build without CUDA refuses --gpu (lamina_vision.cpp)
+target_compile_definitions(lamina-vision PRIVATE LAMINA_VISION_CUDA=$<BOOL:${LAMINA_VISION_CUDA}>)
 install(TARGETS lamina-vision RUNTIME DESTINATION bin COMPONENT lamina)
 set_target_properties(lamina-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 if(UNIX AND NOT APPLE)
