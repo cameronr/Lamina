@@ -305,8 +305,12 @@ struct GpuClocks::State {
     std::condition_variable cv;
     std::thread thread;
     std::atomic<bool> want{false}, off{false};   // generation nears or runs; a lock was refused
-    bool locked = false, quit = false;
+    bool quit = false;
+    uint64_t wishes = 0;                           // counts the calls that change what the locks should be
     std::chrono::steady_clock::time_point due{};   // a release's time
+    // per GPU of gpus_: its tier sleeps; its lock is set, and since when
+    std::vector<char> asleep, locked;
+    std::vector<std::chrono::steady_clock::time_point> since;
 };
 
 namespace {
@@ -347,79 +351,103 @@ bool GpuClocks::add(int device, const std::string& spec, std::string& why) {
     return true;
 }
 
-// Every GPU's locks set or released; false when one was refused (said once: `off`).
-bool GpuClocks::set(bool lock) {
+// One GPU's locks set or released; false when refused (said once: `off`), and then nothing of it stays locked.
+bool GpuClocks::set_one(const Gpu& g, bool lock) {
     const Nvml& n = Nvml::get();
-    bool all = true;
-    for (const Gpu& g : gpus_) {
-        int r = -1;
-        const char* clock = "graphics";   // the one a refusal is about
-        if (g.nvml != nullptr && n.lock_graphics != nullptr && n.lock_memory != nullptr && n.reset_graphics != nullptr &&
-            n.reset_memory != nullptr) {
-            if (lock) {
-                r = n.lock_graphics(g.nvml, g.gr_min, g.gr_max);
-                if (r == 0 && g.mem > 0) {
-                    clock = "memory";
-                    r = n.lock_memory(g.nvml, g.mem, g.mem);
-                }
-            } else {
-                r = n.reset_graphics(g.nvml);
-                const int rm = g.mem > 0 ? n.reset_memory(g.nvml) : 0;
-                if (r == 0) r = rm;
+    int r = -1;
+    const char* clock = "graphics";   // the one a refusal is about
+    const bool nvml = g.nvml != nullptr && n.lock_graphics != nullptr && n.lock_memory != nullptr &&
+                      n.reset_graphics != nullptr && n.reset_memory != nullptr;
+    if (nvml) {
+        if (lock) {
+            r = n.lock_graphics(g.nvml, g.gr_min, g.gr_max);
+            if (r == 0 && g.mem > 0) {
+                clock = "memory";
+                r = n.lock_memory(g.nvml, g.mem, g.mem);
+                if (r != 0) n.reset_graphics(g.nvml);
             }
+        } else {
+            r = n.reset_graphics(g.nvml);
+            const int rm = g.mem > 0 ? n.reset_memory(g.nvml) : 0;
+            if (r == 0) r = rm;
         }
-        if (r == 0) continue;
-        all = false;
-        // 4: NVML_ERROR_NO_PERMISSION.  NVML documents the graphics clock's lock from Volta on (the RTX 20 series) and
-        // the memory clock's from Ampere on (the RTX 30 series), "Not Supported" for a card without one.
-        if (lock && !st_->off.exchange(true))
-            std::fprintf(stderr, "lamina: GPU %d's %s clock could not be locked (%s%s): it runs at the driver's clocks\n",
-                         g.device, clock,
-                         g.nvml == nullptr || r < 0 ? "no NVML" : n.error != nullptr ? n.error(r) : "NVML refused",
-                         r == 4 ? ": the lock needs administrator rights, root on Linux" : "");
     }
+    if (r == 0) return true;
+    // 4: NVML_ERROR_NO_PERMISSION.  NVML documents the graphics clock's lock from Volta on (the RTX 20 series) and the
+    // memory clock's from Ampere on (the RTX 30 series), "Not Supported" for a card without one.
+    if (lock && !st_->off.exchange(true))
+        std::fprintf(stderr, "lamina: GPU %d's %s clock could not be locked (%s%s): it runs at the driver's clocks\n",
+                     g.device, clock,
+                     g.nvml == nullptr || r < 0 ? "no NVML" : n.error != nullptr ? n.error(r) : "NVML refused",
+                     r == 4 ? ": the lock needs administrator rights, root on Linux" : "");
+    return false;
+}
+
+// Every GPU's locks set or released, whatever its tier does; false when one was refused.
+bool GpuClocks::set(bool lock) {
+    bool all = true;
+    for (const Gpu& g : gpus_) all = set_one(g, lock) && all;
     return all;
 }
 
 void GpuClocks::run() {
+    using clock = std::chrono::steady_clock;
     State& s = *st_;
     std::unique_lock<std::mutex> lk(s.mu);
+    const size_t n = gpus_.size();
     while (!s.quit && !s.off.load()) {
-        if (s.want.load() && !s.locked) {
+        // the locks as they should stand: each GPU's whose tier is awake, while generation nears or runs and until
+        // a release that is still to come; one call to the driver, then the wishes are read again
+        const bool held = s.want.load() || clock::now() < s.due;
+        size_t todo = n;
+        for (size_t i = 0; i < n && todo == n; ++i)
+            if ((held && !s.asleep[i]) != (s.locked[i] != 0)) todo = i;
+        if (todo < n) {
+            const bool lock = !s.locked[todo];
             lk.unlock();
-            const bool ok = set(true);
-            if (!ok) set(false);   // none stays locked alone
+            const bool ok = set_one(gpus_[todo], lock);
             lk.lock();
-            s.locked = ok;
-        } else if (!s.want.load() && s.locked) {
-            if (s.cv.wait_until(lk, s.due, [&] { return s.quit || s.want.load(); })) continue;
-            lk.unlock();
-            set(false);
-            lk.lock();
-            s.locked = false;
-        } else {
-            s.cv.wait(lk, [&] { return s.quit || s.want.load() != s.locked; });
+            if (lock && !ok) break;   // refused (`off`): none stays locked alone
+            s.locked[todo] = lock ? 1 : 0;
+            s.since[todo] = clock::now();
+            continue;
         }
+        const uint64_t seen = s.wishes;
+        const auto changed = [&] { return s.quit || s.wishes != seen; };
+        bool any = false;
+        for (const char c : s.locked) any = any || c != 0;
+        if (!s.want.load() && any) s.cv.wait_until(lk, s.due, changed);   // a release is to come
+        else s.cv.wait(lk, changed);
     }
-    if (s.locked) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!s.locked[i]) continue;
         lk.unlock();
-        set(false);
+        set_one(gpus_[i], false);
+        lk.lock();
+        s.locked[i] = 0;
     }
+}
+
+void GpuClocks::start() {
+    if (st_ != nullptr) return;
+    st_ = new State;
+    st_->asleep.assign(gpus_.size(), 0);
+    st_->locked.assign(gpus_.size(), 0);
+    st_->since.assign(gpus_.size(), std::chrono::steady_clock::time_point{});
+    st_->thread = std::thread([this] { run(); });
+    g_clocks.store(this);
+    static const int at_exit = std::atexit([] { GpuClocks::release_now(); });   // std::exit from a failed launch
+    (void) at_exit;
 }
 
 void GpuClocks::hold() {
     if (gpus_.empty()) return;
-    if (st_ == nullptr) {
-        st_ = new State;
-        st_->thread = std::thread([this] { run(); });
-        g_clocks.store(this);
-        static const int at_exit = std::atexit([] { GpuClocks::release_now(); });   // std::exit from a failed launch
-        (void) at_exit;
-    }
+    start();
     if (st_->want.load(std::memory_order_relaxed) || st_->off.load(std::memory_order_relaxed)) return;
     {
         const std::lock_guard<std::mutex> lk(st_->mu);
         st_->want.store(true);
+        ++st_->wishes;
     }
     st_->cv.notify_one();
 }
@@ -431,8 +459,36 @@ void GpuClocks::release_after(double seconds) {
         st_->due = std::chrono::steady_clock::now() +
                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
         st_->want.store(false);
+        ++st_->wishes;
     }
     st_->cv.notify_one();
+}
+
+void GpuClocks::sleep(int device, bool asleep) {
+    for (size_t i = 0; i < gpus_.size(); ++i) {
+        if (gpus_[i].device != device) continue;
+        start();
+        {
+            const std::lock_guard<std::mutex> lk(st_->mu);
+            if ((st_->asleep[i] != 0) == asleep) return;
+            st_->asleep[i] = asleep ? 1 : 0;
+            ++st_->wishes;
+        }
+        st_->cv.notify_one();
+        return;
+    }
+}
+
+bool GpuClocks::at_speed(int device) const {
+    for (size_t i = 0; i < gpus_.size(); ++i) {
+        if (gpus_[i].device != device) continue;
+        if (st_ == nullptr) return false;   // its lock was never asked for
+        if (st_->off.load(std::memory_order_relaxed)) return true;
+        const std::lock_guard<std::mutex> lk(st_->mu);
+        return st_->locked[i] != 0 &&
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - st_->since[i]).count() >= kAtSpeedSeconds;
+    }
+    return true;
 }
 
 }  // namespace lamina::core

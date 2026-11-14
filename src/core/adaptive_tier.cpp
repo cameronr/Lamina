@@ -279,8 +279,16 @@ bool AdaptiveTier::adapt(std::vector<float>& usage, std::string& err, bool decay
     }
     if (!lowers_.empty()) {
         lower_has_.assign((size_t) (n_layers_ * n_expert_), 0);
-        for (const AdaptiveTier* lo : lowers_)
+        for (const AdaptiveTier* lo : lowers_) {
+            if (lo->asleep_) continue;   // (its experts are the CPU's while it sleeps)
             for (size_t i = 0; i < lower_has_.size(); ++i) lower_has_[i] |= (*lo->res_)[i] >= 0 ? 1 : 0;
+        }
+    }
+    if (asleep_) {   // no new move while its GPU sleeps (the unstaged ones went above); the counts decay as ever
+        if (decay)
+            for (float& v : usage) v *= decay_;
+        ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return true;
     }
     using Ranked = AdaptiveMoveOrder;   // out < 0: an empty slot
     std::vector<Ranked> moves;

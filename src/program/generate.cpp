@@ -198,6 +198,11 @@ struct Options {
     /// long before a batched prompt part's end, by its progress (--second-gpu-clocks-lead; < 0: from the part's last
     /// chunk on).
     double clocks_hold = 5.0, clocks_lead = -1.0;
+    /// Per tier after the first: the CPU pool's time a layer (us) without the tier, averaged over a few seconds of
+    /// generation, below which it sleeps, its experts the CPU's, its clocks' lock released and its moves stopped until
+    /// the pool needs longer (--second-gpu-sleep-us; 0: it never sleeps).  Such a tier is also left out while a lock of
+    /// its own is on its way (tier_power).
+    std::vector<double> second_gpu_sleep_us;
     /// Keep the GPU tiers resident and executing, but do not adapt their residency while the main tier adapts.
     /// The default remains coupled adaptation of every tier.
     bool no_second_gpu_adapt = false;
@@ -424,6 +429,13 @@ void usage() {
                  "  --second-gpu-clocks-lead S  --serve: they are asked for S seconds before a batched prompt part\n"
                  "                       ends, by its progress, instead of from its last chunk on (a lock is at\n"
                  "                       speed ~0.6 s after it is asked for)\n"
+                 "  --second-gpu-sleep-us T[,..]  per tier after the first: it sleeps (its experts to the CPU, its\n"
+                 "                       lock released, its moves stopped) while the CPU pool would need less than\n"
+                 "                       T us a layer without it, averaged over a few seconds of generation, and\n"
+                 "                       wakes when that average passes 1.15 T or text turns heavy (twice T);\n"
+                 "                       such a tier is also left out until a lock of its own is at speed (0 =\n"
+                 "                       never, the default; not with --adapt-every 0 or --deterministic-adapt).\n"
+                 "                       Trades speed for the card's awake power: measure T per model file\n"
                  "  --no-second-gpu-adapt  with --second-gpu: keep the tiers\' resident expert assignment static while\n"
                  "                       the main GPU\'s adaptive tier continues to replace experts\n"
                  "  --deterministic-adapt  fixed-epoch adaptive copies and stable equal-gain ordering; default async\n"
@@ -587,6 +599,7 @@ struct Drive {
     std::vector<double> ring_us;   // by window size and layer
     Clock::time_point rows_at{};   // this window's last CPU rows (none yet: the epoch)
     int win_t = 0;                 // this window's tokens
+    bool win_prompt = false;       // ... are a prompt's (the serve loop's feed)
     int64_t n_layers = 0;
     /// The GPU tiers' adaptive tiers, paced: their copies go between windows, where the RAM is idle (the head, the
     /// commit, the drafts); through the layers they slowed the CPU pool's RAM reads, and on the 5070 Ti's one copy engine
@@ -601,6 +614,28 @@ struct Drive {
     bool adapt_next = false;                     // an update is ranked at this window's tail
     bool flush_next = false;                     // the next window's tail ranks one: this gap takes the rest
     std::string tier_err;
+    /// --second-gpu-sleep-us: a tier after the first that sleeps while the CPU pool would not need it (tier_power,
+    /// before each window).  `avg` and `fast`: the pool's us a layer without the tier over ~kLong and ~kFast rounds,
+    /// measured while it sleeps and predicted while it works.
+    struct TierPower {
+        double sleep_us = 0;          // the threshold (0: the tier never sleeps)
+        int device = -1;
+        lamina::core::AdaptiveTier* adapt = nullptr;
+        bool asleep = false;
+        double avg = 0, fast = 0;
+        int64_t in_state = 0;         // rounds since the last change of state
+        int64_t rounds = 0, rounds_asleep = 0, sleeps = 0, groups0 = 0;
+        double us_awake = 0, us_asleep = 0;   // that time summed over the rounds awake (predicted) and asleep (measured)
+    } power[lamina::core::kMaxGpuTiers];
+    lamina::core::GpuClocks* clocks = nullptr;
+    bool power_on = false;            // a tier has a threshold
+    // the pool's marginal cost of an expert (ms a (layer, expert) pair): a regression over the rounds that forgets,
+    // and no less than an expert's bytes at the pool's rate (`expert_ms`: few experts a layer hide in its threads)
+    double reg_n = 0, reg_x = 0, reg_y = 0, reg_xx = 0, reg_xy = 0;
+    double expert_ms = 0.05;
+    double cpu_ms0 = 0;
+    int64_t misses0 = 0, calls0 = 0;
+    int64_t pos = 0;                  // the window's position (LAMINA_TIER_POWER_LOG)
     /// The adaptive tiers' update (ranking, the second tier's first copies) on a thread of its own, started at the
     /// window's tail and joined before the next window.
     std::function<bool()> adapt;
@@ -633,9 +668,92 @@ double tier1_rate(const Drive* t) {
     return r > 0 ? r : 5e6;
 }
 
+/// --second-gpu-sleep-us, before a window: the round before it into each such tier's averages, then its state.
+/// Without a tier at work the pool would need the round's own time plus kAbsorb of the tier's experts at the pool's
+/// marginal cost: the first tier's prefetch takes the others at once (0.34 of IQ3_S's reached the CPU on thinking
+/// text; 0.5-0.76 on code, past the prefetch's budget, where the time is far over any threshold either way).
+/// The card's way down and back up takes ~2 s (1.3 s to its idle watts, 0.6 s to its locked clocks), and an agent's
+/// text crosses a threshold many times a second: an average over 64 rounds of a recorded session stayed under 55
+/// us for 0.5 s at a time, one over 256-512 rounds for 7-8 s.  So one long average decides both ways: a tier
+/// sleeps when it is under the threshold after kDwell rounds awake, and wakes when it passes kWake of it, or at
+/// once when the quick average passes kGuard of it (code and edits: three to ten times a thinking text's load).
+/// Asleep or with its clocks' lock still on its way, the tier is left out of the windows (ExpertDispatch::GpuTier).
+/// LAMINA_TIER_POWER_LOG=<file>: a line a round with the policy's inputs (scratch/power's sleep_trace.py and
+/// load_stretches.py read it): the window's tokens, the round's ms, the pool's ms, its experts, the second tier's
+/// (the third GPU's), the policy's state and the dispatch's, both averages, the marginal cost, the first tier's
+/// experts, the position.
+void tier_power(Drive* t) {
+    if (!t->power_on) return;
+    constexpr double kAbsorb = 0.35, kWake = 1.15, kGuard = 2.0, kForget = 0.98;
+    constexpr double kLong = 384, kFast = 16;   // rounds: ~6 s and ~0.25 s of IQ3_S's
+    constexpr int64_t kDwell = 128;             // rounds awake before a sleep, ~2 s
+    // a window of generated text ran since the last call (a prompt's tokens come in windows as wide as the verifier
+    // takes, whatever the text's drafts would be: they move neither the averages nor a tier's state)
+    const bool round = t->calls > t->calls0 && !t->win_prompt;
+    const double pool_ms = t->cpu_ms - t->cpu_ms0, cpu_exp = (double) (t->d.multi_misses - t->misses0);
+    t->cpu_ms0 = t->cpu_ms;
+    t->misses0 = t->d.multi_misses;
+    t->calls0 = t->calls;
+    if (round) {
+        t->reg_n = kForget * t->reg_n + 1.0;
+        t->reg_x = kForget * t->reg_x + cpu_exp;
+        t->reg_y = kForget * t->reg_y + pool_ms;
+        t->reg_xx = kForget * t->reg_xx + cpu_exp * cpu_exp;
+        t->reg_xy = kForget * t->reg_xy + cpu_exp * pool_ms;
+    }
+    const double den = t->reg_n * t->reg_xx - t->reg_x * t->reg_x;
+    const double cost = std::clamp(t->reg_n > 30.0 && den > 1e-6 ? (t->reg_n * t->reg_xy - t->reg_x * t->reg_y) / den : 0.0,
+                                   t->expert_ms, 6.0 * t->expert_ms);
+    static std::FILE* const plog = [] {
+        const char* f = std::getenv("LAMINA_TIER_POWER_LOG");
+        return f != nullptr ? std::fopen(f, "w") : nullptr;
+    }();
+    static Clock::time_point plast{};
+    if (plog != nullptr) {
+        const Clock::time_point now = Clock::now();
+        if (round)
+            std::fprintf(plog, "%d %.3f %.3f %.0f %lld %d %d %.1f %.1f %.4f %lld %lld\n", t->win_t,
+                         plast == Clock::time_point{} ? 0.0 : std::chrono::duration<double, std::milli>(now - plast).count(),
+                         pool_ms, cpu_exp, (long long) (t->d.tiers[1].groups - t->power[1].groups0),
+                         t->power[1].asleep ? 1 : 0, t->d.tiers[1].asleep ? 1 : 0, t->power[1].avg, t->power[1].fast, cost,
+                         (long long) (t->d.tiers[0].groups - t->power[0].groups0), (long long) t->pos);
+        t->power[0].groups0 = t->d.tiers[0].groups;
+        plast = now;
+    }
+    for (int i = 1; i < t->d.n_tiers; ++i) {
+        Drive::TierPower& p = t->power[i];
+        if (p.sleep_us <= 0) continue;
+        const double groups = (double) (t->d.tiers[i].groups - p.groups0);
+        p.groups0 = t->d.tiers[i].groups;
+        if (round) {
+            ++p.rounds;
+            ++p.in_state;
+            p.rounds_asleep += p.asleep ? 1 : 0;
+            const double us = 1e3 * (pool_ms + kAbsorb * groups * cost) / (double) t->n_layers;
+            (p.asleep ? p.us_asleep : p.us_awake) += us;
+            // (a mean until an average has its length of rounds: one seeded by a first round would keep it that long)
+            p.avg += (us - p.avg) / std::min((double) p.rounds, kLong);
+            p.fast += (us - p.fast) / std::min((double) p.rounds, kFast);
+            if (!p.asleep && p.in_state >= kDwell && p.avg < p.sleep_us && p.fast < kWake * p.sleep_us) {
+                p.asleep = true;
+                p.in_state = 0;
+                ++p.sleeps;
+            } else if (p.asleep && p.in_state >= 4 && (p.avg > kWake * p.sleep_us || p.fast > kGuard * p.sleep_us)) {
+                p.asleep = false;
+                p.in_state = 0;
+            }
+        }
+        if (p.adapt != nullptr) p.adapt->set_asleep(p.asleep);
+        if (t->clocks != nullptr) t->clocks->sleep(p.device, p.asleep);
+        t->d.tiers[i].asleep = p.asleep || (t->clocks != nullptr && !t->clocks->at_speed(p.device));
+    }
+}
+
 /// Before a window of `T` tokens: the tiers' landed moves admitted, and the first tier's next moves staged for what
 /// this window's layers take (their residents leave before the window's residency snapshot).
-void drive_window(Drive* t, int T) {
+void drive_window(Drive* t, int T, bool prompt = false) {
+    tier_power(t);   // (the round before this window)
+    t->win_prompt = prompt;
     t->win_t = T;
     t->rows_at = Clock::time_point{};
     if (t->placement != nullptr && t->d.pool != nullptr) {
@@ -1350,7 +1468,8 @@ int lamina::program::run(int argc, char** argv) {
             }
             std::vector<double>* list = a == "--second-gpu-gib" ? &o.second_gpu_gib
                                       : a == "--second-gpu-reserve-mib" ? &o.second_gpu_reserve_mib
-                                      : a == "--second-gpu-prefetch-mb" ? &o.second_gpu_prefetch_mb : nullptr;
+                                      : a == "--second-gpu-prefetch-mb" ? &o.second_gpu_prefetch_mb
+                                      : a == "--second-gpu-sleep-us" ? &o.second_gpu_sleep_us : nullptr;
             if (list != nullptr) {
                 if (!number_list(next(a.c_str()), *list)) {
                     std::fprintf(stderr, "lamina: %s takes a number or a comma-separated list\n", a.c_str());
@@ -2705,6 +2824,21 @@ int lamina::program::run(int argc, char** argv) {
                 drive.d.tiers[t].gpu = &gp;
                 drive.d.tiers[t].res = ts.res.data();
                 drive.d.tiers[t].prefetch_bytes = pf_bytes;
+                // --second-gpu-sleep-us: a tier after the first may sleep, in a run whose experts move
+                drive.power[t].device = dev;
+                drive.power[t].adapt = &ts.adapt;
+                if (const double us = tier_value(o.second_gpu_sleep_us, ti); us > 0) {
+                    if (t == 0 || o.adapt_every <= 0 || o.deterministic_adapt) {
+                        std::fprintf(stderr, "lamina: --second-gpu-sleep-us: the %s GPU does not sleep (%s)\n", kTierName[t],
+                                     t == 0 ? "the first tier carries the prompts' share, the head's rows and the prefetch"
+                                            : "--adapt-every 0 and --deterministic-adapt keep the experts in place");
+                    } else {
+                        drive.power[t].sleep_us = us;
+                        drive.power_on = true;
+                        std::fprintf(stderr, "lamina: %s GPU %d sleeps while the CPU pool would need less than %.0f us a "
+                                             "layer without it\n", kTierName[t], dev, us);
+                    }
+                }
                 drive.d.n_tiers = ++n_tiers;
                 std::fprintf(stderr, "lamina: %s GPU %d (%s): %zu experts from the profile and %zu empty "
                                      "slots, %.2f GiB\n", kTierName[t], dev, prop.name, pre.size(), empty.size(),
@@ -2725,6 +2859,9 @@ int lamina::program::run(int argc, char** argv) {
             }
         }
         drive.d.tier_min_bytes = (uint64_t) (o.second_gpu_min_mb * 1048576.0);
+        drive.clocks = &clocks;
+        // an expert's time in the CPU pool, by its bytes at ~50 GB/s (IQ3_S's 2 MB: 0.04 ms; measured 0.04-0.06)
+        drive.expert_ms = (double) lay.total / (double) (g.n_layers * g.n_expert) / 50e9 * 1e3;
         // the tiers that work, in order: the first takes the prompt path's share and the split
         o.tier_gpus.clear();
         for (int t = 0; t < n_tiers; ++t) o.tier_gpus.push_back(tiers[(size_t) t].gpu.device());
@@ -3702,6 +3839,7 @@ int lamina::program::run(int argc, char** argv) {
             int64_t main_swaps, main_fills, main_dropped, cpu_layers;
             struct Gpu {
                 int64_t entries, experts, layers, swaps, fills, dropped, prefetched, prefetch_used;
+                int64_t rounds, rounds_asleep, sleeps;   // --second-gpu-sleep-us
             } gpu[lamina::core::kMaxGpuTiers];
         };
         const auto tier_counters = [&]() {
@@ -3710,7 +3848,8 @@ int lamina::program::run(int argc, char** argv) {
                 const lamina::core::SecondGpu& gp = tiers[(size_t) t].gpu;
                 const lamina::core::AdaptiveTier& ad = tiers[(size_t) t].adapt;
                 c.gpu[t] = {gp.entries_done, gp.experts, gp.layers, ad.swaps, ad.fills, ad.dropped,
-                            gp.prefetch_copied, gp.prefetch_used};
+                            gp.prefetch_copied, gp.prefetch_used, drive.power[t].rounds, drive.power[t].rounds_asleep,
+                            drive.power[t].sleeps};
             }
             return c;
         };
@@ -4023,7 +4162,9 @@ int lamina::program::run(int argc, char** argv) {
                 const bool tier_in_prompt = pbuf.helping || (split_on && pbuf.mid);
                 hold_from = tier_in_prompt || halves ? reuse : batched_end - chunk;
                 lead_on.store(false);
-                if (!tier_in_prompt && o.clocks_lead >= 0) {
+                if (tier_in_prompt) {
+                    clocks.sleep(o.tier_gpus[1], false);   // (a tier that sleeps wakes for a prompt it computes in)
+                } else if (o.clocks_lead >= 0) {
                     hold_from = INT64_MAX;
                     lead_split = split_on;
                     lead_from = reuse;
@@ -4140,7 +4281,7 @@ int lamina::program::run(int argc, char** argv) {
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     drive.adapt_next = drive.flush_next = false;
-                    drive_window(&drive, T);
+                    drive_window(&drive, T, true);
                     if (!ver.run(T, window.data(), j, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) err = drive.d.fail;
                         return false;
@@ -4266,6 +4407,7 @@ int lamina::program::run(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                drive.pos = p;
                 drive_window(&drive, T);
                 tr("window", p, T);
                 drive.adapt_next = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0;
@@ -4393,6 +4535,11 @@ int lamina::program::run(int argc, char** argv) {
                 field("empty_slots", tiers[(size_t) t].adapt.free_slots());
                 field("prefetched", b.prefetched - a.prefetched);
                 field("prefetch_used", b.prefetch_used - a.prefetch_used);
+                if (drive.power[t].sleep_us > 0) {   // --second-gpu-sleep-us: the rounds it slept through
+                    field("rounds", b.rounds - a.rounds);
+                    field("asleep_rounds", b.rounds_asleep - a.rounds_asleep);
+                    field("sleeps", b.sleeps - a.sleeps);
+                }
             }
             serve_print("TIERS main_swaps=%lld main_fills=%lld main_dropped=%lld%s deterministic_adapt=%d\n",
                         (long long) (t1.main_swaps - t0.main_swaps), (long long) (t1.main_fills - t0.main_fills),
@@ -4710,6 +4857,7 @@ int lamina::program::run(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
+            drive.pos = p;
             drive_window(&drive, T);
             drive.adapt_next = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0;
             drive.flush_next = !drive.d.usage.empty() && ((rounds + 2) % o.adapt_every) == 0;
@@ -4872,6 +5020,15 @@ int lamina::program::run(int argc, char** argv) {
                         ad.copy_rate() / 1e6, (double) gp.prefetch_copied / (double) rounds,
                         (double) gp.prefetch_used / (double) rounds, ver.ms_predict / (double) rounds,
                         (long long) ver.predict_late);
+            if (const Drive::TierPower& pw = drive.power[t]; pw.sleep_us > 0)
+                serve_print("%-24s asleep in %lld of %lld rounds, %lld sleeps (below %.0f us a layer of the pool without "
+                            "it: %.0f predicted over the rounds awake, %.0f measured over the rounds asleep; %.1f of "
+                            "its experts a round left to others)\n",
+                            (std::string(kTierName[t]) + " GPU").c_str(), (long long) pw.rounds_asleep,
+                            (long long) pw.rounds, (long long) pw.sleeps, pw.sleep_us,
+                            pw.us_awake / (double) std::max<int64_t>(1, pw.rounds - pw.rounds_asleep),
+                            pw.us_asleep / (double) std::max<int64_t>(1, pw.rounds_asleep),
+                            (double) drive.d.tiers[t].slept / (double) rounds);
         }
         if (rounds > 0 && !drive.d.routed.empty()) {
             // the share of the routed entries the N most-routed experts of this run take

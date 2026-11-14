@@ -65,6 +65,10 @@ public:
     void set_wait(bool on) { wait_ = on; }
     /// The share of the routing counts kept after each update (--adapt-decay, upstream's c38dc71; 0.7 by default).
     void set_decay(float f) { decay_ = f; }
+    /// Its GPU sleeps (--second-gpu-sleep-us): an update queues no move while it does, and the tiers before it count
+    /// its experts in full, the CPU's as they are for that time.  Between updates.
+    void set_asleep(bool on) { asleep_ = on; }
+    bool asleep() const { return asleep_; }
 
     /// Ranks and queues this call's moves, then decays `usage` (n_layers x n_expert) unless `decay` is false (a tier
     /// ranked before another on the same counts).  The queued moves whose residents are still in place give way to
@@ -113,6 +117,7 @@ private:
     cudaEvent_t after_ = nullptr;
     std::vector<const AdaptiveTier*> uppers_, lowers_;
     bool wait_ = false;
+    bool asleep_ = false;
     bool deterministic_ = false;
     int64_t frozen_ = 0;
     std::vector<uint8_t> blocked_;                        // per (layer, expert): not a candidate, rebuilt each call

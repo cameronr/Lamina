@@ -54,7 +54,7 @@ std::vector<GpuProbe> probe_gpus(const std::vector<int>& devices, int main_devic
 /// that card's clocks between them, and its rows come late; locked all the time it draws its awake power while the
 /// engine idles or reads a prompt.  The locks are NVML's (nvidia-smi's -lgc and -lmc: they need administrator rights
 /// and stay until released or a reboot), set and released on a thread of this object's: a lock is at speed about
-/// half a second after it is asked for.
+/// half a second after it is asked for.  Each GPU has its own: one whose tier sleeps (sleep) is left out.
 class GpuClocks {
 public:
     GpuClocks() = default;
@@ -72,6 +72,14 @@ public:
     void hold();
     /// Generation is over: the locks are released `seconds` from now unless hold() comes first.
     void release_after(double seconds);
+    /// `device`'s tier sleeps or wakes (--second-gpu-sleep-us): asleep, its lock is released at once and hold()
+    /// leaves it out.  Returns at once; a device without a lock of its own: nothing.
+    void sleep(int device, bool asleep);
+    /// Whether `device` runs at its locked clocks: its lock was set kAtSpeedSeconds ago or longer.  True as well for
+    /// a device without a lock of its own and when the locks were refused (the driver's clocks, as without them).
+    bool at_speed(int device) const;
+    /// A lock is at speed 0.55 s after NVML returns (an RTX 3090, 100 ms samples).
+    static constexpr double kAtSpeedSeconds = 0.6;
     /// The locks of the object that held some, released on the calling thread: for an exit that runs no destructor
     /// (std::exit runs it by itself; std::_Exit does not).
     static void release_now();
@@ -84,7 +92,9 @@ private:
     };
     struct State;
     void run();
+    void start();
     bool set(bool lock);
+    bool set_one(const Gpu& g, bool lock);
     std::vector<Gpu> gpus_;
     State* st_ = nullptr;
 };
