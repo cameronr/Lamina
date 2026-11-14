@@ -90,6 +90,8 @@ int64_t even_chunk(int64_t len, int64_t cap) {
     const int64_t k = (len + cap - 1) / cap;
     return std::min(cap, ((len + k - 1) / k + 255) / 256 * 256);
 }
+/// --prompt-split-from: the chunk that reads a part of `len` tokens in two of one size (a multiple of 256).
+int64_t half_chunk(int64_t len) { return even_chunk(len, ((len + 1) / 2 + 255) / 256 * 256); }
 // A prompt's chunk: of one size where a second GPU takes the experts the first lacks (a short last chunk streams
 // nearly every expert of every layer, and under --prompt-split runs its second stage alone after the first's); whole
 // chunks on one GPU, whose copy-ahead area grows with a chunk's tokens (UD-Q4_K_XL's 64K prompt on the 3090 alone
@@ -214,6 +216,9 @@ struct Options {
     /// later layer; 0: none) three stages: the tier after the first runs the layers from prompt_split up to it, the
     /// second GPU those from it on (without such a tier: two stages, split halfway between the two layers).
     double prompt_split = 0.0, prompt_split2 = 0.0;
+    /// With the split: a batched part of this many tokens or more that fits one chunk is read in two chunks of one
+    /// size, through the stages (0: a part of one chunk runs on the main GPU's stage alone).
+    double prompt_split_from = 0.0;
     /// The elastic K/V (--kv-grow, LAMINA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
     bool no_kv_grow = false;   ///< --no-kv-grow: off whatever LAMINA_KV_GROW says
@@ -432,6 +437,9 @@ void usage() {
                  "                       tiers: three stages, the tier after the first running the layers L..M-1 (the\n"
                  "                       experts its cache lacks on the second GPU), the second GPU the layers M..;\n"
                  "                       with one tier, two stages split halfway between L and M\n"
+                 "  --prompt-split-from N  with --prompt-split: a prompt part of N tokens or more that fits one chunk\n"
+                 "                       (--prefill) is read in two chunks of one size through the stages too (the\n"
+                 "                       stages' own costs set N: by default, 0, such a part is read in one chunk)\n"
                  "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
                  "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
                  "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
@@ -1254,7 +1262,7 @@ int lamina::program::run(int argc, char** argv) {
                 o.prompt_split2 = comma == std::string::npos ? 0.0 : std::atof(v.c_str() + comma + 1);
                 continue;
             }
-            double* knob = a == "--prompt-shift" ? &o.prompt_shift
+            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-split-from" ? &o.prompt_split_from
                          : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
                          : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
@@ -3880,19 +3888,30 @@ int lamina::program::run(int argc, char** argv) {
                 tr("prompt tiers landed");
                 // --prompt-split: a prompt of more than one chunk, when the stages' caches can lend the split's bytes.
                 // The checkpoints every --prompt-cache-every cells fall at the chunks' ends.
-                const int64_t chunk = prompt_chunk(batched_end - reuse, o.prefill_chunk, pbuf.offload != nullptr);
-                const int64_t step = std::max<int64_t>(1, o.prompt_cache_every / o.prefill_chunk) * chunk;
-                pp_chunk = chunk;
-                const bool split_try = pbuf.split != nullptr && batched_end - reuse > o.prefill_chunk;
+                // --prompt-split-from: a part of one chunk in two, where it is long enough for the stages to pay.
+                const int64_t part = batched_end - reuse;
+                const bool halves = pbuf.split != nullptr && o.prompt_split_from > 0 && part <= o.prefill_chunk &&
+                                    part >= (int64_t) o.prompt_split_from;
+                int64_t chunk = halves ? half_chunk(part) : prompt_chunk(part, o.prefill_chunk, pbuf.offload != nullptr);
+                const bool split_try = pbuf.split != nullptr && (part > o.prefill_chunk || halves);
                 std::vector<uint64_t> split_need;
                 for (int st = 0; split_try && st < psplit.stages(); ++st)
                     split_need.push_back(psplit.bytes_for(st, chunk, batched_end));
                 if (!pbuf.take(chunk, err, split_need)) { report(err); return 1; }
-                tr("prompt slots lent", chunk);
                 const bool split_on = !pbuf.split_regions.empty();
                 if (split_try && !split_on) tr("prompt split: the stages' caches cannot lend its bytes");
-                // (a later tier that runs a stage of the prompt works from its first chunk on)
-                hold_from = split_on && pbuf.mid ? reuse : batched_end - chunk;
+                if (halves && !split_on) {   // one chunk then, as without the switch (the loans grow to its size)
+                    chunk = part;
+                    if (!pbuf.take(chunk, err)) { report(err); return 1; }
+                }
+                // (a part in two halves keeps its one checkpoint, at its end)
+                const int64_t step = halves && split_on
+                                         ? part : std::max<int64_t>(1, o.prompt_cache_every / o.prefill_chunk) * chunk;
+                pp_chunk = chunk;
+                tr("prompt slots lent", chunk);
+                // (a later tier that runs a stage of the prompt works from its first chunk on; a part in two halves is
+                // held from its start, as in one chunk)
+                hold_from = (split_on && pbuf.mid) || halves ? reuse : batched_end - chunk;
                 // a return on an error below lets the second stage end first: its worker writes checkpoints into
                 // pcache's buffers, which go before psplit (finish after a finish does nothing)
                 struct SplitEnd {
@@ -4290,12 +4309,20 @@ int lamina::program::run(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         const int64_t n_batched = n_prompt - 1;
         const bool path_ok = setup_prompt_path(prefill, offload, pbuf, psplit, err);
-        const int64_t chunk = path_ok ? prompt_chunk(n_batched, o.prefill_chunk, pbuf.offload != nullptr) : 0;
-        const bool split_try = path_ok && pbuf.split != nullptr && n_batched > o.prefill_chunk;
+        const bool halves = path_ok && pbuf.split != nullptr && o.prompt_split_from > 0 && n_batched <= o.prefill_chunk &&
+                            n_batched >= (int64_t) o.prompt_split_from;
+        int64_t chunk = !path_ok ? 0 : halves ? half_chunk(n_batched)
+                                              : prompt_chunk(n_batched, o.prefill_chunk, pbuf.offload != nullptr);
+        const bool split_try = path_ok && pbuf.split != nullptr && (n_batched > o.prefill_chunk || halves);
         std::vector<uint64_t> split_need;
         for (int st = 0; split_try && st < psplit.stages(); ++st)
             split_need.push_back(psplit.bytes_for(st, chunk, n_batched));
-        if (!path_ok || !pbuf.take(chunk, err, split_need)) {
+        bool taken = path_ok && pbuf.take(chunk, err, split_need);
+        if (taken && halves && pbuf.split_regions.empty()) {   // the stages' caches cannot lend: one chunk
+            chunk = n_batched;
+            taken = pbuf.take(chunk, err);
+        }
+        if (!taken) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }
