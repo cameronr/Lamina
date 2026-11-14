@@ -218,7 +218,8 @@ config renders Codex's compaction requests with the conversation's tools, so the
 ## Pictures
 
 With pictures set up (setup's default), OpenAI `image_url` parts and Anthropic `image` blocks (base64 data, http(s)
-URLs or local file paths) go through the image encoder, `lamina-vision`, and reach the model as up to 1,024 tokens each
+URLs or local file paths) go through the image encoder, the `lamina-vision` in the server's own folder (no config key
+names another), and reach the model as up to 1,024 tokens each
 (the `vision` section's `max_tokens`; a 640x480 photo is ~300). JPEG, PNG, BMP and GIF are read as they are; WebP,
 TIFF, AVIF and others are converted to PNG first. The encoder runs on the CPU (the `vision` section's `threads`), so
 the GPUs keep their VRAM for experts: on the development PC's 8-core Ryzen 7 9700X a picture of ~1,000 tokens takes

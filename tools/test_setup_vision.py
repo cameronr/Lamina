@@ -1,5 +1,5 @@
-"""Tests for setup.py's --vision gpu[:GPU]: the GPU it picks, the config's `vision` section and the encoder's build,
-without building or running anything.
+"""Tests for setup.py's --vision gpu[:GPU]: the GPU it picks, the config's `vision` section, the encoder's build and its
+place beside the server, without building or running anything.
 
     python -m unittest tools.test_setup_vision
 """
@@ -59,19 +59,16 @@ class PickVisionGpu(unittest.TestCase):
 
 
 class VisionSection(unittest.TestCase):
-    EXAMPLE = {"exe": "./build-vision/bin/lamina-vision", "mmproj": "m.gguf", "model": "x.gguf", "gpu": False,
-               "threads": 16, "max_tokens": 1024}
+    EXAMPLE = {"mmproj": "m.gguf", "model": "x.gguf", "gpu": False, "threads": 16, "max_tokens": 1024}
 
     def test_the_cpu_encoder(self):
         v = setup.vision_section(self.EXAMPLE, None)
-        self.assertEqual(v["exe"], "./build-vision/bin/lamina-vision")
         self.assertEqual(v["threads"], os.cpu_count() or 8)
         self.assertFalse(v["gpu"])
         self.assertNotIn("cuda_device", v)
 
     def test_the_cuda_encoder_on_a_card(self):
         v = setup.vision_section(self.EXAMPLE, SMALL)
-        self.assertEqual(v["exe"], "./build-vision-cuda/bin/lamina-vision")
         self.assertIs(v["gpu"], True)
         self.assertEqual(v["cuda_device"], "GPU-cccc")
         self.assertNotIn("threads", v)
@@ -82,35 +79,32 @@ class VisionSection(unittest.TestCase):
         setup.vision_section(self.EXAMPLE, SMALL)
         self.assertEqual(self.EXAMPLE, before)
 
-    def test_a_releases_encoder_in_bin(self):
-        v = setup.vision_section(self.EXAMPLE, None, True)
-        self.assertEqual(v["exe"], "./bin/lamina-vision")
-        self.assertFalse(v["gpu"])
+    def test_no_key_names_the_encoder(self):   # the server takes the lamina-vision in its own folder
+        for gpu in (None, SMALL):
+            self.assertNotIn("exe", setup.vision_section(self.EXAMPLE, gpu))
 
 
 class WriteConfig(unittest.TestCase):
-    def written(self, vision_gpu, release=False):
+    def written(self, vision_gpu):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "ROOT", Path(d)):
             (Path(d) / "examples").mkdir()
             shutil.copy(ROOT / "examples" / "ud-q4_k_xl.json", Path(d) / "examples")
             path = setup.write_config("ud-q4_k_xl", Path(d) / "data", "NVIDIA GeForce RTX 3090", 8082, True, None, None,
-                                      vision_gpu, release)
+                                      vision_gpu)
             return json.loads(path.read_text(encoding="utf-8"))
 
     def test_the_examples_section_on_a_gpu(self):
         v = self.written(SMALL)["vision"]
-        self.assertTrue(v["exe"].startswith("./build-vision-cuda/bin/lamina-vision"))
         self.assertEqual((v["gpu"], v["cuda_device"]), (True, "GPU-cccc"))
         self.assertNotIn("threads", v)
 
     def test_without_a_gpu_as_before(self):
         v = self.written(None)["vision"]
-        self.assertTrue(v["exe"].startswith("./build-vision/bin/lamina-vision"))
         self.assertEqual((v["gpu"], v["threads"]), (False, os.cpu_count() or 8))
 
-    def test_a_releases_programs_in_bin(self):
-        v = self.written(None, True)["vision"]
-        self.assertEqual(v["exe"], "./bin/lamina-vision" + (".exe" if setup.WIN else ""))
+    def test_the_examples_name_no_encoder(self):
+        for vision_gpu in (None, SMALL):
+            self.assertNotIn("exe", self.written(vision_gpu)["vision"])
 
 
 class WriteLauncher(unittest.TestCase):
@@ -133,21 +127,47 @@ class BuildVision(unittest.TestCase):
     TC = setup.Toolchain(None, None, "/opt/cuda/bin/nvcc", (13, 4), None, None)
 
     def test_the_cpu_build_as_before(self):
-        with mock.patch.object(setup, "cmake_build") as cb:
+        with mock.patch.object(setup, "cmake_build") as cb, mock.patch.object(setup, "place_vision", return_value=True) as pv:
             quiet(setup.build_vision, self.TC, {})
         _, src, b, target, defs, _ = cb.call_args.args
         self.assertEqual((src, b, target), (setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision", "lamina-vision"))
         self.assertIn("-DLAMINA_VISION_CUDA=OFF", defs)
+        pv.assert_called_once_with(False)   # the CPU build, beside the server
 
     def test_the_cuda_build(self):
         with mock.patch.object(setup, "cmake_build") as cb, \
                 mock.patch.object(setup, "cuda_defs", return_value=["-DCMAKE_CUDA_COMPILER=nvcc"]), \
-                mock.patch.object(setup, "WIN", False):
+                mock.patch.object(setup, "place_vision", return_value=True) as pv:
             quiet(setup.build_vision, self.TC, {}, "86;120")
         _, src, b, target, defs, _ = cb.call_args.args
         self.assertEqual((b, target), (setup.ROOT / "build-vision-cuda", "lamina-vision"))
         for d in ("-DLAMINA_VISION_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=86;120", "-DCMAKE_CUDA_COMPILER=nvcc"):
             self.assertIn(d, defs)
+        pv.assert_called_once_with(True)   # the CUDA build, beside the server
+
+
+class PlaceVision(unittest.TestCase):
+    def placed(self, cuda, built):
+        """Whether place_vision(cuda) placed an encoder, and which build's is in build/, with one built in each of
+        `built`'s folders."""
+        name = "lamina-vision" + setup.EXE
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "ROOT", Path(d)):
+            (Path(d) / "build").mkdir()
+            for folder in built:
+                (Path(d) / folder / "bin").mkdir(parents=True)
+                (Path(d) / folder / "bin" / name).write_text(folder)
+            done = setup.place_vision(cuda)
+            copy = Path(d) / "build" / name
+            return done, copy.read_text() if copy.exists() else None
+
+    def test_the_cpu_build_beside_the_server(self):
+        self.assertEqual(self.placed(False, ["build-vision", "build-vision-cuda"]), (True, "build-vision"))
+
+    def test_the_cuda_build_beside_the_server(self):
+        self.assertEqual(self.placed(True, ["build-vision", "build-vision-cuda"]), (True, "build-vision-cuda"))
+
+    def test_a_build_that_is_not_there(self):
+        self.assertEqual(self.placed(True, ["build-vision"]), (False, None))
 
 
 if __name__ == "__main__":

@@ -366,13 +366,27 @@ bool network_path(const std::string& path) {
     return starts_with(p, "\\\\") || starts_with(p, "\\??\\");
 }
 
+std::string vision_exe() {
+#ifdef _WIN32
+    const fs::path exe = u8_path(self_dir()) / "lamina-vision.exe";
+#else
+    const fs::path exe = u8_path(self_dir()) / "lamina-vision";
+#endif
+    std::error_code ec;
+    if (!fs::is_regular_file(exe, ec))
+        throw std::runtime_error("the config has a \"vision\" section, and the image encoder is not there: " + u8_str(exe) +
+                                 " (lamina-vision belongs in lamina-server's folder; without pictures, take the section and "
+                                 "--vision out of the config)");
+    return u8_str(exe);
+}
+
 std::vector<std::string> vision_reader_args(const json& cfg) {
     // the encoder runs in its own directory (#480): a path with a directory part is made absolute
     auto absolute = [](const std::string& p) {
         const fs::path x = u8_path(p);
         return x.has_parent_path() ? u8_str(fs::absolute(x)) : p;
     };
-    std::vector<std::string> args = {absolute(jstr(cfg, "exe")), "--mmproj", absolute(jstr(cfg, "mmproj")), "--model",
+    std::vector<std::string> args = {vision_exe(), "--mmproj", absolute(jstr(cfg, "mmproj")), "--model",
                                       absolute(jstr(cfg, "model"))};
     auto num = [](const json& v) { return v.is_number_integer() ? std::to_string(v.get<int64_t>()) : py_dumps(v); };
     if (truthy(jget(cfg, "gpu"))) args.push_back("--gpu");

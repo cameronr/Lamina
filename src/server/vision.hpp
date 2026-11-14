@@ -27,8 +27,9 @@ inline constexpr uint64_t kImagePixelsMax = 178956970;
 
 class Vision {
 public:
-    /// the config's "vision" section (exe, mmproj, model, gpu, threads, max_tokens, min_tokens), the log its stderr
-    /// is appended to ("": none), its environment; started now unless `lazy`
+    /// the config's "vision" section (mmproj, model, gpu, threads, max_tokens, min_tokens), the log its stderr
+    /// is appended to ("": none), its environment; started now unless `lazy`. The encoder is the lamina-vision
+    /// beside this program (std::runtime_error when none is there).
     Vision(const json& cfg, std::string log = "", std::optional<Environment> env = std::nullopt, bool lazy = false);
     /// for good (#914): the encoder ends and its directory (one .sve file per picture) goes with it
     ~Vision();
@@ -69,7 +70,11 @@ private:
     std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> cache_;   ///< key -> (file, tokens), oldest first
 };
 
-/// the config's vision section as its args: the encoder runs in its own directory, so its paths are made absolute
+/// the image encoder: lamina-vision in this program's folder, where a release and every build put it (no config
+/// names another); std::runtime_error when it is not there
+std::string vision_exe();
+/// the encoder's command line from the config's vision section: it runs in its own directory, so the section's paths
+/// are made absolute
 std::vector<std::string> vision_reader_args(const json& cfg);
 /// a path to another computer (\\host\share, //host/share, \\?\UNC\..., \??\UNC\...): Windows would sign in to it
 bool network_path(const std::string& path);

@@ -43,10 +43,12 @@ result is already there is skipped, so setup runs again after an interruption or
 1. For a build, CMake and Ninja into `.venv` and llama.cpp at the commit the engine is built against, into
    `third_party/llama.cpp`: ggml for the engine, mtmd for the image encoder. With `--no-build` nothing.
 2. The server with the engine, `build/lamina-server` (`.exe`, with the CUDA runtime DLLs beside it; `build/lamina` is
-   the engine alone), for this PC's GPUs, and the image encoder, `build-vision/bin/lamina-vision`: llama.cpp's mtmd
+   the engine alone), for this PC's GPUs, and the image encoder, `build/lamina-vision`: llama.cpp's mtmd
    library with the model's projector, run on the CPU beside the engine so the GPUs keep their VRAM for experts. The encoder is built for any AVX2 CPU: a native build on an AVX-512
-   CPU loses flash attention and encodes about half as fast. With `--vision gpu` it is built with CUDA instead,
-   `build-vision-cuda/bin/lamina-vision`, and runs on the GPU the option picks.
+   CPU loses flash attention and encodes about half as fast. With `--vision gpu` it is built with CUDA instead
+   and runs on the GPU the option picks. It is built in `build-vision` (`build-vision-cuda` with CUDA) and copied
+   beside the server: the server starts the `lamina-vision` in its own folder, and no config key names another. The
+   CUDA build also runs on the CPU, so the last setup run's choice serves every config.
 3. The model's files from Hugging Face at pinned revisions, into the data folder, resumed when interrupted and checked
    once by size and SHA-256 (`<file>.sha256` beside each records the check):
    [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
@@ -122,7 +124,7 @@ the same way (`toolkit`, `build`, `test`, `package`).
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder: its binary, the projector, the model, `threads` (the CPU's logical cores), or with `--vision gpu` `gpu` and `cuda_device` (the card it runs on) |
+| `vision` | the image encoder's files and settings: the projector, the model, `threads` (the CPU's logical cores), or with `--vision gpu` `gpu` and `cuda_device` (the card it runs on). The encoder itself is the `lamina-vision` in the server's folder |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):

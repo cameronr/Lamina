@@ -34,8 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /opt/lamina
 COPY . .
 RUN python3 -m venv .venv
-COPY --from=build /opt/lamina/build/lamina /opt/lamina/build/lamina-server build/
-COPY --from=build /opt/lamina/build-vision/bin/lamina-vision build-vision/bin/
+# (the image encoder beside the server, which takes it from its own folder)
+COPY --from=build /opt/lamina/build/lamina /opt/lamina/build/lamina-server /opt/lamina/build/lamina-vision build/
 VOLUME ["/data"]
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/lamina/docker/entrypoint.sh"]

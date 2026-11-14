@@ -27,7 +27,6 @@
   "log": "./lamina-qwen36-ud-q4_k_xl.log",
   "lib_dirs": [],
   "vision": {
-    "exe": "./build-vision/bin/lamina-vision.exe",
     "mmproj": "../Lamina-data/models/qwen36-UD-Q4_K_XL/mmproj-F16.gguf",
     "model": "../Lamina-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
     "gpu": false,

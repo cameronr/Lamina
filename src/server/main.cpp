@@ -439,7 +439,7 @@ int run(int argc, char** argv) {
             if (truthy(jget(cfg, "vision"))) {
                 say(lazy ? "vision encoder unloaded; it starts with the model ..." : "loading the vision encoder ...");
                 json vcfg = cfg["vision"];   // relative paths are the config's cwd's, as for the engine
-                for (const char* k : {"exe", "mmproj", "model"})
+                for (const char* k : {"mmproj", "model"})
                     if (jget(vcfg, k).is_string() && !u8_path(vcfg[k].get<std::string>()).is_absolute())
                         vcfg[k] = u8_str(cfg_dir / u8_path(vcfg[k].get<std::string>()));
                 Environment venv = groups.empty() ? vision_env(cfg) : child_env(cfg, a.offline);

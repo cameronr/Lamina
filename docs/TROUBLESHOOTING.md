@@ -44,6 +44,11 @@ runs, and Linux may end the engine. Close other programs, or use a smaller quant
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.
 
+**"the config has a "vision" section, and the image encoder is not there: ...".** The server starts the
+`lamina-vision` (`.exe`) in its own folder and no other: a release has it there, and setup copies the one it builds
+there. Put it back (a release's programs archive extracted whole, or setup run again), or take the `vision` section
+and `"--vision"` out of the config to run without pictures.
+
 **"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's config names no draft layer (`"--mtp", "<folder>"` in its
 `args`), or a folder without the layer's files. The server runs, and the model writes new text at roughly half to two
 thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`, `./download-draft-layer.sh FOLDER`

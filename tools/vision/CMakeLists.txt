@@ -1,9 +1,11 @@
-# tools/vision - lamina-vision, the image encoder for Lamina's multimodal path (optional; setup.py builds it when
-# the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
+# tools/vision - lamina-vision, the image encoder for Lamina's multimodal path (setup.py builds it).  Uses llama.cpp's
+# mtmd library at the same pinned commit as the engine's ggml.
 #
 #   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
 #         [-DLAMINA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DLAMINA_PORTABLE=OFF]
 #   cmake --build build-vision --target lamina-vision
+#
+# lamina-server starts the lamina-vision in its own folder and no other: copy build-vision/bin's there (setup.py does).
 #
 # Portable (AVX2 baseline; arm64: Armv8.2 + dotprod + fp16) is the default, so an encoder built without extra flags
 # runs on any AVX2 PC: the 0.1.32 release's encoder was built native on an AVX-512 machine and stopped with an illegal
