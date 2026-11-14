@@ -162,6 +162,8 @@ void LaminaEngine::start() {
             }
         } else if (starts_with(line, "CACHE ")) {   // the prompt cache at rest
             cache_line(line);
+        } else if (starts_with(line, "WARN ")) {    // the engine's warning, as its start goes (RAM that is tight)
+            say("[lamina] WARNING: " + line.substr(5));
         } else if (starts_with(line, "READY")) {
             const std::vector<std::string> f = split_ws(line);
             max_context_ = f.size() > 1 ? std::atoll(f[1].c_str()) : 0;

@@ -32,8 +32,14 @@ data folder is an older or damaged copy. Move it away and run setup again to dow
 RAM and locks them there for the GPUs (the server's window says when). Wait; the next starts are faster while the
 model file stays in the OS file cache.
 
-**The start fails, or the PC pages heavily, with too little free RAM.** The experts stay locked in RAM while the model
-runs (the README's table). Close other programs, or use IQ3_S, which takes ~28 GB less than UD-Q4_K_XL.
+**"not enough RAM: the model's experts take ...".** The experts stay locked in RAM while the model runs (the README's
+table), and this PC's RAM cannot hold them beside the ~4 GiB the system needs. Use a smaller quant: IQ3_S takes ~28 GB
+less than UD-Q4_K_XL. With GPUs of ample VRAM, `--vram-pin-gib` keeps some experts there instead of in RAM. Qwen3.6's
+experts take RAM only when they do not all fit in VRAM: more GPUs (`--second-gpu`) or a shorter context avoid it.
+
+**"RAM is tight: ...", or the PC pages heavily.** The model fits, but less than 6 GiB of RAM would stay available
+beside it: other programs hold the rest, or the model leaves little. Windows pages them out to disk while the model
+runs, and Linux may end the engine. Close other programs, or use a smaller quant.
 
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.

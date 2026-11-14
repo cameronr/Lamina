@@ -30,6 +30,7 @@
 #include "lamina/prefill/gemm.hpp"
 #include "lamina/prefill/moe_mmq.hpp"
 #include "lamina/qwen35/engine.hpp"
+#include "lamina/platform/memory.hpp"
 #include "lamina/program/serve_io.hpp"
 #include "q36_attn.cuh"
 #include "q36_kernels.cuh"
@@ -3384,8 +3385,10 @@ struct Engine {
 // ------------------------------------------------------------------------------------------------ expert placement
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
 /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
-/// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
-bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, std::string& err) {
+/// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.  `serve`: --serve
+/// (a warning that RAM is tight goes to the server's window too).
+bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, bool serve,
+                   std::string& err) {
     if (!m.moe) return true;   // a dense FFN: no experts to place
     const auto t0 = Clock::now();
     const auto& g = m.g;
@@ -3444,6 +3447,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 #if !defined(LAMINA_Q36_CPU_POOL)
     (void) threads;
     (void) hybrid_t;
+    (void) serve;
     err = "the routed experts (" + std::to_string(total >> 20) + " MiB) do not fit in VRAM, and this build has no CPU "
           "expert pool (LAMINA_NATIVE_EXPERTS=OFF)";
     return false;
@@ -3480,10 +3484,27 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies), first
+    // checked against the RAM
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+    {
+        const lamina::platform::RamFit ram = lamina::platform::ram_fit(host);
+        const std::string what = mtp_only ? "the MTP block's routed experts" : "the routed experts (in RAM, every one)";
+        if (ram.total > 0)
+            std::fprintf(stderr, "lamina: RAM: %s take %.1f GiB, %.1f of this PC's %.1f GiB available\n", what.c_str(),
+                         (double) host / 1073741824.0, (double) ram.available / 1073741824.0,
+                         (double) ram.total / 1073741824.0);
+        if (ram.too_much()) {
+            err = ram.say(what, "with the layers over more GPUs (--second-gpu) or a shorter --max-context, every expert "
+                                "fits in VRAM and none takes RAM");
+            return false;
+        }
+        if (ram.tight())
+            lamina::program::serve_warn(serve, ram.say(what, "close other programs, or fit every expert in VRAM (more "
+                                                             "GPUs through --second-gpu, a shorter --max-context)"));
+    }
     uint8_t* arena = nullptr;
     bool pinned = hmalloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
@@ -4480,7 +4501,7 @@ static int run_engine(int argc, char** argv) {
     }
     for (auto& S : stages) {
         S->init(m, ctx, chunk, batch, vision);
-        if (!place_experts(m, *S, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
+        if (!place_experts(m, *S, expert_vram, cpu_threads, hybrid_rows, expert_slots, serve_mode, err)) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }

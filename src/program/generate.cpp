@@ -1914,8 +1914,41 @@ int lamina::program::run(int argc, char** argv) {
     }
     lamina::core::ArenaExpertSource arena_src;
     lamina::core::ExpertSource* srcp = nullptr;
+    // The RAM the model takes against this PC's, before the arena takes it: the experts in it and, with --ple-io ram,
+    // the PLE table (read in after them).  False when they cannot fit, said; a warning when they leave little.
+    auto ram_fits = [&](uint64_t arena_bytes) {
+        uint64_t need = arena_bytes;
+        std::string what = "the model's experts";
+        if (o.ple_io == "ram") {
+            try {
+                const lamina::GgufFile f(o.ple_gguf);
+                if (const lamina::TensorInfo* t = f.find("per_layer_token_embd.weight")) {
+                    need += lamina::tensor_payload_bytes(*t);
+                    what += " and its PLE table";
+                }
+            } catch (const std::exception&) {   // the table's open has said what is wrong with the file
+            }
+        }
+        const lamina::platform::RamFit ram = lamina::platform::ram_fit(need);
+        if (ram.total > 0)
+            std::fprintf(stderr, "lamina: RAM: %s take %.1f GiB, %.1f of this PC's %.1f GiB available\n", what.c_str(),
+                         (double) need / 1073741824.0, (double) ram.available / 1073741824.0,
+                         (double) ram.total / 1073741824.0);
+        if (ram.too_much()) {
+            std::fprintf(stderr, "lamina: %s\n",
+                         ram.say(what, "a smaller quant of the model takes less, and --vram-pin-gib keeps experts in "
+                                       "VRAM instead").c_str());
+            return false;
+        }
+        if (ram.tight())
+            lamina::program::serve_warn(o.serve, ram.say(what, "close other programs, or use a smaller quant of the "
+                                                               "model"));
+        return true;
+    };
     auto load_experts = [&]() -> bool {
         arena_src.set_gguf(native_shards);
+        const lamina::kernels::cpu::ExpertLayout& lay = lamina::kernels::cpu::expert_layout();
+        uint64_t arena_bytes = lay.total;
         if (!vram_only.empty()) {
             // --prompt-split: the second stage streams the experts of its layers that its GPU lacks from this arena,
             // and the main GPU's pinned ones of those layers live nowhere else, so they stay here too (the first
@@ -1926,8 +1959,12 @@ int lamina::program::run(int argc, char** argv) {
                 for (int64_t l = (int64_t) o.prompt_split; l < g.n_layers; ++l)
                     for (int64_t e = 0; e < g.n_expert; ++e)
                         if (uint8_t& v = left_out[(size_t) (l * g.n_expert + e)]; v == 1) v = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (left_out[(size_t) (l * g.n_expert + e)] != 0) arena_bytes -= lay.blob_bytes(l);
             arena_src.set_vram_only(std::move(left_out));
         }
+        if (!ram_fits(arena_bytes)) return false;
         arena_src.set_uncached(o.no_file_cache);
         if (!arena_src.open(g.n_layers, g.n_expert, /*threads=*/6, err)) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());

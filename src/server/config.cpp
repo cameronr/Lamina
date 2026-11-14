@@ -11,13 +11,6 @@
 #include <fstream>
 #include <regex>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 namespace lamina {
 namespace {
 
@@ -41,26 +34,6 @@ std::vector<std::string> args_of(const json& cfg) {
 }
 
 bool has(const std::vector<std::string>& args, const char* flag) { return std::find(args.begin(), args.end(), flag) != args.end(); }
-
-/// (total, available) RAM in bytes; zeros when it cannot be read
-std::pair<double, double> ram() {
-#ifdef _WIN32
-    MEMORYSTATUSEX m{};
-    m.dwLength = sizeof m;
-    if (GlobalMemoryStatusEx(&m)) return {(double) m.ullTotalPhys, (double) m.ullAvailPhys};
-    return {0, 0};
-#else
-    std::ifstream f("/proc/meminfo");
-    std::string key;
-    double total = 0, avail = 0, kb;
-    std::string unit;
-    while (f >> key >> kb >> unit) {
-        if (key == "MemTotal:") total = kb * 1024;
-        if (key == "MemAvailable:") avail = kb * 1024;
-    }
-    return {total, avail};
-#endif
-}
 
 /// an expert profile's (layers, experts per layer) from its header (tools/make_profile.py's format)
 std::optional<std::pair<uint32_t, uint32_t>> profile_shape(const std::string& path) {
@@ -455,24 +428,6 @@ std::vector<std::string> offline_blockers(const json& cfg) {
                 needs.push_back(std::string("the config's ") + key + "." + field + " permits network sources");
     }
     return needs;
-}
-
-void warn_tight_ram(const json& arena_mib) {
-    if (!arena_mib.is_number_integer() || arena_mib.get<int64_t>() <= 0) return;
-    const double total = ram().first;
-    if (total <= 0) return;
-    const double left = total / 1073741824.0 - (double) arena_mib.get<int64_t>() / 1024;
-    if (left >= 6) return;
-    char buf[256];
-    std::snprintf(buf, sizeof buf, "[lamina] WARNING: RAM is tight - the model's experts take %.1f GB of this PC's %.0f GB, "
-                  "leaving %.1f GB for everything else. ", (double) arena_mib.get<int64_t>() / 1024, total / 1073741824.0, left);
-#ifdef _WIN32
-    say(std::string(buf) + "Windows will slow down (paging to disk). Close other programs, or set up the smaller quant "
-        "(setup --model iq3_s).");
-#else
-    say(std::string(buf) + "Linux may stop the engine in the middle of an answer. Close other programs, or set up the "
-        "smaller quant (setup --model iq3_s).");
-#endif
 }
 
 }  // namespace lamina

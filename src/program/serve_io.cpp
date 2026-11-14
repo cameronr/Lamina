@@ -66,6 +66,11 @@ void serve_print(const char* fmt, ...) {
     va_end(ap);
 }
 
+void serve_warn(bool serving, const std::string& text) {
+    std::fprintf(stderr, "lamina: %s\n", text.c_str());
+    if (serving) serve_print("WARN %s\n", text.c_str());
+}
+
 std::string read_vision_records(const std::string& path, int64_t n_embd, std::vector<float>& rows,
                                 std::vector<VisionImage>& imgs) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
