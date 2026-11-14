@@ -173,7 +173,11 @@ The example configs' options, and the ones that pay on some PCs. `build/lamina -
 | `--no-file-cache` | off by default: the experts are read past the OS file cache, which then holds no second copy of the model |
 | `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz, the card's own (`0`: that tier's stay the driver's); needs administrator rights (root on Linux) |
 
-The last six are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
+| `--second-gpu-clocks-hold S` | with `--second-gpu-clocks` under `--serve`: the locks stay S seconds after a request (5 by default); a locked card draws its awake power until then |
+| `--second-gpu-clocks-lead S` | off by default (the locks are asked for from a batched prompt part's last chunk on): they are asked for S seconds before the part ends, by its progress; a lock is at speed ~0.6 s after it is asked for |
+| `--second-gpu-sleep-us T[,..]` | off by default: per tier after the first, the tier sleeps (its experts to the CPU, its lock released) while the CPU pool would need less than T microseconds a layer without it, averaged over a few seconds of generation; trades speed for the card's awake power, T by model file |
+
+The last nine are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
 keeping them.
 
 ## Control vectors

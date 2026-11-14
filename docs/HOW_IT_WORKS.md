@@ -69,6 +69,13 @@ The main GPU waits for the host and the other devices by spinning on flags in ho
 the hand-offs cost microseconds. It is also why nothing else may use that GPU: a display or another program makes the
 driver share it in time slices, and a spin that loses its slice stalls the pass.
 
+A tier after the first gets only these short shares, and a driver may slow its card between them until its rows come
+late. `--second-gpu-clocks` locks a tier's clocks while the engine generates, `--second-gpu-clocks-hold` and
+`--second-gpu-clocks-lead` time that lock around a request, and `--second-gpu-sleep-us` lets such a tier sleep while
+the CPU pool would not need it: its experts go to the tiers before it and the CPU, its lock is released, and it comes
+back when the text turns heavy. Each is off unless a config sets it: the clocks are a card's own, and the sleep gives
+up speed for power by an amount that is the model file's and the PC's ([examples/](../examples/README.md)).
+
 After the last layer, the output head gives each token of the window its next-token distribution. The window's tokens
 are accepted from the first while each draft is the token the model picks there (greedy: the likeliest; sampled: the
 one drawn from the model's distribution), and the model's own token follows the last accepted draft. So a pass yields

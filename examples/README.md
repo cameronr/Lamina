@@ -57,7 +57,8 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
 - **`--second-gpu-clocks 0,1395-2100/9751`** (all three): a value per tier, here none for the first and, for the
   second, its graphics clock locked at 1395-2100 MHz and its memory clock at 9,751 while the engine generates (NVML's
   locks, the ones `nvidia-smi -lgc` and `-lmc` set). The engine sets them from a request's start, or from a long
-  prompt's last chunk, until 5 s after the request, so the card idles at ~12 W instead of the ~110 W it draws locked.
+  prompt's last chunk, until 5 s after the request (its own timing: the two switches below shorten it), so the card
+  idles at ~12 W instead of the ~110 W it draws locked.
   It pays for a tier whose work is sparse: this PC's second RTX 3090, as the third GPU, gets only the verify windows'
   short shares, the Windows driver drops it to its idle clocks between them, its rows come late and its moves copy at
   a quarter of the link's rate, and generation takes 4-22% longer (with an RTX 5060 Ti in that place: 0-7%). A tier
@@ -75,3 +76,21 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
   - The values go to the tiers in their order, the last one to the tiers past it. With `--second-gpu auto` the order
     is the one the start's log lists: name the tiers to give each card its own values.
   - An engine ended by force leaves its lock: the next engine's first release ends it, or `nvidia-smi -rgc -rmc`.
+  - `--second-gpu-clocks-hold 1 --second-gpu-clocks-lead 1.0` (this PC's configs set them with the lock): the lock
+    stays 1 s after a request instead of 5, and is asked for 1 s before a batched prompt part ends, by the part's
+    progress, instead of from its last chunk on. Over an agent's session replayed here (60 requests, a third of its
+    time in pauses of up to 12 s) that took 3.2-3.5% of the energy the GPUs and the CPU drew: the card's locked time
+    in the pauses and through one-chunk prompts. No time that showed: the generation +0.2% over four rounds, where
+    two runs of one arm differ by up to 2.2%. A lock is at speed ~0.6 s after it is asked for, so a shorter lead
+    starts generation on a card still at its idle clocks; a short hold pays where the next request rarely comes
+    within it (here 72% of an agent's come within a second).
+  - `--second-gpu-sleep-us T[,..]` (this PC's IQ3_S config sets `0,55`): a value per tier, none for the first. A later
+    tier sleeps (its experts go to the tiers before it and the CPU, its lock is released) while the CPU pool would
+    need less than T microseconds a layer without it, averaged over a few seconds of generation, and wakes when the
+    text turns heavy. It gives up speed for the card's awake power, by an amount that is the model file's and the
+    PC's: here IQ3_S at 55 slept through 59-63% of a session's rounds for 10.5% fewer joules a token, its time a
+    token within ~1% of the config's (code and edits kept the card, worth 11-13% of their time), Gyro-L at 100
+    through 51% for 6.7% fewer joules and 2% more time, and UD-Q4_K_XL's load never falls that low. `--stats` prints
+    the measure at the end of a `lamina` run, predicted while the tier works and measured while it sleeps: start
+    from what a thinking text shows, and compare whole sessions with and without the switch, several each (single
+    runs differ by 2%).
