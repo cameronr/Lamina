@@ -10,7 +10,7 @@
 #              -e MODEL=iq3_s -e API_KEY=<a long random key> lamina
 #
 # The settings (environment variables): MODEL (iq3_s, ud-q4_k_xl or qwen36-ud-q4_k_xl), API_KEY, and optionally
-# VISION (on or off), CONTEXT (tokens), MAIN_GPU (a name, UUID or nvidia-smi index). The image runs on any x86-64 CPU
+# VISION (on, off or gpu), CONTEXT (tokens), MAIN_GPU (a name, UUID or nvidia-smi index). The image runs on any x86-64 CPU
 # with AVX2 (--portable). Pinned memory needs --ulimit memlock=-1.
 
 ARG CUDA_VERSION=13.0.0

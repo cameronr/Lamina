@@ -1,18 +1,19 @@
 # tools/vision - lamina-vision, the image encoder for Lamina's multimodal path (setup.py builds it).  Uses llama.cpp's
 # mtmd library at the same pinned commit as the engine's ggml.
 #
-#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         [-DLAMINA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DLAMINA_PORTABLE=OFF]
-#   cmake --build build-vision --target lamina-vision
+#   cmake -S tools/vision -B build-vision-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
+#         -DLAMINA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native [-DLAMINA_PORTABLE=OFF]
+#   cmake --build build-vision-cuda --target lamina-vision
 #
-# lamina-server starts the lamina-vision in its own folder and no other: copy build-vision/bin's there (setup.py does).
+# lamina-server starts the lamina-vision in its own folder and no other: copy build-vision-cuda/bin's there (setup.py
+# and .github/ci.py do).  A CUDA build runs either way, as the config's vision section says: without --gpu it hides the
+# GPUs and runs on the CPU; LAMINA_VISION_CUDA=OFF builds one for the CPU alone.
 #
 # Portable (AVX2 baseline; arm64: Armv8.2 + dotprod + fp16) is the default, so an encoder built without extra flags
 # runs on any AVX2 PC: the 0.1.32 release's encoder was built native on an AVX-512 machine and stopped with an illegal
-# instruction elsewhere (#411 #412 #419).  setup.py builds it portable too, into build-vision (the CPU encoder: a
-# native build on an AVX-512 CPU runs without flash attention, about half as fast) or, with --vision gpu, with CUDA for
-# the PC's GPUs into build-vision-cuda.  The option is kept in CMakeCache.txt, so a build folder configured before
-# this default still needs the flag (or a fresh folder).
+# instruction elsewhere (#411 #412 #419).  setup.py builds it portable too (a native build on an AVX-512 CPU runs
+# without flash attention on the CPU, about half as fast), with CUDA for the PC's GPUs.  The option is kept in
+# CMakeCache.txt, so a build folder configured before this default still needs the flag (or a fresh folder).
 cmake_minimum_required(VERSION 3.21)
 project(lamina_vision C CXX)
 

@@ -14,7 +14,8 @@ The steps:
 1. For a build, CMake and Ninja into .venv and llama.cpp at the pinned commit into third_party/llama.cpp: ggml for
    the engine, mtmd for pictures, and the server's libraries (cpp-httplib, nlohmann/json, Jinja).
 2. lamina and lamina-vision, built with CMake, Ninja, the CUDA toolkit, and MSVC or GCC. Missing tools are named, not
-   installed. The image encoder is copied into build/: the server takes the lamina-vision in its own folder.
+   installed. The image encoder, built with CUDA, is copied into build/: the server takes the lamina-vision in its own
+   folder, which runs on the CPU or a GPU as the config's vision section says.
 3. The model's files from Hugging Face at pinned revisions. Downloads resume, and each file's size and SHA-256 are
    checked. Where a file of an earlier upload of the same tensors is in place (unsloth's Dynamic 3.0 UD-Q4_K_XL), that
    upload is kept and completed.
@@ -521,32 +522,27 @@ def cuda_dlls(nvcc: str) -> list:
             for dll in [*(tk / ("arm64" if ARM else "x64")).glob(pat), *tk.glob(pat)]]
 
 
-def place_vision(cuda: bool) -> bool:
-    """The image encoder into build/, beside the server, which takes it from its own folder and no other: the CPU build
-    (build-vision/bin) or the CUDA one (build-vision-cuda/bin; it runs on the CPU too, and takes the CUDA runtime
-    build_engine put there). False when that build is not there."""
-    src = ROOT / ("build-vision-cuda" if cuda else "build-vision") / "bin" / f"lamina-vision{EXE}"
+def place_vision() -> bool:
+    """The image encoder built in build-vision-cuda into build/, beside the server, which takes it from its own folder
+    and no other (on Windows it loads the CUDA runtime build_engine put there). False when it is not built."""
+    src = ROOT / "build-vision-cuda" / "bin" / f"lamina-vision{EXE}"
     if not src.is_file():
         return False
     shutil.copy2(src, ROOT / "build" / src.name)
     return True
 
 
-def build_vision(tc: Toolchain, env: dict, cuda_archs: str | None = None):
-    """The image encoder, built in build-vision and copied beside the server. It runs on the CPU, built for any AVX2 CPU
-    (arm64: Armv8.2 with dotprod and fp16): a native build on an AVX-512 CPU runs without flash attention, about half as
-    fast. With --vision gpu (`cuda_archs`) it is built with CUDA, in build-vision-cuda."""
-    if not cuda_archs:
-        cmake_build(tc, ROOT / "tools" / "vision", ROOT / "build-vision", "lamina-vision",
-                    [f"-DLLAMA_DIR={LLAMA.as_posix()}", "-DLAMINA_VISION_CUDA=OFF", "-DLAMINA_PORTABLE=ON",
-                     *compiler_defs(tc)], env)
-    else:
-        cmake_build(tc, ROOT / "tools" / "vision", ROOT / "build-vision-cuda", "lamina-vision",
-                    [f"-DLLAMA_DIR={LLAMA.as_posix()}", "-DLAMINA_VISION_CUDA=ON",
-                     f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", "-DLAMINA_PORTABLE=ON", *cuda_defs(tc, env)], env)
-    if not place_vision(bool(cuda_archs)):
+def build_vision(tc: Toolchain, env: dict, cuda_archs: str):
+    """The image encoder, built with CUDA for the engine's architectures in build-vision-cuda and copied beside the
+    server. One build runs either way, as the config's vision section says: on the CPU ("gpu": false: it hides the GPUs,
+    which keep their VRAM; its CPU code for any AVX2 CPU, arm64: Armv8.2 with dotprod and fp16, since a native build on
+    an AVX-512 CPU runs without flash attention, about half as fast), or on a GPU ("gpu": true, "cuda_device")."""
+    cmake_build(tc, ROOT / "tools" / "vision", ROOT / "build-vision-cuda", "lamina-vision",
+                [f"-DLLAMA_DIR={LLAMA.as_posix()}", "-DLAMINA_VISION_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
+                 "-DLAMINA_PORTABLE=ON", *cuda_defs(tc, env)], env)
+    if not place_vision():
         fail("the image encoder's build left no lamina-vision")
-    ok(f"the image encoder: build/lamina-vision{EXE}" + (f" (CUDA architectures {cuda_archs})" if cuda_archs else ""))
+    ok(f"the image encoder: build/lamina-vision{EXE} (CUDA architectures {cuda_archs})")
 
 
 def cuda_lib_dir(nvcc: str | None):
@@ -774,9 +770,9 @@ def main() -> int:
     ap.add_argument("--data-dir", default=str(ROOT.parent / "Lamina-data"),
                     help="the models, the draft layer and the image projector (default: Lamina-data beside this checkout)")
     ap.add_argument("--vision", default="on", metavar="on|off|gpu[:GPU]",
-                    help="pictures: on (the encoder runs on the CPU), off, or gpu (built with CUDA and run on a GPU: its "
-                         "name, UUID or nvidia-smi index; default the one with the least VRAM besides the main GPU, "
-                         "of those that drive no display if any)")
+                    help="pictures: on (the encoder runs on the CPU), off, or gpu (it runs on a GPU: its name, UUID or "
+                         "nvidia-smi index; default the one with the least VRAM besides the main GPU, of those that "
+                         "drive no display if any)")
     ap.add_argument("--main-gpu", help="the GPU the model runs on: its name, UUID or nvidia-smi index (default: the one "
                                        "with the most VRAM that drives no display)")
     ap.add_argument("--context", type=int, help="the context in tokens (default: the example config's)")
@@ -884,20 +880,15 @@ def main() -> int:
         say("\n2. the engine and the image encoder")
         env = vs_environment(tc.vcvars) if WIN else clean_env()
         build_engine(tc, archs, a.portable, env)
-        build_vision(tc, env, archs if vision_gpu else None)
+        build_vision(tc, env, archs)
     else:
         say("\n2. the programs as they are (--no-build): " + ("a release's, in bin/" if release else "build/'s"))
-        if release:   # the server takes the encoder beside it: the release's own, built for the CPU
-            if vision and not (RELEASE / f"lamina-vision{EXE}").exists():
-                fail("bin/ has no lamina-vision: extract the release's programs archive there whole, or --vision off")
-            if vision_gpu:
-                warn("--vision gpu: bin/'s image encoder is used, and a release's runs on the CPU alone: put a CUDA "
-                     "build of lamina-vision there (setup without --no-build makes one in build-vision-cuda/bin)")
-        elif not place_vision(bool(vision_gpu)):   # else the one built before is beside the server again
-            if vision_gpu:
-                fail("--vision gpu: build-vision-cuda/bin/lamina-vision is not built: run setup without --no-build")
-            if vision and not (ROOT / "build" / f"lamina-vision{EXE}").exists():
-                fail("the image encoder is not built: run setup without --no-build, or with --vision off")
+        if not release:
+            place_vision()   # the encoder built before, beside the server again
+        if vision and not ((RELEASE if release else ROOT / "build") / f"lamina-vision{EXE}").exists():
+            fail(("bin/" if release else "build/") + " has no lamina-vision beside the server",
+                 "extract the release's programs archive there whole, or --vision off" if release else
+                 "run setup without --no-build, or with --vision off")
     if not m:
         say("\nDone: the engine is built. Prepare a model with --model (" + ", ".join(MODELS) + ").")
         return 0

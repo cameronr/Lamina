@@ -6,7 +6,8 @@ tests that need no GPU, and the release archives.
     python .github/ci.py toolkit --dest DIR     the toolkit for this OS and CPU into DIR (in GitHub Actions also
                                                  CUDA_PATH and PATH for the later steps; elsewhere LAMINA_NVCC names it)
     python .github/ci.py build                  llama.cpp at the pinned commit, build/ (every program, the release's CUDA
-                                                 architectures, for other PCs) and build-vision/ (the CPU encoder)
+                                                 architectures, for other PCs) and the image encoder for the same
+                                                 architectures (built in build-vision-cuda/, copied into build/)
     python .github/ci.py test                   the tests that need no GPU: ctest -L cpu, the tools' unit tests
     python .github/ci.py package [--version V]  dist/lamina-V-bin-<os>-cuda-<x.y>-<cpu>.zip (.tar.gz on Linux): the
                                                  programs and the script that downloads Flash-Next's draft layer, and
@@ -146,7 +147,7 @@ def build():
     # Linux: the programs look for the CUDA runtime beside them (the runtime archive), not in this machine's toolkit
     extra = () if S.WIN else ("-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON", "-DCMAKE_INSTALL_RPATH=$ORIGIN")
     S.build_engine(tc, CUDA_ARCHS, True, env, tests=True, extra=extra)
-    S.build_vision(tc, env)
+    S.build_vision(tc, env, CUDA_ARCHS)   # on the CPU or a GPU as a config's vision section says
     if ccache:
         subprocess.run([ccache, "--show-stats"])
 
@@ -201,7 +202,7 @@ def package(version: str):
     dist.mkdir(exist_ok=True)
     files = {f"lamina-server{S.EXE}": S.ROOT / "build" / f"lamina-server{S.EXE}",
              f"lamina{S.EXE}": S.ROOT / "build" / f"lamina{S.EXE}",
-             f"lamina-vision{S.EXE}": S.ROOT / "build-vision" / "bin" / f"lamina-vision{S.EXE}",
+             f"lamina-vision{S.EXE}": S.ROOT / "build" / f"lamina-vision{S.EXE}",
              DRAFT_SCRIPT: S.ROOT / DRAFT_SCRIPT,
              "LICENSE": S.ROOT / "LICENSE",
              "LICENSE-llama.cpp": S.LLAMA / "LICENSE",

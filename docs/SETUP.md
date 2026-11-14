@@ -28,7 +28,7 @@ Without `--model`, setup builds the engine only.
 | --- | --- |
 | `--check` | say what this PC has (GPUs, RAM, disk, the tools) and what the model needs; change nothing |
 | `--data-dir DIR` | where the model files go (default `../Lamina-data`, beside the clone) |
-| `--vision on\|off\|gpu[:GPU]` | pictures (default on; the image encoder runs on the CPU). `gpu` builds it with CUDA (`build-vision-cuda`) and runs it on a GPU: the one named (name, UUID or nvidia-smi index), else the one with the least VRAM besides the main GPU, of those that drive no display if any; it takes ~1.3 GB there |
+| `--vision on\|off\|gpu[:GPU]` | pictures (default on; the image encoder runs on the CPU). `gpu` runs it on a GPU: the one named (name, UUID or nvidia-smi index), else the one with the least VRAM besides the main GPU, of those that drive no display if any; it takes ~1.3 GB there |
 | `--main-gpu GPU` | the GPU the model runs on (default: the one with the most VRAM that drives no display) |
 | `--context N` | the context in tokens (default: the example config's) |
 | `--port N` | the server's port (default 8081 to 8084 by model) |
@@ -44,11 +44,12 @@ result is already there is skipped, so setup runs again after an interruption or
    `third_party/llama.cpp`: ggml for the engine, mtmd for the image encoder. With `--no-build` nothing.
 2. The server with the engine, `build/lamina-server` (`.exe`, with the CUDA runtime DLLs beside it; `build/lamina` is
    the engine alone), for this PC's GPUs, and the image encoder, `build/lamina-vision`: llama.cpp's mtmd
-   library with the model's projector, run on the CPU beside the engine so the GPUs keep their VRAM for experts. The encoder is built for any AVX2 CPU: a native build on an AVX-512
-   CPU loses flash attention and encodes about half as fast. With `--vision gpu` it is built with CUDA instead
-   and runs on the GPU the option picks. It is built in `build-vision` (`build-vision-cuda` with CUDA) and copied
-   beside the server: the server starts the `lamina-vision` in its own folder, and no config key names another. The
-   CUDA build also runs on the CPU, so the last setup run's choice serves every config.
+   library with the model's projector, built with CUDA for the same GPUs in `build-vision-cuda` and copied beside the
+   server, which starts the `lamina-vision` in its own folder (no config key names another). The config's `vision`
+   section decides where it runs at each start: on the CPU beside the engine (`"gpu": false`, the default), where it
+   hides the GPUs so they keep their VRAM for experts, or with `--vision gpu` on the GPU the option picks (`"gpu":
+   true`, `cuda_device`). Its CPU code is built for any AVX2 CPU: a native build on an AVX-512 CPU loses flash
+   attention and encodes about half as fast.
 3. The model's files from Hugging Face at pinned revisions, into the data folder, resumed when interrupted and checked
    once by size and SHA-256 (`<file>.sha256` beside each records the check):
    [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
@@ -84,8 +85,8 @@ Each [release](https://github.com/eddoursul/Lamina/releases) has the programs bu
 arm64, in two downloads a platform:
 
 - `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`lamina-server`), the engine alone
-  (`lamina`) and the CPU image encoder (`lamina-vision`), with their licenses, and the script that downloads
-  Flash-Next's draft layer (`download-draft-layer.bat`, `.sh` on Linux);
+  (`lamina`) and the image encoder (`lamina-vision`, on the CPU or a GPU as a config says), with their licenses, and
+  the script that downloads Flash-Next's draft layer (`download-draft-layer.bat`, `.sh` on Linux);
 - `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, beside them (the same in every
   release of that CUDA version: one download serves the next releases).
 
@@ -105,9 +106,9 @@ does), and the config and the launcher it writes run the programs in `bin/`. The
 capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
 kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
 13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the
-runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a GH200's 9.0), a
-native build for the PC's CPU and `--vision gpu` (the encoder with CUDA) need setup's build. The arm64 programs are
-built and their CPU tests run on each release, not yet run with a GPU.
+runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a GH200's 9.0)
+and a native build for the PC's CPU need setup's build. The arm64 programs are built and their CPU tests run on each
+release, not yet run with a GPU.
 
 The releases come from the GitHub workflow `.github/workflows/build.yml` at a `v*` tag; it also builds every push to
 `main` and every pull request, and runs the tests that need no GPU. Its steps are `.github/ci.py`'s, which runs on a PC
@@ -264,7 +265,7 @@ docker run --rm --gpus all --ulimit memlock=-1 -p 127.0.0.1:8081:8080 -v lamina-
            -e MODEL=iq3_s -e API_KEY=<a long random key> lamina
 ```
 
-`VISION` (on, off), `CONTEXT` and `MAIN_GPU` pass the setup options of those names. The engine pins the experts in
+`VISION` (on, off, gpu), `CONTEXT` and `MAIN_GPU` pass the setup options of those names. The engine pins the experts in
 RAM, hence `--ulimit memlock=-1`.
 
 ## Updating
