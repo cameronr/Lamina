@@ -53,6 +53,11 @@ and `"--vision"` out of the config to run without pictures.
 the server is a CPU-only build and the config's `vision` section asks for a GPU (`"gpu": true`). Set `"gpu"` to
 `false` (and remove `cuda_device`), or put the CUDA build back: a release's programs archive, or setup run again.
 
+**"the vision encoder did not start: ERR lamina-vision sees no GPU (CUDA_VISIBLE_DEVICES=...)".** The config's
+`vision` section asks for a GPU (`"gpu": true`) and the encoder sees none: its `cuda_device` names a card that is not
+in this PC (moved, replaced, or a config from another PC), or is not a UUID or number CUDA takes, or the driver gives
+no GPU. `nvidia-smi -L` lists the cards with their UUIDs: name one there, or set `"gpu"` to `false`.
+
 **"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's config names no draft layer (`"--mtp", "<folder>"` in its
 `args`), or a folder without the layer's files. The server runs, and the model writes new text at roughly half to two
 thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`, `./download-draft-layer.sh FOLDER`

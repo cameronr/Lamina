@@ -113,6 +113,18 @@ int main(int argc, char** argv) {
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);
     llama_backend_init();
+    // --gpu where no GPU is visible (the config's "cuda_device" names a card that is not there: the server hands it to
+    // CUDA as CUDA_VISIBLE_DEVICES; or the driver gives none): said, not done.  mtmd would fall back to the CPU quietly,
+    // with its default threads and after the GPU path's warm-up, as a build without CUDA did.
+    if (gpu && ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr &&
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) == nullptr) {
+        const char* vis = std::getenv("CUDA_VISIBLE_DEVICES");
+        const std::string shown = vis != nullptr && *vis ? std::string(" (CUDA_VISIBLE_DEVICES=") + vis + ")" : "";
+        std::printf("ERR lamina-vision sees no GPU%s: name a card that is there in the config's vision \"cuda_device\" "
+                    "(nvidia-smi -L lists them), or set \"gpu\" to false\n", shown.c_str());
+        std::fflush(stdout);
+        return 2;
+    }
 
     const auto load_t0 = std::chrono::steady_clock::now();
 #if !defined(_WIN32)
