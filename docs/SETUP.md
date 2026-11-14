@@ -166,12 +166,14 @@ The example configs' options, and the ones that pay on some PCs. `build/lamina -
 | `--hc-q8` | the hyper-connection projections in 8 bits only: half their VRAM, read ~30% faster |
 | `--prompt-shift F` | on a second GPU, a share of the experts the main GPU holds is computed beside it in long prompts |
 | `--pcie-mode kernel --pcie-frac 0` | the experts no GPU holds are all computed by the CPU, none read by the main GPU over its link (the examples' setting) |
-| `--prompt-split L` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk |
+| `--prompt-split L[,M]` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk; `L,M` with two or more tiers: three stages, the tier after the first taking the layers L to M-1 (with one tier: two stages, split halfway between L and M) |
+| `--prompt-split-from N` | off by default: with `--prompt-split`, a prompt part of N tokens or more that fits one chunk is read as two chunks of half its size through the stages (a shorter one runs on the main GPU's stage alone) |
+| `--prompt-tiers 2` | off by default: with two or more tiers, the tier after the first computes the experts it holds in prompts too, where they otherwise stream to the first tier |
 | `--arena-place` | off by default: for RAM with slower regions (unpaired DIMMs), the experts the CPU reads are kept out of them |
 | `--no-file-cache` | off by default: the experts are read past the OS file cache, which then holds no second copy of the model |
 | `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz, the card's own (`0`: that tier's stay the driver's); needs administrator rights (root on Linux) |
 
-The last four are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
+The last six are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
 keeping them.
 
 ## Control vectors

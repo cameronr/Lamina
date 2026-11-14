@@ -113,6 +113,11 @@ where the batched path's fixed cost would be the larger.
 `--prompt-split L` runs a prompt of several chunks in two stages: the first tier runs each chunk's layers from L on
 while the main GPU runs the next chunk's first layers. On the development PC it reads prompts of 32K-128K tokens
 1.1-1.6x as fast, but its layer and its gain depend on the GPUs and their links, so it is off unless a config sets it.
+With a second tier, `--prompt-split L,M` makes it three stages, that tier's GPU running the layers between (there
+another 1.2x at 64K-128K tokens for the smaller file, nothing for the larger); `--prompt-split-from N` sends a part of
+N tokens or more that fits one chunk through the stages in two halves; `--prompt-tiers 2` has that tier compute the
+experts it holds in prompts, where they otherwise stream to the first. Each is off unless a config sets it, for the
+same reason.
 
 ## The context
 
