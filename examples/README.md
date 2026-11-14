@@ -42,17 +42,18 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
   - Three more switches of the prompt path were measured here with the second RTX 3090 as the tier after the first;
     this PC's configs do not set them.
   - `--prompt-split L,M` runs three stages, that tier's GPU the layers L to M-1 between the main GPU's and the first
-    tier's: at 17,35 IQ3_S's prompts of 64K / 128K tokens read 1.17x / 1.23x as fast as in two stages, UD-Q4_K_XL's
-    no faster (the first tier then streams its larger experts for three stages at once). It takes ~0.9 GiB more
-    pinned RAM and ~0.25 GiB more of the first tier's VRAM, lends that tier's cache as well, and keeps its GPU at work
-    from a prompt's first chunk. Without that tier the same value runs two stages at the layer halfway between.
+    tier's: at 17,35 IQ3_S's prompts of 64K / 128K tokens read 14% / 21% faster than in two stages through the
+    server (10.4 / 18.9 s against 11.9 / 22.8), UD-Q4_K_XL's no faster (the first tier then streams its larger
+    experts for three stages at once). It takes ~0.9 GiB more pinned RAM and ~0.25 GiB more of the first tier's VRAM,
+    lends that tier's cache as well, and keeps its GPU at work from a prompt's first chunk (170-200 W through a
+    prompt, where it otherwise idles). Without that tier the same value runs two stages at the layer halfway between.
   - `--prompt-split-from N` reads a prompt part of N tokens or more that fits one chunk as two halves through the
     stages. The stages' fixed cost sets N: here ~9K tokens for IQ3_S (a 12K part 10-12% sooner, 16K 17-19%, 8K 3%
-    later), and no size for UD-Q4_K_XL.
+    later; the server's 16K prompt in 4.0 s against 5.1 with three stages), and no size for UD-Q4_K_XL.
   - `--prompt-tiers 2` has the tier after the first compute the experts it holds in prompts, its input and sums over
-    its own link: UD-Q4_K_XL's parts of 2-4K tokens read 15% sooner (the first tier streams fewer of its large
-    experts), IQ3_S's 4-10% later (its small experts stream sooner than rows cross two x4 links). It takes ~0.65 GiB
-    of that card's VRAM.
+    its own link: UD-Q4_K_XL's parts of 2-4K tokens read 15-25% sooner and its prompts of 64K-128K 6% (the first
+    tier streams fewer of its large experts), IQ3_S's 4-10% later (its small experts stream sooner than rows cross
+    two x4 links). It takes ~0.65 GiB of that card's VRAM and keeps the card at work through a prompt (~140 W).
 - **`--second-gpu-clocks 0,1395-2100/9751`** (all three): a value per tier, here none for the first and, for the
   second, its graphics clock locked at 1395-2100 MHz and its memory clock at 9,751 while the engine generates (NVML's
   locks, the ones `nvidia-smi -lgc` and `-lmc` set). The engine sets them from a request's start, or from a long
