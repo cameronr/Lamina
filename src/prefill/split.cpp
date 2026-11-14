@@ -105,6 +105,7 @@ struct PromptSplit::Impl::St final : public SplitOut {
     bool last = false;        // the model's last layers: the draft layer's prompt K/V are its work
     int dev = -1;
     int64_t at = 0, end = 0;  // its layers
+    int64_t run_p0 = 0, run_T = 0;   // the chunk its prompt path runs (PromptSplit::on_progress)
     std::unique_ptr<Prefill> own_p{new Prefill};   // (ends with its GPU current: ~St)
     Prefill& p = *own_p;
     // the dense weights of its layers and, the last stage, the draft layer's prompt-K/V weights: the main GPU's rows,
@@ -350,6 +351,8 @@ struct PromptSplit::Impl::St final : public SplitOut {
         dkv2.first_cell = im->first_cell;
         p.set_in_events(ev_in.data(), n);
         p.set_run_end(j.run_end);
+        run_p0 = j.p0;
+        run_T = j.T;
         if (!p.run(j.tokens, j.T, j.p0, e)) return false;
         // the chunk's cells to the main GPU's session
         std::vector<Run> runs;
@@ -629,6 +632,10 @@ bool PromptSplit::init(Prefill& first, const core::WeightTable& wt, const core::
             // (1, 2 and 4 sections measured alike)
             t.p.set_pacing(2);
         }
+        if (t.last)
+            t.p.on_progress = [this, tp = &t](double done) {
+                if (on_progress) on_progress(tp->run_p0, tp->run_T, done);
+            };
         t.p.draft = drafts ? mtp : nullptr;
         t.p.draft_kv = drafts ? &t.dkv2 : nullptr;
         if (!m.order.empty()) t.p.set_order(m.order);

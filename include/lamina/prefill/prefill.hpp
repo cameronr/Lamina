@@ -155,6 +155,9 @@ public:
     /// Checked before every chunk: true stops the prompt there (`run` returns false with err "cancelled", and the
     /// state and `ss.ple_prev` hold the chunks before it, `processed()` positions).
     std::function<bool()> should_stop;
+    /// Called before each layer of each chunk with the share of this `run`'s layer-tokens already queued (0..1): how
+    /// near its end is (the clock locks of --second-gpu-clocks-lead), or null.
+    std::function<void(double done)> on_progress;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.

@@ -657,6 +657,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         };
         int64_t qsa_index = 0, gdn_index = 0;   // from L0: the session state holds the layers from L0 on
         for (int64_t l = L0; l < L1; ++l) {
+            if (on_progress)
+                on_progress(((double) c0 + (double) T * (double) (l - L0) / (double) (L1 - L0)) / (double) n);
             const core::LayerView v(*m.wt, l);
             const bool qsa = core::is_qsa_layer(g, l);
             new_layer();

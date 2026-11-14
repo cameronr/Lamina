@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -96,6 +97,10 @@ public:
     /// After the prompt's last run(): waits for the stages, then the state of their layers goes back to the main
     /// GPU's session and their routing counts into `first`'s; `first` runs every layer again.
     bool finish(std::string& err);
+
+    /// The last stage's progress through its chunk [pos0, pos0 + T): the share of the chunk's layer-tokens it has
+    /// queued (Prefill::on_progress), called on its thread; the prompt's part ends with that stage's last chunk.
+    std::function<void(int64_t pos0, int64_t T, double done)> on_progress;
 
     /// A stage's prompt path (its stats, the --prefill-profile sections of its layers).
     const PrefillStats& stats(int stage = 0) const;

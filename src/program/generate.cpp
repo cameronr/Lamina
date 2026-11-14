@@ -194,6 +194,10 @@ struct Options {
     /// per tier, its clocks' lock while the engine generates, "<graphics min>-<graphics max>/<memory>" in MHz
     /// (core::GpuClocks), or "0": the driver's clocks
     std::vector<std::string> second_gpu_clocks;
+    /// Those locks' timing (--serve): kept this long after a request (--second-gpu-clocks-hold), and asked for this
+    /// long before a batched prompt part's end, by its progress (--second-gpu-clocks-lead; < 0: from the part's last
+    /// chunk on).
+    double clocks_hold = 5.0, clocks_lead = -1.0;
     /// Keep the GPU tiers resident and executing, but do not adapt their residency while the main tier adapts.
     /// The default remains coupled adaptation of every tier.
     bool no_second_gpu_adapt = false;
@@ -416,6 +420,10 @@ void usage() {
                  "                       0: the driver's), 0 = none (the default). For a tier the driver slows\n"
                  "                       between its short shares; from a prompt's last chunk until a few seconds\n"
                  "                       after the request. Needs administrator rights (root on Linux)\n"
+                 "  --second-gpu-clocks-hold S  --serve: those locks stay S seconds after a request (default 5)\n"
+                 "  --second-gpu-clocks-lead S  --serve: they are asked for S seconds before a batched prompt part\n"
+                 "                       ends, by its progress, instead of from its last chunk on (a lock is at\n"
+                 "                       speed ~0.6 s after it is asked for)\n"
                  "  --no-second-gpu-adapt  with --second-gpu: keep the tiers\' resident expert assignment static while\n"
                  "                       the main GPU\'s adaptive tier continues to replace experts\n"
                  "  --deterministic-adapt  fixed-epoch adaptive copies and stable equal-gain ordering; default async\n"
@@ -1308,6 +1316,8 @@ int lamina::program::run(int argc, char** argv) {
             }
             double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-tiers" ? &o.prompt_tiers
                          : a == "--prompt-split-from" ? &o.prompt_split_from
+                         : a == "--second-gpu-clocks-hold" ? &o.clocks_hold
+                         : a == "--second-gpu-clocks-lead" ? &o.clocks_lead
                          : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
                          : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
@@ -3566,15 +3576,6 @@ int lamina::program::run(int argc, char** argv) {
             serve_print("PP %lld %lld %.0f %.1f\n", (long long) (done - pp_from), (long long) pp_total, ms,
                         ms > 0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
         };
-        // --second-gpu-clocks: held from the batched part's last chunk on (a chunk takes seconds, a lock half of one);
-        // `hold_from` is where that chunk starts, `pp_chunks` the chunks begun since `pp_at`
-        constexpr double kClocksIdleS = 5.0;   // and until this long after a request
-        int64_t hold_from = 0, pp_chunk = 1, pp_chunks = 0;
-        prefill.should_stop = [&] {
-            pp_line(pp_at + prefill.processed());
-            if (pp_at + pp_chunks++ * pp_chunk >= hold_from) clocks.hold();
-            return stop_req.load();
-        };
         // LAMINA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("LAMINA_TRACE") != nullptr;
         const Clock::time_point trace_t0 = Clock::now();
@@ -3583,6 +3584,38 @@ int lamina::program::run(int argc, char** argv) {
             std::fprintf(stderr, "lamina trace: %s %lld %lld (%.1f ms)\n", what, a, b,
                          std::chrono::duration<double, std::milli>(Clock::now() - trace_t0).count());
             std::fflush(stderr);
+        };
+        // --second-gpu-clocks: held from the batched part's last chunk on (a chunk takes seconds, a lock half of one);
+        // `hold_from` is where that chunk starts, `pp_chunks` the chunks begun since `pp_at`.  With
+        // --second-gpu-clocks-lead they are asked for that long before the part's end instead: the time since the
+        // part's first layer over the share of its layer-tokens queued tells how far the end is, on the path that
+        // ends the part (the main GPU's, or with --prompt-split the last stage's, on its thread).  And until
+        // --second-gpu-clocks-hold after a request.
+        int64_t hold_from = 0, pp_chunk = 1, pp_chunks = 0;
+        std::atomic<bool> lead_on{false};
+        bool lead_split = false;
+        int64_t lead_from = 0, lead_seg = 0, lead_total = 1;
+        Clock::time_point lead_t0{};
+        const auto lead_tick = [&](double all) {   // `all`: the share of the part read
+            if (!lead_on.load(std::memory_order_relaxed)) return;
+            const Clock::time_point now = Clock::now();
+            if (lead_t0 == Clock::time_point{}) lead_t0 = now;
+            if (all < 0.02 || std::chrono::duration<double>(now - lead_t0).count() * (1.0 - all) / all > o.clocks_lead)
+                return;
+            lead_on.store(false);
+            clocks.hold();
+            tr("clocks asked for, at this 1/1000 of the part", (long long) (1000.0 * all));
+        };
+        prefill.on_progress = [&](double done) {
+            if (!lead_split) lead_tick(((double) (pp_at - lead_from) + done * (double) lead_seg) / (double) lead_total);
+        };
+        psplit.on_progress = [&](int64_t p0, int64_t T, double done) {
+            if (lead_split) lead_tick(((double) (p0 - lead_from) + done * (double) T) / (double) lead_total);
+        };
+        prefill.should_stop = [&] {
+            pp_line(pp_at + prefill.processed());
+            if (pp_at + pp_chunks++ * pp_chunk >= hold_from) clocks.hold();
+            return stop_req.load();
         };
         {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
@@ -3987,7 +4020,17 @@ int lamina::program::run(int argc, char** argv) {
                 tr("prompt slots lent", chunk);
                 // (a later tier that computes its experts in the prompt, or runs a stage of it, works from its first
                 // chunk on; a part in two halves is held from its start, as in one chunk)
-                hold_from = pbuf.helping || (split_on && pbuf.mid) || halves ? reuse : batched_end - chunk;
+                const bool tier_in_prompt = pbuf.helping || (split_on && pbuf.mid);
+                hold_from = tier_in_prompt || halves ? reuse : batched_end - chunk;
+                lead_on.store(false);
+                if (!tier_in_prompt && o.clocks_lead >= 0) {
+                    hold_from = INT64_MAX;
+                    lead_split = split_on;
+                    lead_from = reuse;
+                    lead_total = part;
+                    lead_t0 = Clock::time_point{};
+                    lead_on.store(true);
+                }
                 // a return on an error below lets the second stage end first: its worker writes checkpoints into
                 // pcache's buffers, which go before psplit (finish after a finish does nothing)
                 struct SplitEnd {
@@ -4021,6 +4064,7 @@ int lamina::program::run(int argc, char** argv) {
                         if (c > a0 && c < b0) { b0 = c; break; }
                     pp_at = a0;
                     pp_chunks = 0;
+                    lead_seg = b0 - a0;
                     if (!prefill.run(ids.data() + a0, b0 - a0, a0, err)) {
                         // an error while a STOP is set is still an error: the states may have gone past the chunks
                         if (!prefill.stopped()) { report(err); return 1; }
@@ -4360,7 +4404,7 @@ int lamina::program::run(int argc, char** argv) {
             serve_print("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n,
                         prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) reuse, (long long) (hits1 - hits0), (long long) (look1 - look0));
-            clocks.release_after(kClocksIdleS);
+            clocks.release_after(o.clocks_hold);
             const int64_t fresh = n - reuse;
             std::fprintf(stderr, "lamina serve: %lld prompt tokens (%lld cached) in %.0f ms (%.1f tok/s), %lld generated "
                                  "in %.0f ms (%.1f tok/s)\n", (long long) n, (long long) reuse, prompt_ms,
