@@ -63,6 +63,23 @@ changing anything. Setup asks nothing and installs no system software: it names 
 extracted into `bin` in the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)).
 Details: [docs/SETUP.md](docs/SETUP.md).
 
+### The draft layer
+
+Qwen3.8-Flash-Next needs one thing no model file holds: Lamina's draft layer, four files of 0.8 GB together in
+[eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP). Setup
+downloads it. Whoever installs Lamina another way, a person or an agent, with a config of their own or a model file
+setup does not know, should download it too:
+
+```
+download-draft-layer.bat FOLDER      (Windows)
+./download-draft-layer.sh FOLDER     (Linux)
+```
+
+and name the folder in the config's `args`: `"--mtp", "FOLDER"`. The scripts check each file's SHA-256 and go on with
+a download that broke off. Without the layer the server still starts and says so in its window, with this command:
+the model then writes new text at roughly half to two thirds of its speed, and an edit that quotes its prompt loses
+under a tenth. Qwen3.6-35B-A3B and Qwen3.8-27B draft with their own files' layer and need nothing more.
+
 ## Run
 
 ```

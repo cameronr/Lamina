@@ -1,6 +1,7 @@
 // src/server/config.cpp - the run config as the server reads it (config.hpp).
 #include "config.hpp"
 
+#include "lamina/program/engine.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -121,6 +122,56 @@ void lift_reasoning_effort_arg(json& cfg) {
     if (jget(cfg, "reasoning_effort").is_null()) cfg["reasoning_effort"] = value;
     say("[lamina] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking level "
         "is the config's 'reasoning_effort' key (outside 'args'); it is used as " + py_repr_value(cfg["reasoning_effort"]));
+}
+
+namespace {
+
+/// `s` as a shell takes it as one word
+std::string shell_word(const std::string& s) { return s.find(' ') == std::string::npos ? s : "\"" + s + "\""; }
+
+/// this platform's script that downloads the draft layer, by its path where it lies (beside the program, as a release
+/// has it; in the config's folder or the one above the program's, as in a clone), else by its name
+std::string draft_layer_script(const json& cfg) {
+    const std::filesystem::path self = u8_path(self_dir());
+    std::error_code ec;
+    for (const std::filesystem::path& dir : {self, std::filesystem::absolute(u8_path(here_path(cfg, ".")), ec), self.parent_path()}) {
+        const std::filesystem::path script = dir / program::kDraftLayerScript;
+        if (std::filesystem::is_regular_file(script, ec)) return shell_word(u8_str(script.lexically_normal()));
+    }
+#ifdef _WIN32
+    return program::kDraftLayerScript;
+#else
+    return std::string("./") + program::kDraftLayerScript;
+#endif
+}
+
+}  // namespace
+
+std::string draft_layer_warning(json& cfg, const std::string& arch) {
+    if (arch != "qwen4exp" || !jget(cfg, "args").is_array()) return "";
+    json& args = cfg["args"];
+    std::string why = "the config's \"args\" name none", folder;
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (args[i] != "--mtp") continue;
+        const std::string dir = arg_str(args[i + 1]);
+        std::error_code ec;
+        const std::filesystem::path at = std::filesystem::absolute(u8_path(here_path(cfg, dir)), ec).lexically_normal();
+        std::string gone;
+        for (const char* f : {"dense.txt", "dense.bin", "experts.bin"})   // what MtpDrafter::load cannot do without
+            if (!std::filesystem::is_regular_file(at / f, ec)) gone += (gone.empty() ? "" : ", ") + std::string(f);
+        if (gone.empty()) return "";
+        why = "--mtp " + dir + " has no " + gone;
+        folder = shell_word(u8_str(at));
+        args.erase(i);   // the engine stops at a folder it cannot load
+        args.erase(i);
+        break;
+    }
+    const std::string head = "[lamina] WARNING: no draft layer (" + why + "): generation runs without its drafts, a "
+                             "verify window a token, and is slower.\n         Download it (0.8 GB) ";
+    const std::string from = std::string("  (or from\n         ") + program::kDraftLayerUrl + ")";
+    if (!folder.empty()) return head + "into that folder with  " + draft_layer_script(cfg) + " " + folder + from;
+    return head + "with  " + draft_layer_script(cfg) + " FOLDER" + from + ", then name the folder in the\n"
+           "         config's \"args\": \"--mtp\", \"FOLDER\"";
 }
 
 std::vector<int> gpu_list(const json& cfg) {

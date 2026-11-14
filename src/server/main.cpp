@@ -404,6 +404,8 @@ int run(int argc, char** argv) {
         say_err(std::string("[lamina] the model's tokenizer could not be read from ") + gguf + ": " + e.what());
         return 1;
     }
+    if (a.engine == "lamina")   // Flash-Next without its draft layer starts, slower: said in this window
+        if (const std::string w = draft_layer_warning(cfg, tok->architecture); !w.empty()) say(w);
     std::shared_ptr<McpHub> hub;
     try {
         hub = hub_from_config(cfg, a.mcp_config);   // before the minutes of loading: a bad entry stops here

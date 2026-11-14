@@ -44,6 +44,12 @@ runs, and Linux may end the engine. Close other programs, or use a smaller quant
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.
 
+**"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's config names no draft layer (`"--mtp", "<folder>"` in its
+`args`), or a folder without the layer's files. The server runs, and the model writes new text at roughly half to two
+thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`, `./download-draft-layer.sh FOLDER`
+on Linux: 0.8 GB), name the folder in the config's `args` if they name none, and start the server again
+([SETUP.md](SETUP.md#setup), The draft layer without setup).
+
 **"this build has no kernels for its compute capability, ...".** The engine was built for other GPUs: a card added
 after setup, or a release's programs on a card other than the RTX 30, 40 and 50 series. Run setup again: it builds for
 this PC's GPUs. As the main GPU, such a card stops the start; as a tier it is left out.

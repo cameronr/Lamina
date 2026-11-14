@@ -9,9 +9,10 @@ tests that need no GPU, and the release archives.
                                                  architectures, for other PCs) and build-vision/ (the CPU encoder)
     python .github/ci.py test                   the tests that need no GPU: ctest -L cpu, the tools' unit tests
     python .github/ci.py package [--version V]  dist/lamina-V-bin-<os>-cuda-<x.y>-<cpu>.zip (.tar.gz on Linux): the
-                                                 programs, and dist/cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>.zip: the CUDA
-                                                 runtime and cuBLAS; both flat, for one folder (bin/ in a clone, which
-                                                 setup --no-build runs)
+                                                 programs and the script that downloads Flash-Next's draft layer, and
+                                                 dist/cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>.zip: the CUDA runtime and
+                                                 cuBLAS; both flat, for one folder (bin/ in a clone, which setup
+                                                 --no-build runs)
 """
 from __future__ import annotations
 
@@ -39,6 +40,9 @@ COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "c
 SKIP = {"libcublas_static.a", "libcublasLt_static.a"}   # ~1 GB the engine does not link
 # The release's GPUs: RTX 30 (86), 40 (89) and 50 (120, with its PTX for newer ones), as the Dockerfile's
 CUDA_ARCHS = "86-real;89-real;120-real;120-virtual"
+# Flash-Next's draft layer is no part of a release: the platform's script that downloads it is, beside the programs,
+# where the server's warning of a start without the layer looks for it (src/server/config.cpp)
+DRAFT_SCRIPT = "download-draft-layer.bat" if S.WIN else "download-draft-layer.sh"
 
 
 def redist_platform() -> str:
@@ -198,6 +202,7 @@ def package(version: str):
     files = {f"lamina-server{S.EXE}": S.ROOT / "build" / f"lamina-server{S.EXE}",
              f"lamina{S.EXE}": S.ROOT / "build" / f"lamina{S.EXE}",
              f"lamina-vision{S.EXE}": S.ROOT / "build-vision" / "bin" / f"lamina-vision{S.EXE}",
+             DRAFT_SCRIPT: S.ROOT / DRAFT_SCRIPT,
              "LICENSE": S.ROOT / "LICENSE",
              "LICENSE-llama.cpp": S.LLAMA / "LICENSE",
              "LICENSE-cpp-httplib": S.LLAMA / "vendor" / "cpp-httplib" / "LICENSE",

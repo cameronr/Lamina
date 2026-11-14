@@ -389,7 +389,9 @@ void usage() {
                  "                       --spec allows the draft layer (windows of up to 8 tokens; 0 = off)\n"
                  "  --spec-split         a window's tokens in two groups, the GPU's work on one beside the CPU's on\n"
                  "                       the other (exact, ~7%% slower: a measurement arm)\n"
-                 "  --mtp DIR            the MTP draft layer's runtime files (tools/mtp_rt.py). Qwen3.6-35B-A3B and\n"
+                 "  --mtp DIR            the MTP draft layer's runtime files (download-draft-layer.bat / .sh, or\n"
+                 "                       tools/mtp_rt.py); --serve without it: one token a window, or prompt\n"
+                 "                       lookup's drafts. Qwen3.6-35B-A3B and\n"
                  "                       Qwen3.8-27B: --mtp N, at most N drafts of the file's own MTP block a step\n"
                  "                       (--spec-min-p as above), --draft-vocab N its head over the first N ids\n"
                  "  --mtp-window N       the draft layer attends to the last N cells (default 32768; 0 = every cell)\n"
@@ -2246,6 +2248,11 @@ int lamina::program::run(int argc, char** argv) {
             return 1;
         }
         mtp.set_max_drafts(o.spec - 1);
+    } else if (o.serve) {
+        // the server says the same in its window (check_draft_layer: this line goes to the engine's log there)
+        std::fprintf(stderr, "lamina: WARNING: no draft layer (--mtp FOLDER): every verify window holds one token, or "
+                             "prompt lookup's drafts (--spec-lookup), and generation is slower. Download it with  %s "
+                             "FOLDER  (or from %s)\n", kDraftLayerScript, kDraftLayerUrl);
     }
     // a GPU tier this build's kernels do not run on is left out
     if (!o.tier_gpus.empty()) {
@@ -3222,9 +3229,15 @@ int lamina::program::run(int argc, char** argv) {
     // empty sequence (`session_zero`): the prompt goes through the batched prompt path and its last token through
     // the first verify window - the path all three model files share.  Decoding is greedy.
     if (o.serve) {
-        if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 || thits.d_res == nullptr || host_res.empty()) {
-            std::fprintf(stderr, "lamina serve: needs --spec T, --mtp DIR, --prefill CHUNK, --expert-profile P and "
-                                 "--expert-cache\n");
+        if (o.spec < 2 || o.prefill_chunk <= 0 || thits.d_res == nullptr || host_res.empty()) {
+            std::fprintf(stderr, "lamina serve: needs --spec T, --prefill CHUNK, --expert-profile P and --expert-cache\n");
+            return 2;
+        }
+        // without the draft layer (said at its place in the start) the windows hold the last token alone, or prompt
+        // lookup's drafts: the same tokens, a window each
+        const bool use_mtp = !o.mtp.empty();
+        if (!use_mtp && !o.dump_draft_data.empty()) {
+            std::fprintf(stderr, "lamina serve: --dump-draft-data needs the draft layer (--mtp DIR)\n");
             return 2;
         }
         lamina::prefill::Prefill prefill;
@@ -3529,13 +3542,13 @@ int lamina::program::run(int argc, char** argv) {
         vh.blob = thits.blob;
         ver.set_split_head(split_head.get());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.max_window(), err) ||
-            !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+            (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err))) {
             std::fprintf(stderr, "lamina serve: %s\n", err.c_str());
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
         hook_verifier(ver);
-        prefill.draft = &mtp;
+        prefill.draft = use_mtp ? &mtp : nullptr;
         drive.d.plan = ver.plan_sink();
         drive.d.host_res = ver.residency();   // the snapshot the windows decide their GPU hits by
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
@@ -3575,7 +3588,7 @@ int lamina::program::run(int argc, char** argv) {
         // ---- the prompt cache (lamina/core/prompt_cache.hpp)
         std::vector<lamina::core::QsaState*> kv_states;
         for (int64_t i = 0; i < g.n_qsa_layers(); ++i) kv_states.push_back(&ss.qsa_states[i]);
-        kv_states.push_back(&mtp.kv_state());
+        if (use_mtp) kv_states.push_back(&mtp.kv_state());
         lamina::core::PromptCache pcache(g, ss, kv_states, main_cs, o.prompt_cache,
                                          (uint64_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots,
                                          o.conversation_cache_min_tokens);
@@ -4292,7 +4305,8 @@ int lamina::program::run(int argc, char** argv) {
                     }
                     if (!ver.commit(T, err, false)) return false;   // beside the draft
                     for (int i = 0; i < T; ++i) outv[(size_t) i] = (int32_t) ids[(size_t) (j + i + 1)];
-                    if (!mtp.draft(T, outv.data(), j, T - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p) ||
+                    if ((use_mtp && !mtp.draft(T, outv.data(), j, T - 1, drafts.data(), err, dprob.data(),
+                                               (float) o.spec_min_p)) ||
                         !ver.wait_commit(err))
                         return false;
                     if (track) pcache.set(j, ids.data() + j, T);
@@ -4472,7 +4486,7 @@ int lamina::program::run(int argc, char** argv) {
                 mtp.set_max_drafts(lk > 0 ? 1 : S - 1);
                 if (fw)   // the draft layer catches up on the prompt tokens: each position's next token is the prompt's
                     for (int i = 0; i < T - 1; ++i) outv[(size_t) i] = (int32_t) ids[(size_t) (merge_from + i + 1)];
-                const bool drafted = (eos || produced_n >= max_new ||
+                const bool drafted = (eos || produced_n >= max_new || !use_mtp ||   // (no layer: kept stays 0)
                                       mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
                                                 (float) req_spec_min_p, nullptr, &kept)) &&
                                      ver.wait_commit(err);

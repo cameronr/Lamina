@@ -64,6 +64,14 @@ result is already there is skipped, so setup runs again after an interruption or
    `examples/<model>.json` with this PC's GPUs and data folder. A config written before keeps the keys the example
    lacks (an `api_key`, an `images` section).
 
+**The draft layer without setup.** `download-draft-layer.bat FOLDER` (`./download-draft-layer.sh FOLDER` on Linux; a
+release's archive has its platform's script beside the programs) downloads step 4's four files into a folder,
+at the same revision, each checked by its SHA-256 and a broken download resumed; a config takes them with `"--mtp",
+"FOLDER"` in its `args`. Flash-Next's server starts without the layer too, when the `args` name none or a folder
+without its files, and warns in its window with the script's command. It then generates a token a verify window,
+or prompt lookup's drafts (`--spec-lookup`). On the development PC, new text came at 44-61% of IQ3_S's speed with
+the layer and 50-68% of UD-Q4_K_XL's, an edit that quotes its prompt at 92-96%.
+
 On Windows on Arm the build takes LLVM's clang-cl for the C and C++ code (ggml's CPU code for Arm does not build with
 MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or LLVM's own install
 (`LAMINA_CLANG_CL` names another).
@@ -74,7 +82,8 @@ Each [release](https://github.com/eddoursul/Lamina/releases) has the programs bu
 arm64, in two downloads a platform:
 
 - `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`lamina-server`), the engine alone
-  (`lamina`) and the CPU image encoder (`lamina-vision`), with their licenses;
+  (`lamina`) and the CPU image encoder (`lamina-vision`), with their licenses, and the script that downloads
+  Flash-Next's draft layer (`download-draft-layer.bat`, `.sh` on Linux);
 - `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, beside them (the same in every
   release of that CUDA version: one download serves the next releases).
 
