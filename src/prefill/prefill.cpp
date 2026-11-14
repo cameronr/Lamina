@@ -210,6 +210,7 @@ struct Prefill::Impl {
     SplitOut* out = nullptr;
     std::vector<cudaEvent_t> ev_written, ev_out;
     bool out_live = false;
+    int run_end = -1;   // set_run_end: what out_end is told of a chunk (-1: whether it ends this run() call)
     std::vector<cudaEvent_t> in_ev;
     bool fast_local = false;   // set_fast_link
     // set_pacing: the sections of work queued on its GPU ahead of it (0: as fast as the host goes), an event a section
@@ -311,6 +312,11 @@ void Prefill::set_fast_link(bool on) {
 }
 float* Prefill::residual() const { return impl_->b.R; }
 void Prefill::set_in_events(const cudaEvent_t* ev, int64_t n) { impl_->in_ev.assign(ev, ev + n); }
+void Prefill::set_run_end(bool run_end) { impl_->run_end = run_end ? 1 : 0; }
+cudaEvent_t Prefill::out_done(int64_t k) const {
+    const Impl& m = *impl_;
+    return m.out_live && k >= 0 && (size_t) k < m.ev_out.size() ? m.ev_out[(size_t) k] : nullptr;
+}
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload) {
     const lamina::kernels::QsaShapes s = lamina::kernels::qsa_shapes(g);
@@ -999,7 +1005,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
         if (host_out != nullptr) {
             m.out_live = true;
-            if (!m.out->out_end(tokens + c0, T, p0, m.ev_out.data(), SUB, c0 + T >= n, err)) return false;
+            if (!m.out->out_end(tokens + c0, T, p0, m.ev_out.data(), SUB, m.run_end >= 0 ? m.run_end != 0 : c0 + T >= n,
+                                err))
+                return false;
         }
         if (on_final && L1 == g.n_layers) on_final(b.R, T, p0, m.cs);
         if (drafter != nullptr && !draft_pass(tokens + c0, T, p0)) return false;
