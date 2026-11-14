@@ -1,5 +1,5 @@
-// include/lamina/core/gpu_select.hpp - GPUs named in the options, a short probe that orders and sizes the GPU tiers,
-// and a tier's clocks locked while the engine generates.
+// include/lamina/core/gpu_select.hpp - GPUs named in the options, whether this build's kernels run on one, a short
+// probe that orders and sizes the GPU tiers, and a tier's clocks locked while the engine generates.
 //
 // A device ordinal moves when a card is added: here an RTX 5060 Ti on an M.2 adapter took bus 02 and made the RTX
 // 3090 device 2 instead of 1, and its slot's bus 0F became 10, so a PCI bus id moves too.  A UUID stays with its
@@ -18,9 +18,16 @@ struct GpuInfo {
     std::string bus_id;   ///< "0000:10:00.0"
     std::string uuid;     ///< "GPU-f26e9ba6-34e6-e46a-a700-b8349f7e5456", as nvidia-smi prints it
     int sms = 0;
+    int cc = 0;           ///< compute capability x 10 (86: 8.6)
 };
 /// Every visible device, its ordinal its index.
 std::vector<GpuInfo> list_gpus();
+
+/// "" when the engine can run on `device`, else why not, to follow the GPU's name in a message: a compute capability
+/// below 8.0, no kernels for it in this build (CMAKE_CUDA_ARCHITECTURES), or a driver that cannot load them.  The
+/// last two are asked of the driver, as a launch would load a kernel (CUB's probe), before anything is made on
+/// `device`: it is current after it, with its context, which goes again when the kernels do not run there.
+std::string gpu_unusable(int device);
 
 /// The ordinal `spec` names: an ordinal ("2"), a UUID or a prefix of it that only one card has ("GPU-f26e9ba6"), a PCI
 /// bus id ("10:00.0", "0000:10:00.0", nvidia-smi's "00000000:10:00.0"), or a name or a part of one that only one card

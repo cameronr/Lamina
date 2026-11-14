@@ -1097,13 +1097,24 @@ int qwen35_switch(int argc, char** argv) {
         std::fprintf(stderr, "lamina: --main-gpu %s: %s\n", main_gpu.c_str(), dev < 0 ? why.c_str() : "cannot use it");
         return 2;
     }
+    if (const std::string no = lamina::core::gpu_unusable(dev); !no.empty()) {
+        std::fprintf(stderr, "lamina: --main-gpu %s: GPU %d, %s: %s\n", main_gpu.c_str(), dev,
+                     gpus[(size_t) dev].name.c_str(), no.c_str());
+        return 2;
+    }
     // --second-gpu: the GPUs a layer split may add, in order (names or numbers, comma-separated, a name no visible GPU
-    // answers to left out; auto: every other GPU in CUDA's order; -1: none); the engine takes the fewest that hold the
-    // model
+    // answers to left out; auto: every other GPU in CUDA's order; -1: none), each one this build's kernels do not run
+    // on left out; the engine takes the fewest that hold the model
     std::vector<int> stages{dev};
+    auto usable = [&](int d) {   // (the split's GPUs have their contexts made here, as its sizing would)
+        const std::string no = lamina::core::gpu_unusable(d);
+        if (!no.empty())
+            std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(), no.c_str());
+        return no.empty();
+    };
     if (second == "auto") {
         for (const lamina::core::GpuInfo& gi : gpus)
-            if (gi.ordinal != dev) stages.push_back(gi.ordinal);
+            if (gi.ordinal != dev && usable(gi.ordinal)) stages.push_back(gi.ordinal);
     } else if (!second.empty() && second != "-1") {
         for (size_t at = 0; at <= second.size();) {
             const size_t comma = std::min(second.find(',', at), second.size());
@@ -1116,9 +1127,10 @@ int qwen35_switch(int argc, char** argv) {
                              d < 0 ? why.c_str() : "the split has that GPU already");
                 continue;
             }
-            stages.push_back(d);
+            if (usable(d)) stages.push_back(d);
         }
     }
+    cudaSetDevice(dev);   // current again for the path's first CUDA call
     std::string list, more, flag = "--stage-gpus";
     for (const int d : stages) {
         list += (list.empty() ? "" : ",") + std::to_string(d);
@@ -1407,13 +1419,19 @@ int lamina::program::run(int argc, char** argv) {
                      o.main_gpu < 0 ? gpu_why.c_str() : "cannot use it");
         return 2;
     }
+    if (const std::string no = lamina::core::gpu_unusable(o.main_gpu); !no.empty()) {
+        std::fprintf(stderr, "lamina: --main-gpu %s: GPU %d, %s: %s\n", o.main_gpu_name.c_str(), o.main_gpu,
+                     gpus[(size_t) o.main_gpu].name.c_str(), no.c_str());
+        return 2;
+    }
     {
         const lamina::core::GpuInfo& gi = gpus[(size_t) o.main_gpu];
         std::fprintf(stderr, "lamina: main GPU %d, %s (%s, %s)\n", o.main_gpu, gi.name.c_str(),
                      gi.bus_id.c_str(), gi.uuid.c_str());
     }
     // the GPU tiers: the ones named, a name no visible GPU answers to (a card taken out, a failed driver) left out, or
-    // with "auto" every other GPU, ordered by the probe below
+    // with "auto" every other GPU, ordered by the probe below (and one this build's kernels do not run on left out
+    // once its context is made)
     const bool tier_auto = o.tier_names.size() == 1 && o.tier_names[0] == "auto";
     for (const lamina::core::GpuInfo& gi : gpus)
         if (tier_auto && gi.ordinal != o.main_gpu) o.tier_gpus.push_back(gi.ordinal);
@@ -1439,7 +1457,9 @@ int lamina::program::run(int argc, char** argv) {
         return 2;
     }
     // the GPU tiers' contexts, each made on a thread of its own beside the loads: a first CUDA call took ~2 s here (the
-    // head split's or the tier's, whichever came first).  Joined before either, and on any return.
+    // head split's or the tier's, whichever came first), there asked whether this build's kernels run on each.  Joined
+    // before either, and on any return.
+    std::vector<std::string> tier_unusable(o.tier_gpus.size());
     struct JoinOnExit {
         std::vector<std::thread> t;
         void join() {
@@ -1448,10 +1468,9 @@ int lamina::program::run(int argc, char** argv) {
         }
         ~JoinOnExit() { join(); }
     } second_ctx;
-    for (const int dev : o.tier_gpus)
-        second_ctx.t.emplace_back([dev] {
-            if (cudaSetDevice(dev) == cudaSuccess) (void) cudaFree(nullptr);
-            (void) cudaGetLastError();   // a failure shows where the GPU is first used
+    for (size_t i = 0; i < o.tier_gpus.size(); ++i)
+        second_ctx.t.emplace_back([dev = o.tier_gpus[i], &no = tier_unusable[i]] {
+            no = lamina::core::gpu_unusable(dev);
         });
     lamina::core::qsa_set_kv_format(o.kv == "int8"   ? lamina::core::KvFormat::Int8
                                     : o.kv == "k8v4" ? lamina::core::KvFormat::K8V4
@@ -1979,6 +1998,23 @@ int lamina::program::run(int argc, char** argv) {
             return 1;
         }
         mtp.set_max_drafts(o.spec - 1);
+    }
+    // a GPU tier this build's kernels do not run on is left out
+    if (!o.tier_gpus.empty()) {
+        second_ctx.join();
+        std::vector<int> usable;
+        for (size_t i = 0; i < o.tier_gpus.size(); ++i) {
+            const int d = o.tier_gpus[i];
+            if (tier_unusable[i].empty()) usable.push_back(d);
+            else std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(),
+                              tier_unusable[i].c_str());
+        }
+        o.tier_gpus = usable;
+        o.second_gpu = usable.empty() ? -1 : usable[0];
+        if (o.second_gpu < 0 && o.second_gpu_pin_gib > 0) {
+            std::fprintf(stderr, "lamina: --second-gpu-pin-gib needs a GPU tier, and none is left\n");
+            return 2;
+        }
     }
     // The GPU tiers' links measured, and whether the desktop uses each, while no load reads the RAM: "auto" puts the
     // fastest first (host-to-device rate x multiprocessors) and keeps the first kMaxGpuTiers; a reserve or a prefetch

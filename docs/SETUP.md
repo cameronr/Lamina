@@ -146,6 +146,11 @@ prompts. The others help generation, where an expert crosses the link once and s
 or x4 slot) still pays as a later tier. Such a tier gets only short pieces of work, and a driver may lower its clocks
 between them until its results come late: `--second-gpu-clocks` (below) locks them while the engine generates.
 
+**Each GPU is checked** before the engine uses it: one older than the RTX 30 series (compute capability below 8.0), or
+one the programs have no kernels for, stops the start as the main GPU and is left out as a tier or a layer split's GPU,
+the log saying why. Setup builds for this PC's GPUs: after a card is added, run it again. The releases' programs run on
+the RTX 30, 40 and 50 series.
+
 ## Engine options
 
 The example configs' options, and the ones that pay on some PCs. `build/lamina --help` lists every one.

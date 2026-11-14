@@ -197,8 +197,12 @@ if(LAMINA_ENABLE_CUDA)
   add_library(lamina_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/prompt_cache.cpp src/core/adaptive_tier.cpp src/core/second_gpu.cpp src/core/arena_place.cpp
-    src/core/split_head.cpp src/core/vmm.cpp src/core/gpu_select.cpp src/core/pack_image.cpp
+    src/core/split_head.cpp src/core/vmm.cpp src/core/gpu_select.cpp src/core/gpu_usable.cu src/core/pack_image.cpp
     src/core/control_vector.cpp)
+  # the architectures a GPU the build has no kernels for is told of (a definition's value cannot hold a ';')
+  string(REPLACE ";" "," _lamina_archs "${CMAKE_CUDA_ARCHITECTURES}")
+  set_source_files_properties(src/core/gpu_usable.cu PROPERTIES
+                              COMPILE_DEFINITIONS "LAMINA_CUDA_ARCHS=\"${_lamina_archs}\"")
   target_include_directories(lamina_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(lamina_engine PUBLIC lamina_core lamina_kernels lamina_kernels_cpu CUDA::cudart ${CMAKE_DL_LIBS})
 

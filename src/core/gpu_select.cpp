@@ -49,6 +49,7 @@ GpuInfo info_of(int ordinal) {
     }
     g.name = p.name;
     g.sms = p.multiProcessorCount;
+    g.cc = p.major * 10 + p.minor;
     char buf[64];
     std::snprintf(buf, sizeof buf, "%04x:%02x:%02x.0", (unsigned) p.pciDomainID, (unsigned) p.pciBusID,
                   (unsigned) p.pciDeviceID);
@@ -148,6 +149,16 @@ int find_gpu(const std::vector<GpuInfo>& gpus, const std::string& spec_in, std::
     const std::string spec = trimmed(spec_in), ls = lower(spec);
     if (spec.empty()) {
         why = "no GPU named";
+        return -1;
+    }
+    if (gpus.empty()) {   // CUDA's reason: no driver, one too old for this build's CUDA runtime, none visible
+        int n = 0;
+        const cudaError_t e = cudaGetDeviceCount(&n);
+        (void) cudaGetLastError();
+        why = "no CUDA device is visible";
+        if (e != cudaSuccess) why += std::string(" (") + cudaGetErrorString(e) + ")";
+        if (e == cudaErrorInsufficientDriver)
+            why += ": install an NVIDIA driver for CUDA " + std::to_string(CUDART_VERSION / 1000) + " or newer";
         return -1;
     }
     std::vector<const GpuInfo*> hits;

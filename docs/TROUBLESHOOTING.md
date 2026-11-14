@@ -38,6 +38,16 @@ runs (the README's table). Close other programs, or use IQ3_S, which takes ~28 G
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.
 
+**"this build has no kernels for its compute capability, ...".** The engine was built for other GPUs: a card added
+after setup, or a release's programs on a card other than the RTX 30, 40 and 50 series. Run setup again: it builds for
+this PC's GPUs. As the main GPU, such a card stops the start; as a tier it is left out.
+
+**"its compute capability is ..., and Lamina needs 8.0 or newer".** The card is older than the RTX 30 series: name
+another as `--main-gpu`.
+
+**"no CUDA device is visible (CUDA driver version is insufficient for CUDA runtime version)".** The NVIDIA driver is
+older than the CUDA runtime the programs come with: install a driver for CUDA 13 or newer.
+
 **"Windows blocked ... Smart App Control".** Smart App Control on Windows 11 refuses programs that are not signed, and
 the engine and the image encoder are built on this PC. Turn it off (Windows Security > App & browser control > Smart
 App Control settings), or, if only the image encoder is blocked, run setup with `--vision off`.
