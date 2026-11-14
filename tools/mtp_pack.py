@@ -15,7 +15,8 @@ Layout: dense tensors (attention, indexer, hyper-connections, shared expert, rou
             model's experts, so Lamina's CPU VNNI kernel and GPU hit kernel serve it unchanged. ~0.71 GB.
     iq4_nl  ggml's quantizer without an importance matrix (relative RMS error ~0.078). ~1.42 GB.
     q8_0    ggml reference (~0.006). ~2.67 GB.
-    iq4_nl and q8_0 run through the main model's native expert kernels (tools/mtp_rt.py writes them as GGUF blocks).
+    iq4_nl and q8_0 run through the main model's native expert kernels.  tools/mtp_rt.py writes the engine's file
+    of the layer from this one.
 
 This is round-to-nearest, not GSQ: the plan picks the expert format by MEASURED draft acceptance (P0.3/P6), not
 by this file's reconstruction error, which is reported per tensor only as a sanity check. No model runs here.

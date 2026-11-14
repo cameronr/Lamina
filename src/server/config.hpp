@@ -23,11 +23,13 @@ json read_config(const std::string& path);
 void split_joined_args(json& cfg);
 /// #1641: "--reasoning-effort X" in the args is the config's reasoning_effort, not an engine option (said once)
 void lift_reasoning_effort_arg(json& cfg);
-/// Qwen3.8-Flash-Next (`arch` "qwen4exp") without its draft layer, which no GGUF holds: the args name none (--mtp DIR),
-/// or a folder without the layer's files, which is taken out of them, so the engine starts and generates without
-/// drafts. The warning for the server's window, with where the layer comes from; empty when the layer is there or the
-/// model is another (Qwen3.6-35B-A3B and Qwen3.8-27B draft with their files' own MTP block)
-std::string draft_layer_warning(json& cfg, const std::string& arch);
+/// Qwen3.8-Flash-Next's draft layer (`arch` "qwen4exp"), which no model file holds: args that name none (--mtp FILE)
+/// take kDraftLayerFile (artifact/draft_layer.hpp) beside the model, else beside the program; a named file that is not
+/// there, or a folder without the earlier layout's files, is taken out of them: the engine starts and generates without
+/// drafts.  The line for the server's window: the file found, or the warning with the download's command; empty when
+/// the args name a file or a folder of the earlier layout that is there, or the model is another (Qwen3.6-35B-A3B and
+/// Qwen3.8-27B draft with their files' own MTP block)
+std::string resolve_draft_layer(json& cfg, const std::string& arch);
 /// the config's "gpu": one card, or several ([0, 2] or "0,2"), numbered as nvidia-smi numbers them
 std::vector<int> gpu_list(const json& cfg);
 struct GpuInfo {

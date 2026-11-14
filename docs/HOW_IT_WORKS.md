@@ -88,8 +88,9 @@ takes far less time than as many passes over one: the weights are read once for 
   to 3 tokens, each kept while its probability under the draft layer stays at 0.5 or more (`--spec-min-p 0.5`). Its
   experts are 2-bit, it attends to the last 32,768 tokens, and its head covers a fixed subset of 40,525 tokens of the
   vocabulary (it never drafts the others), scored through a 2-bit copy and the best ones again exactly. Its dense part
-  was trained further on this engine's own output, so its drafts are right more often
-  ([eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP)).
+  was trained further on this engine's own output, so its drafts are right more often. It is one GGUF file of its own
+  ([eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP)): no
+  model file holds it, and the server takes it from beside the model.
 - **A sampled request's drafts**: a position's token is drawn with a number that follows from the seed and the
   position alone, so the engine knows the number a draft will meet. The draft is still the layer's likeliest token,
   which passes when the model's likeliest token is the same and the number falls inside its share of the

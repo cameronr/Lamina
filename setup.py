@@ -63,7 +63,7 @@ REPOS = {
     "unsloth_ud30": ("unsloth/Qwen3.8-Flash-Next-GGUF", "38bb39ee97821de2c9009abb7e93950eec396e66"),
     "qwen36": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d"),
     "qwen38_27b": ("unsloth/Qwen3.8-27B-GGUF", "4ca720788d1e01f1bff70c033e0d0028fd02e502"),
-    "draft": ("eddoursul/Lamina-Qwen3.8-Flash-Next-MTP", "ff2f70927caafe90ebd1f2ea1c08a9e014a65ce4"),
+    "draft": ("eddoursul/Lamina-Qwen3.8-Flash-Next-MTP", "e0d95e4236a43f3e02153c290211b74ba17a6f90"),
 }
 
 
@@ -119,15 +119,9 @@ QWEN38_27B_MMPROJ = File("qwen38_27b", "mmproj-F16.gguf", "models/qwen38-27b-UD-
 # BF16 one: ISTA-DASLab's mmproj-Qwen3.8-Flash-Next-BF16.gguf through tools/mmproj_q8.py, published with the draft layer
 FLASH_MMPROJ = File("draft", "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "models/mmproj/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
                     616703328, "2486a2e7bd834a0494fd1f5b324f66b78f7836cb0c6644b090be7ed1c58527c3")
-# The MTP draft layer of both Flash-Next quants (the repository's README describes it)
-DRAFT = [
-    File("draft", name, f"mtp/rt-distilled/{name}", size, sha)
-    for name, size, sha in (
-        ("experts.bin", 707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
-        ("dense.bin", 116099072, "a46561c5d3e76e78eebb9b54bbf4ae87ba1f99a62cad85562cbb516141cd5e47"),
-        ("dense.txt", 1880, "8773c81ebb0986e37fe94a8a9933e87be48b1fabc6889a0106bcdab179d1c2ac"),
-        ("draft_vocab.bin", 162100, "369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"))
-]
+# The MTP draft layer of every Flash-Next quant, one GGUF (the repository's README describes it)
+DRAFT = File("draft", "Lamina-Qwen3.8-Flash-Next-MTP.gguf", "mtp/Lamina-Qwen3.8-Flash-Next-MTP.gguf",
+             824052896, "eeaa94d4cd1e51f5b548aacbb72f8a0f6989cc11c62923b5cece11b33712c7db")
 
 
 @dataclass(frozen=True)
@@ -689,8 +683,7 @@ def prepare(key: str, m: Model, data: Path, vision: bool):
     in Q8_0). The engine computes its float tensors' forms from the GGUF at load, and the server reads the tokenizer
     and the chat template from it."""
     if m.flash_next:
-        for f in DRAFT:
-            fetch(f, data)
+        fetch(DRAFT, data)
         if vision:
             fetch(FLASH_MMPROJ, data)
     elif vision and m.mmproj:
@@ -843,7 +836,7 @@ def main() -> int:
         if m.vram_gb and sum(g.mem_mib for g in usable) < m.vram_gb * 1024:
             warn(f"its layers need ~{m.vram_gb} GB of VRAM over every GPU, and these have "
                  f"{sum(g.mem_mib for g in usable) / 1024:.0f} GB: a shorter --context, or another GPU")
-        files = model_files(m, data) + (DRAFT if m.flash_next else [])
+        files = model_files(m, data) + ([DRAFT] if m.flash_next else [])
         need = sum(f.size for f in files)
         missing = sum(f.size for f in files if not (data / f.dest).exists())
         say(f"  {need / 1e9:.0f} GB of files in {data}: {missing / 1e9:.0f} GB to download, {free_gb(data):.0f} GB free")

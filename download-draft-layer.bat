@@ -1,40 +1,62 @@
 @echo off
-rem Lamina's draft layer for Qwen3.8-Flash-Next (the engine's --mtp folder): four files, 0.8 GB, from
-rem https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP at a pinned revision, each checked by its SHA-256.
+rem Lamina's draft layer for Qwen3.8-Flash-Next, one file of 0.8 GB, from
+rem https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP at a pinned revision, checked by its SHA-256.
 rem
-rem   download-draft-layer.bat FOLDER      then in the config's "args":  "--mtp", "FOLDER"
+rem   download-draft-layer.bat FOLDER
 rem
-rem A download that broke off goes on from where it stopped. HF_ENDPOINT names a mirror. It needs curl.exe and
-rem certutil.exe, which Windows 10 (1803) and newer have.
+rem lamina-server takes the file from beside the model or beside the program; elsewhere name it in the config's
+rem "args": "--mtp", "FOLDER\Lamina-Qwen3.8-Flash-Next-MTP.gguf". A download that broke off goes on from where it
+rem stopped. HF_ENDPOINT names a mirror. It needs curl.exe and certutil.exe, which Windows 10 (1803) and newer have.
 setlocal
+set "NAME=Lamina-Qwen3.8-Flash-Next-MTP.gguf"
 if "%~1"=="" goto usage
 if not "%~2"=="" goto usage
 set "DEST=%~f1"
-set "REV=ff2f70927caafe90ebd1f2ea1c08a9e014a65ce4"
+set "REV=e0d95e4236a43f3e02153c290211b74ba17a6f90"
+set "SHA=eeaa94d4cd1e51f5b548aacbb72f8a0f6989cc11c62923b5cece11b33712c7db"
 set "BASE=https://huggingface.co"
 if defined HF_ENDPOINT set "BASE=%HF_ENDPOINT%"
-set "URL=%BASE%/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP/resolve/%REV%"
+set "URL=%BASE%/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP/resolve/%REV%/%NAME%"
 where curl >nul 2>nul
 if errorlevel 1 goto nocurl
 if not exist "%DEST%\" mkdir "%DEST%"
 if not exist "%DEST%\" goto nofolder
-call :get dense.txt 8773c81ebb0986e37fe94a8a9933e87be48b1fabc6889a0106bcdab179d1c2ac
+set "FILE=%DEST%\%NAME%"
+if not exist "%FILE%" goto part
+call :sha "%FILE%"
+if /i "%HASH%"=="%SHA%" goto there
+echo "%FILE%" is not the file expected (its SHA-256 differs): move it away and run this again
+exit /b 1
+:there
+echo %NAME%: there already, checked
+goto done
+:part
+if not exist "%FILE%.part" goto fetch
+call :sha "%FILE%.part"
+if /i "%HASH%"=="%SHA%" goto keep
+:fetch
+echo %NAME% ...
+curl -L --fail --retry 5 --retry-delay 5 -C - -o "%FILE%.part" "%URL%"
+if errorlevel 1 goto failed
+call :sha "%FILE%.part"
+if /i "%HASH%"=="%SHA%" goto keep
+echo the download is not the file expected (its SHA-256 differs): delete "%FILE%.part" and run this again
+exit /b 1
+:keep
+move /y "%FILE%.part" "%FILE%" >nul
 if errorlevel 1 exit /b 1
-call :get draft_vocab.bin 369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25
-if errorlevel 1 exit /b 1
-call :get dense.bin a46561c5d3e76e78eebb9b54bbf4ae87ba1f99a62cad85562cbb516141cd5e47
-if errorlevel 1 exit /b 1
-call :get experts.bin 09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f
-if errorlevel 1 exit /b 1
+echo %NAME%: downloaded, checked
+:done
 echo.
-echo The draft layer is in "%DEST%"
-echo Name the folder in the config's "args":  "--mtp", "%DEST:\=/%"
+echo The draft layer is "%FILE%"
+echo lamina-server takes it from beside the model or the program; elsewhere name it in the config's "args":
+echo   "--mtp", "%FILE:\=/%"
 exit /b 0
 
 :usage
 echo usage: %~nx0 FOLDER
-echo Downloads Lamina's draft layer for Qwen3.8-Flash-Next (0.8 GB) into FOLDER; then name the folder in the
-echo config's "args":  "--mtp", "FOLDER"
+echo Downloads Lamina's draft layer for Qwen3.8-Flash-Next (%NAME%, 0.8 GB) into FOLDER: the model's
+echo folder, where lamina-server finds it
 exit /b 2
 
 :nocurl
@@ -45,36 +67,8 @@ exit /b 1
 echo the folder "%DEST%" could not be made
 exit /b 1
 
-:get
-rem %1: the file's name, %2: its SHA-256
-set "FILE=%DEST%\%1"
-if not exist "%FILE%" goto part
-call :sha "%FILE%"
-if /i "%HASH%"=="%2" goto there
-echo "%FILE%" is not the file expected (its SHA-256 differs): move it away and run this again
-exit /b 1
-:there
-echo %1: there already, checked
-exit /b 0
-:part
-if not exist "%FILE%.part" goto fetch
-call :sha "%FILE%.part"
-if /i "%HASH%"=="%2" goto keep
-:fetch
-echo %1 ...
-curl -L --fail --retry 5 --retry-delay 5 -C - -o "%FILE%.part" "%URL%/%1"
-if errorlevel 1 goto failed
-call :sha "%FILE%.part"
-if /i "%HASH%"=="%2" goto keep
-echo %1: the download is not the file expected (its SHA-256 differs): delete "%FILE%.part" and run this again
-exit /b 1
-:keep
-move /y "%FILE%.part" "%FILE%" >nul
-if errorlevel 1 exit /b 1
-echo %1: downloaded, checked
-exit /b 0
 :failed
-echo %1: the download failed. Run this again to go on from where it stopped; if it fails the same way, delete
+echo the download failed. Run this again to go on from where it stopped; if it fails the same way, delete
 echo "%FILE%.part" first
 exit /b 1
 

@@ -56,7 +56,7 @@ result is already there is skipped, so setup runs again after an interruption or
    [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF),
    [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) and
    [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). `HF_ENDPOINT` names a mirror.
-4. Their preparation, for Flash-Next only: the MTP draft layer, `mtp/rt-distilled`, from
+4. Their preparation, for Flash-Next only: the MTP draft layer, `mtp/Lamina-Qwen3.8-Flash-Next-MTP.gguf`, from
    [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP); with
    pictures, from the same repository the image projector in Q8_0 (ISTA-DASLab's BF16 one through `tools/mmproj_q8.py`),
    which the CPU encodes ~20% faster.
@@ -68,12 +68,17 @@ result is already there is skipped, so setup runs again after an interruption or
    lacks (an `api_key`, an `images` section).
 
 **The draft layer without setup.** `download-draft-layer.bat FOLDER` (`./download-draft-layer.sh FOLDER` on Linux; a
-release's archive has its platform's script beside the programs) downloads step 4's four files into a folder,
-at the same revision, each checked by its SHA-256 and a broken download resumed; a config takes them with `"--mtp",
-"FOLDER"` in its `args`. Flash-Next's server starts without the layer too, when the `args` name none or a folder
-without its files, and warns in its window with the script's command. It then generates a token a verify window,
-or prompt lookup's drafts (`--spec-lookup`). On the development PC, new text came at 44-61% of IQ3_S's speed with
-the layer and 50-68% of UD-Q4_K_XL's, an edit that quotes its prompt at 92-96%.
+release's archive has its platform's script beside the programs) downloads step 4's file into a folder, at the same
+revision, checked by its SHA-256 and a broken download resumed. A config whose `args` name no `--mtp` takes
+`Lamina-Qwen3.8-Flash-Next-MTP.gguf` from beside the model, else from beside the server, and the server's window says
+which; elsewhere the `args` name it: `"--mtp", "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"`. A folder of the
+layer's earlier layout (`dense.txt`, `dense.bin`, `experts.bin`, `draft_vocab.bin`), as earlier setups downloaded it to
+`mtp/rt-distilled`, still works as `--mtp`. Flash-Next's server starts without the layer too, when none is found or
+the named file or folder is not there, and warns in its window with the script's command. It then generates a token a
+verify window, or prompt lookup's drafts (`--spec-lookup`). On the development PC, new text came at 44-61% of IQ3_S's
+speed with the layer and 50-68% of UD-Q4_K_XL's, an edit that quotes its prompt at 92-96%. The layer's file holds its
+draft vocabulary, the 40,525 tokens it proposes from; `tools/mtp_rt.py --gguf <the file> --draft-vocab <ids> --out
+<new file>` writes one over another (`data/draft_vocab_fr.bin`, `draft_vocab_cyrillic.bin`, `tools/draft_vocab.py`).
 
 **A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 5 MB instead of the CUDA build's
 ~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone, with `third_party/llama.cpp` in place

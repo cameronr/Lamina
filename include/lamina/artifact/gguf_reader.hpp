@@ -101,6 +101,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "IQ4_XS";
     case 24:
         return "I8";
+    case 26:
+        return "I32";
     case 30:
         return "BF16";
     case 34:
@@ -235,6 +237,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
         elems = 1;
         bytes = 1;
+        return true;
+    case 26:   // I32: the draft layer's draft_vocab (tools/mtp_rt.py)
+        elems = 1;
+        bytes = 4;
         return true;
     case 28:   // F64
         elems = 1;

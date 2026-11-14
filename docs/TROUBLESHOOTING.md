@@ -58,11 +58,16 @@ the server is a CPU-only build and the config's `vision` section asks for a GPU 
 in this PC (moved, replaced, or a config from another PC), or is not a UUID or number CUDA takes, or the driver gives
 no GPU. `nvidia-smi -L` lists the cards with their UUIDs: name one there, or set `"gpu"` to `false`.
 
-**"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's config names no draft layer (`"--mtp", "<folder>"` in its
-`args`), or a folder without the layer's files. The server runs, and the model writes new text at roughly half to two
-thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`, `./download-draft-layer.sh FOLDER`
-on Linux: 0.8 GB), name the folder in the config's `args` if they name none, and start the server again
+**"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's draft layer, `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, is
+neither beside the model nor beside the server, or the config's `args` name a file that is not there (`"--mtp",
+"<file>"`), or a folder without the files of the layer's earlier layout (`dense.txt`, `dense.bin`, `experts.bin`). The
+server runs, and the model writes new text at
+roughly half to two thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`,
+`./download-draft-layer.sh FOLDER` on Linux: 0.8 GB), do what it adds about the config, and start the server again
 ([SETUP.md](SETUP.md#setup), The draft layer without setup).
+
+**"mtp: ... is not a draft layer this engine reads".** The file `--mtp` names is another GGUF (a model, a projector) or
+the draft layer of another format: download the layer again with the script.
 
 **"this build has no kernels for its compute capability, ...".** The engine was built for other GPUs: a card added
 after setup, or a release's programs on a card other than the RTX 30, 40 and 50 series. Run setup again: it builds for

@@ -65,20 +65,24 @@ Details: [docs/SETUP.md](docs/SETUP.md).
 
 ### The draft layer
 
-Qwen3.8-Flash-Next needs one thing no model file holds: Lamina's draft layer, four files of 0.8 GB together in
+Qwen3.8-Flash-Next needs one thing no model file holds: Lamina's draft layer, one file of 0.8 GB,
+`Lamina-Qwen3.8-Flash-Next-MTP.gguf`, in
 [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP). Setup
 downloads it. Whoever installs Lamina another way, a person or an agent, with a config of their own or a model file
-setup does not know, should download it too:
+setup does not know, should download it too, into the model's folder:
 
 ```
-download-draft-layer.bat FOLDER      (Windows)
-./download-draft-layer.sh FOLDER     (Linux)
+download-draft-layer.bat MODEL_FOLDER      (Windows)
+./download-draft-layer.sh MODEL_FOLDER     (Linux)
 ```
 
-and name the folder in the config's `args`: `"--mtp", "FOLDER"`. The scripts check each file's SHA-256 and go on with
-a download that broke off. Without the layer the server still starts and says so in its window, with this command:
-the model then writes new text at roughly half to two thirds of its speed, and an edit that quotes its prompt loses
-under a tenth. Qwen3.6-35B-A3B and Qwen3.8-27B draft with their own files' layer and need nothing more.
+The server takes the file from beside the model, or from beside the server, when the config's `args` name no
+`--mtp`; elsewhere name it there: `"--mtp", "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"` (a folder of the layer's
+earlier layout of four files, as earlier setups downloaded it, still works there too). The scripts check the
+file's SHA-256 and go on with a download that broke off. Without the layer the server still starts and says so in its
+window, with this command: the model then writes new text at roughly half to two thirds of its speed, and an edit
+that quotes its prompt loses under a tenth. Qwen3.6-35B-A3B and Qwen3.8-27B draft with their own files' layer and need
+nothing more.
 
 ## Run
 

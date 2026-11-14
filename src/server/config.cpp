@@ -1,7 +1,7 @@
 // src/server/config.cpp - the run config as the server reads it (config.hpp).
 #include "config.hpp"
 
-#include "lamina/program/engine.hpp"
+#include "lamina/artifact/draft_layer.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -135,43 +135,65 @@ std::string draft_layer_script(const json& cfg) {
     const std::filesystem::path self = u8_path(self_dir());
     std::error_code ec;
     for (const std::filesystem::path& dir : {self, std::filesystem::absolute(u8_path(here_path(cfg, ".")), ec), self.parent_path()}) {
-        const std::filesystem::path script = dir / program::kDraftLayerScript;
+        const std::filesystem::path script = dir / kDraftLayerScript;
         if (std::filesystem::is_regular_file(script, ec)) return shell_word(u8_str(script.lexically_normal()));
     }
 #ifdef _WIN32
-    return program::kDraftLayerScript;
+    return kDraftLayerScript;
 #else
-    return std::string("./") + program::kDraftLayerScript;
+    return std::string("./") + kDraftLayerScript;
 #endif
 }
 
 }  // namespace
 
-std::string draft_layer_warning(json& cfg, const std::string& arch) {
+std::string resolve_draft_layer(json& cfg, const std::string& arch) {
     if (arch != "qwen4exp" || !jget(cfg, "args").is_array()) return "";
+    namespace fs = std::filesystem;
     json& args = cfg["args"];
-    std::string why = "the config's \"args\" name none", folder;
+    std::error_code ec;
+    const fs::path model_dir = fs::absolute(u8_path(model_file(cfg)), ec).parent_path().lexically_normal();
+    // the warning's parts: why, the folder the download goes to, what the config needs then
+    std::string why, into = shell_word(u8_str(model_dir)), then = ": the server takes it from beside the model";
+    bool named = false;
     for (size_t i = 0; i + 1 < args.size(); ++i) {
         if (args[i] != "--mtp") continue;
-        const std::string dir = arg_str(args[i + 1]);
-        std::error_code ec;
-        const std::filesystem::path at = std::filesystem::absolute(u8_path(here_path(cfg, dir)), ec).lexically_normal();
-        std::string gone;
-        for (const char* f : {"dense.txt", "dense.bin", "experts.bin"})   // what MtpDrafter::load cannot do without
-            if (!std::filesystem::is_regular_file(at / f, ec)) gone += (gone.empty() ? "" : ", ") + std::string(f);
-        if (gone.empty()) return "";
-        why = "--mtp " + dir + " has no " + gone;
-        folder = shell_word(u8_str(at));
-        args.erase(i);   // the engine stops at a folder it cannot load
+        const std::string name = arg_str(args[i + 1]);
+        const fs::path at = fs::absolute(u8_path(here_path(cfg, name)), ec).lexically_normal();
+        if (fs::is_regular_file(at, ec)) return "";   // the engine reads it (and refuses a file of another layout)
+        const bool folder = fs::is_directory(at, ec);
+        std::string gone;   // a folder of the earlier layout: what the engine cannot do without
+        for (const char* f : {"dense.txt", "dense.bin", "experts.bin"})
+            if (folder && !fs::is_regular_file(at / f, ec)) gone += (gone.empty() ? "" : ", ") + std::string(f);
+        if (folder && gone.empty()) return "";
+        named = true;
+        why = "--mtp " + name + (folder ? " is a folder without " + gone + " (the layer's earlier layout)" : " is not there");
+        if (!folder && at.filename() == kDraftLayerFile) {   // download it where the config names it
+            into = shell_word(u8_str(at.parent_path()));
+            then.clear();
+        } else {
+            then = ",\n         then take \"--mtp\", \"" + name + "\" out of the config's \"args\": the server takes the file "
+                   "from beside the model";
+        }
+        args.erase(i);   // the engine stops at a file it cannot read
         args.erase(i);
         break;
     }
-    const std::string head = "[lamina] WARNING: no draft layer (" + why + "): generation runs without its drafts, a "
-                             "verify window a token, and is slower.\n         Download it (0.8 GB) ";
-    const std::string from = std::string("  (or from\n         ") + program::kDraftLayerUrl + ")";
-    if (!folder.empty()) return head + "into that folder with  " + draft_layer_script(cfg) + " " + folder + from;
-    return head + "with  " + draft_layer_script(cfg) + " FOLDER" + from + ", then name the folder in the\n"
-           "         config's \"args\": \"--mtp\", \"FOLDER\"";
+    if (!named) {   // none named: the layer's file beside the model, else beside the program
+        for (const fs::path& dir : {model_dir, u8_path(self_dir())}) {
+            const fs::path at = (dir / kDraftLayerFile).lexically_normal();
+            if (fs::is_regular_file(at, ec)) {
+                args.push_back("--mtp");
+                args.push_back(u8_str(at));
+                return "[lamina] draft layer: " + u8_str(at);
+            }
+        }
+        why = std::string("no ") + kDraftLayerFile + " beside the model or the program, and the config's \"args\" name no "
+              "--mtp";
+    }
+    return "[lamina] WARNING: no draft layer (" + why + "): generation runs without its drafts, a verify window a "
+           "token, and is slower.\n         Download it (0.8 GB) with  " + draft_layer_script(cfg) + " " + into +
+           "  (or from\n         " + kDraftLayerUrl + ")" + then;
 }
 
 std::vector<int> gpu_list(const json& cfg) {

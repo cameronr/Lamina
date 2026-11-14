@@ -5,6 +5,7 @@
 
 #include "lamina/artifact/gguf_split.hpp"
 #if defined(LAMINA_HAVE_QWEN35)
+#include "lamina/artifact/draft_layer.hpp"
 #include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/qwen35/engine.hpp"
 #endif
@@ -167,7 +168,7 @@ struct Options {
     double temperature = 0.0, top_p = 1.0, min_p = 0.0;
     int top_k = 20;
     unsigned long long seed = 0;
-    /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
+    /// Plan v0.3 P6: the MTP draft layer's file (artifact/draft_layer.hpp, tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// the CUDA device (of the visible ones) the engine runs on: --main-gpu names it as find_gpu (gpu_select.hpp) reads
@@ -389,9 +390,10 @@ void usage() {
                  "                       --spec allows the draft layer (windows of up to 8 tokens; 0 = off)\n"
                  "  --spec-split         a window's tokens in two groups, the GPU's work on one beside the CPU's on\n"
                  "                       the other (exact, ~7%% slower: a measurement arm)\n"
-                 "  --mtp DIR            the MTP draft layer's runtime files (download-draft-layer.bat / .sh, or\n"
-                 "                       tools/mtp_rt.py); --serve without it: one token a window, or prompt\n"
-                 "                       lookup's drafts. Qwen3.6-35B-A3B and\n"
+                 "  --mtp FILE           the MTP draft layer, Lamina-Qwen3.8-Flash-Next-MTP.gguf (download-draft-layer\n"
+                 "                       .bat / .sh; tools/mtp_rt.py writes one), or a folder of its earlier layout;\n"
+                 "                       --serve without it: one token a window, or prompt lookup's drafts.\n"
+                 "                       Qwen3.6-35B-A3B and\n"
                  "                       Qwen3.8-27B: --mtp N, at most N drafts of the file's own MTP block a step\n"
                  "                       (--spec-min-p as above), --draft-vocab N its head over the first N ids\n"
                  "  --mtp-window N       the draft layer attends to the last N cells (default 32768; 0 = every cell)\n"
@@ -2249,8 +2251,8 @@ int lamina::program::run(int argc, char** argv) {
         }
         mtp.set_max_drafts(o.spec - 1);
     } else if (o.serve) {
-        // the server says the same in its window (check_draft_layer: this line goes to the engine's log there)
-        std::fprintf(stderr, "lamina: WARNING: no draft layer (--mtp FOLDER): every verify window holds one token, or "
+        // the server says the same in its window (resolve_draft_layer: this line goes to the engine's log there)
+        std::fprintf(stderr, "lamina: WARNING: no draft layer (--mtp FILE): every verify window holds one token, or "
                              "prompt lookup's drafts (--spec-lookup), and generation is slower. Download it with  %s "
                              "FOLDER  (or from %s)\n", kDraftLayerScript, kDraftLayerUrl);
     }
@@ -3237,7 +3239,7 @@ int lamina::program::run(int argc, char** argv) {
         // lookup's drafts: the same tokens, a window each
         const bool use_mtp = !o.mtp.empty();
         if (!use_mtp && !o.dump_draft_data.empty()) {
-            std::fprintf(stderr, "lamina serve: --dump-draft-data needs the draft layer (--mtp DIR)\n");
+            std::fprintf(stderr, "lamina serve: --dump-draft-data needs the draft layer (--mtp FILE)\n");
             return 2;
         }
         lamina::prefill::Prefill prefill;

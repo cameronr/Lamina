@@ -19,7 +19,7 @@
     "--adapt-every",
     "1",
     "--mtp",
-    "../Lamina-data/mtp/rt-distilled",
+    "../Lamina-data/mtp/Lamina-Qwen3.8-Flash-Next-MTP.gguf",
     "--max-context",
     "262144",
     "--kv",
