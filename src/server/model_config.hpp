@@ -51,8 +51,8 @@ struct ModelOptions {
     std::string model;               ///< -m: any shard of the model
     std::string mmproj;              ///< --mmproj ("": the projector beside the model, if any)
     bool no_mmproj = false;          ///< --no-mmproj
-    std::string written;             ///< --write-config's file: the log and the learned profile go beside it (beside
-                                     ///< the program without it)
+    std::string written;             ///< the config file that describes the run (--write-config's, else --config's):
+                                     ///< the log and the learned profile go beside it, else beside the program
     std::vector<int> allowed_gpus;   ///< --gpu: the cards the engine sees
 };
 /// A config built from a model, and what the server's window says about it

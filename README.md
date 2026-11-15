@@ -102,9 +102,10 @@ run-iq3_s.bat                    (setup's launcher; ./run-iq3_s.sh on Linux)
 `-m` takes a model file the engine runs, a split one by any of its shards. The server builds its config from the
 preset for it (the file's header picks one of [`examples/*.json`](examples/README.md), built into the server), this
 PC's GPUs and the files beside the model, and its window says what it took. `--check` says beforehand what the model
-needs against what this PC has, and loads nothing. An engine option on the command line takes the place of the
-preset's (`--max-context 65536`), and `--write-config FILE` writes the config for `lamina-server --config FILE`:
-[docs/SETUP.md](docs/SETUP.md#a-model-file-without-setup).
+needs against what this PC has, and loads nothing. Every key of a config is an option too (`lamina-server --help`),
+whose value takes the place of the file's and the preset's (`--port 8090 --temperature 0.6`); an engine option there
+takes the place of the preset's (`--max-context 65536`); `--write-config FILE` writes the config for
+`lamina-server --config FILE`: [docs/SETUP.md](docs/SETUP.md#a-model-file-without-setup).
 
 The model loads in a minute or so. Then, on the preset's port (the window's `ready` line names it: 8081 for
 ISTA-DASLab's Flash-Next files, 8082 for the family's others, 8083 for Qwen3.6-35B-A3B, 8084 for Qwen3.8-27B):

@@ -125,14 +125,19 @@ The server builds the config setup would write for the file and says in its wind
 - **What a run writes**, beside the server: the engine's log (`<model>.log`) and what the run learned about the
   experts (`<model>-learned.bin`, [below](#the-config)), which the next start begins from.
 
-An engine option on the command line, with the values after it, takes the place of the preset's:
-`lamina-server -m MODEL.gguf --max-context 65536 --kv q4_0`. It works the same with `--config`. The engine's own parser
-reads those options first, for the model's family, and the server stops on one it does not take ("unknown argument:
-...", a value out of range); `--native`, `--serve` and `--vision` are the server's to set. The server's options
-(`--port`, `--host`, `--api-key`, ...) work as with a config.
+Every key of a config is an option of the command line too ([USING.md](USING.md#the-config)), and a value given there
+takes the place of the config file's, the file's that of the preset: `lamina-server -m MODEL.gguf --port 8090
+--temperature 0.6`. A config file can be as short as `{"model": "D:/Models/x.gguf", "port": 8090}`: without `"args"`
+the server builds the rest from the model's preset, as with `-m`, and the file's keys take the place of the preset's;
+a config with `"args"` stays as it is, `-m` or its `"model"` then naming the file in place of their `--native`. What a
+run writes (the log, the learned profile) goes beside that config file. An engine option on the command line, with the
+values after it, takes the place of the preset's or the config's: `lamina-server -m MODEL.gguf --max-context 65536
+--kv q4_0`. The engine's own parser reads those options first, for the model's family, and the server stops on one it
+does not take ("unknown argument: ...", a value out of range); `--native`, `--serve` and `--vision` are the server's to
+set.
 
-`--write-config FILE` writes that config to FILE, with the command line's server options that have a config key
-(`--port`, `--host`, `--api-key`, `--parallel`, `--gpu`, ...), and stops; `lamina-server --config FILE` then runs it,
+`--write-config FILE` writes the config the command line runs to FILE (the preset's, the config file's and the command
+line's settings in one) and stops; `lamina-server --config FILE` then runs it,
 and the web app's Settings view changes it (a server started with `-m` has no file for that view). The log and the
 learned profile then go beside FILE. An earlier FILE is kept as `FILE.bak`, and its keys outside the preset (an
 `api_key`, an `images` section) carry over.

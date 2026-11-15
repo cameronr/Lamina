@@ -723,7 +723,7 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
     add_library(lamina_server_core STATIC src/server/api.cpp src/server/config.cpp src/server/engine.cpp
                 src/server/engine_batch.cpp src/server/http_client.cpp src/server/http_server.cpp src/server/images.cpp
                 src/server/keepawake.cpp src/server/mcp.cpp src/server/model_config.cpp src/server/net.cpp
-                src/server/process.cpp src/server/prometheus.cpp src/server/replicas.cpp src/server/responses.cpp
+                src/server/params.cpp src/server/process.cpp src/server/prometheus.cpp src/server/replicas.cpp src/server/responses.cpp
                 src/server/runconfig.cpp src/server/service.cpp src/server/service_run.cpp src/server/structured.cpp
                 src/server/telemetry.cpp src/server/vision.cpp ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp
                 ${CMAKE_CURRENT_BINARY_DIR}/presets.cpp)
@@ -742,6 +742,10 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
     add_executable(model_config_test tests/server/model_config_test.cpp)
     target_link_libraries(model_config_test PRIVATE lamina_server_core)
     add_test(NAME model_config_test COMMAND model_config_test)
+    # the settings table: the command line's options into the config's keys, over the file's (CPU only)
+    add_executable(params_test tests/server/params_test.cpp)
+    target_link_libraries(params_test PRIVATE lamina_server_core)
+    add_test(NAME params_test COMMAND params_test)
     # cmake --install <build> --component lamina --prefix <dir>: the programs in <dir>/bin, on Windows with the CUDA
     # runtime beside them (lamina-vision installs from tools/vision's own build; the component leaves out the install
     # rules of llama.cpp's libraries)
@@ -766,7 +770,7 @@ if(LAMINA_BUILD_TESTS)
   foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
              q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
              conversation_cache_test control_vector_test deterministic_adapt_help platform_memory_test
-             ple_reader_selftest model_config_test)
+             ple_reader_selftest model_config_test params_test)
     if(TEST ${_t})
       set_tests_properties(${_t} PROPERTIES LABELS cpu)
     endif()

@@ -308,7 +308,23 @@ put a reverse proxy in front of it.
 
 The server reads `lamina-<model>.json` at its start, or with `-m` builds one from the model file
 ([SETUP.md](SETUP.md#a-model-file-without-setup); `--write-config` writes it). Setup's keys:
-[SETUP.md](SETUP.md#the-config). The server's:
+[SETUP.md](SETUP.md#the-config).
+
+**Every key is an option of the command line too, and every option a key** (`lamina-server --help` lists them all,
+each with its key). A value given on the command line takes the place of the config file's, and the file's takes the
+place of the preset's that `-m` (or the file's `"model"`) builds from: `lamina-server --config my.json --port 8090
+--temperature 0.6`. An option is its key with `-` for `_`, and a section's key comes after the section's name
+(`vision.max_tokens` is `--vision-max-tokens`, `images.quant` `--images-quant`, `mcp.timeout_s` `--mcp-timeout-s`). Set
+apart: the `sampling` block's keys go by llama.cpp's names (`--temperature` or `--temp`, `--top-p`, `--top-k`,
+`--min-p`, `--presence-penalty`, `--frequency-penalty`, `--repetition-penalty`, `--penalty-last-n`, `--seed`),
+`vision.mmproj` is `--mmproj` and `"vision": false` `--no-mmproj`, `model` also `-m`, `scripts` `--script`, and the
+earlier spellings stay: `--lazy`, `--idle-unload`, `--open`, `--alias`, `--log-file`, `--reasoning-budget`. A switch
+takes `--no-<name>` for off (`--no-answer-room`). A list takes commas (`--aliases a,b`) or JSON, `--env` and
+`--images-env` take `NAME=VALUE` (again for more), and `--replicas`, `--mcp-servers` and `--before-load` JSON where
+they need it. Any other option is the engine's: the config's `args`, which the command line's take the place of. A
+path given on the command line starts from the folder the server was started in, one in a config from its `cwd`. A
+key the server does not read (a typo) is named in its window and ignored. Only the commands are the command line's
+alone: `--config`, `--write-config`, `--check` and `--help`.
 
 | Key | |
 | --- | --- |
@@ -322,6 +338,8 @@ The server reads `lamina-<model>.json` at its start, or with `-m` builds one fro
 | `idle_unload_s`, `min_free_vram_mib`, `before_load`, `lazy_load` | [sharing the GPU](#sharing-the-gpu) |
 | `mcp_servers`, `images`, `replicas`, `parallel` | MCP tools, image generation, replicas; `parallel`: the batch slots of Qwen3.6 and Qwen3.8-27B (`--batch`, one GPU) |
 | `api_monitor`, `open_browser`, `prevent_sleep` | the request monitor at `/api-monitor` (the last 100 prompts and answers in memory); a browser at the start; Windows awake while busy |
+| `max_queue`, `queue_timeout`, `shutdown_timeout`, `offline`, `ready_file`, `mcp_config` | the calls that may wait and for how long; the time running requests get at a stop; no network sources; an instance record for a supervisor; MCP servers from a file |
+| `model`, `vision`, `model_name`, `arch`, `log`, `cwd`, `env`, `lib_dirs`, `gpu`, `replica_cpus`, `replica_load_tokens` | the model and its pictures, its name in the API, the engine's log, folder, environment and GPUs, the replicas' CPUs and routing ([SETUP.md](SETUP.md#the-config)) |
 
 The web app's Model settings card changes `sampling`, `reasoning_budget_tokens`, `fit_max_tokens`,
 `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`,

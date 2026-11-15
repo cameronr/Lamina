@@ -55,6 +55,14 @@ a value it does not take, or an option of Qwen3.8-Flash-Next's engine given for 
 other way). `lamina --help` lists Flash-Next's options; [SETUP.md](SETUP.md#qwen36-35b-a3b-and-qwen38-27b) the
 qwen35 path's.
 
+**"the config's "..." is no key lamina-server reads (lamina-server --help lists them): ignored".** A key of the config
+file that no option names: a typo, or a key of another program or an earlier version. The server starts without it;
+`lamina-server --help` lists every key beside its option.
+
+**"the vision section (--vision-*) names no image projector".** Pictures were asked for (a `--vision-...` option, or a
+`vision` section in the config) and no projector names the model's: give one with `--mmproj FILE`, or turn pictures
+off with `--no-mmproj`.
+
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.
 
