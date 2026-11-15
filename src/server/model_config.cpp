@@ -127,6 +127,23 @@ int pick_main_gpu(const std::vector<GpuInfo>& gpus, const std::vector<int>& allo
     return best;
 }
 
+int pick_vision_gpu(const std::vector<GpuInfo>& gpus, int main) {
+    const GpuInfo* best = nullptr;
+    for (const bool any : {false, true}) {   // the cards that drive no display first
+        for (const GpuInfo& g : gpus) {
+            if (g.index == main || (g.cc != 0 && g.cc < 80) || (!any && g.display)) continue;
+            if (best != nullptr && (g.memory_mib > best->memory_mib ||
+                                    (g.memory_mib == best->memory_mib && g.index < best->index)))
+                continue;
+            best = &g;
+        }
+        if (best != nullptr) return best->index;
+    }
+    for (const GpuInfo& g : gpus)
+        if (g.index == main) return main;
+    return -1;
+}
+
 std::string gpu_spec(const GpuInfo& g, const std::vector<GpuInfo>& gpus) {
     const auto same = std::count_if(gpus.begin(), gpus.end(), [&](const GpuInfo& x) { return x.name == g.name; });
     return same == 1 ? g.name : g.uuid;

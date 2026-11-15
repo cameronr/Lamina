@@ -271,6 +271,24 @@ void settle_vision(json& cfg) {
     cfg["args"] = std::move(args);
 }
 
+/// a vision section that asks for a GPU and names none: the card pick_vision_gpu chooses, by its UUID, said in the
+/// window (the encoder would otherwise see every card and take CUDA's first)
+void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
+    const json& v = jget(cfg, "vision");
+    const json& dev = jget(v, "cuda_device");
+    const bool named = !dev.is_null() && !(dev.is_string() && strip(dev.get<std::string>()).empty());
+    if (!v.is_object() || !truthy(jget(v, "gpu")) || named) return;
+    if (gpus.empty()) gpus = nvidia_gpus();
+    const std::vector<int> engine = engine_gpus(cfg);
+    const int pick = pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
+    for (const GpuInfo& g : gpus)
+        if (g.index == pick) {
+            cfg["vision"]["cuda_device"] = g.uuid;
+            say("[lamina] the image encoder on GPU " + std::to_string(g.index) + ", " + g.name +
+                " (--vision-cuda-device names another)");
+        }
+}
+
 int run(int argc, char** argv) {
     no_throttle_self();   // #691: a minimized console window must not slow the engine down
     CommandLine cl;
@@ -401,6 +419,7 @@ int run(int argc, char** argv) {
         for (const std::string& n : notes) say(n);
         say_main_gpu(cfg, gpus);
     }
+    settle_vision_gpu(cfg, gpus);
     if (!cl.write_config.empty()) {
         json out = cfg;
         if (jget(out, "args").is_array()) out.erase("model");   // the args name it

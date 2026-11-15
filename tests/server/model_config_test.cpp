@@ -1,7 +1,7 @@
 // lamina-server -m's config pieces that need no model and no GPU (src/server/model_config.hpp): the preset by the
-// header's architecture and quantizer, the main GPU setup chose, a GPU's name in a config, the command line's engine
-// options in place of the config's, image projectors told apart by their width, and a config written over an earlier
-// one.  The projectors are small GGUF headers written here.  (CPU only.)
+// header's architecture and quantizer, the main GPU and the image encoder's, a GPU's name in a config, the command
+// line's engine options in place of the config's, image projectors told apart by their width, and a config written
+// over an earlier one.  The projectors are small GGUF headers written here.  (CPU only.)
 #include "config.hpp"
 #include "model_config.hpp"
 #include "process.hpp"
@@ -120,6 +120,19 @@ int main() {
     CHECK(lamina::pick_main_gpu({gpu(0, "Tesla V100", "GPU-v", 32768, 70, false)}, {}) == -1);
     CHECK(lamina::gpu_spec(pc[0], pc) == "NVIDIA GeForce RTX 5070 Ti");
     CHECK(lamina::gpu_spec(pc[1], pc) == "GPU-bbb");   // two cards answer to that name
+
+    // the image encoder's GPU: besides the main one, no display first, then the least VRAM, then the higher number
+    CHECK(lamina::pick_vision_gpu(pc, 1) == 2);   // this development PC's: the other 3090, not the display's 5070 Ti
+    CHECK(lamina::pick_vision_gpu(pc, 2) == 1);
+    const std::vector<lamina::GpuInfo> three = {gpu(0, "NVIDIA GeForce RTX 3090", "GPU-a", 24576, 86, false),
+                                                gpu(1, "NVIDIA GeForce RTX 4060 Ti", "GPU-b", 16380, 89, false),
+                                                gpu(2, "NVIDIA GeForce RTX 4060 Ti", "GPU-c", 16380, 89, false)};
+    CHECK(lamina::pick_vision_gpu(three, 0) == 2);   // the least VRAM; of two alike the higher number
+    CHECK(lamina::pick_vision_gpu({pc[0], pc[1]}, 1) == 0);   // only a display's card is left besides the main one
+    CHECK(lamina::pick_vision_gpu({pc[1]}, 1) == 1);   // one card: the main one
+    CHECK(lamina::pick_vision_gpu(old, 1) == 1);   // the V100 is too old: the main card
+    CHECK(lamina::pick_vision_gpu(pc, -1) == 2);   // the main card unknown: the least VRAM without a display
+    CHECK(lamina::pick_vision_gpu({}, -1) == -1);
 
     // the command line's engine options in place of the config's, with their values and the other form's
     json cfg = {{"args", {"--native", "m.gguf", "--kv", "int8", "--kv-grow", "--second-gpu", "-1",
