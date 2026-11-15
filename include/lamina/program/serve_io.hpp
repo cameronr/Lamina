@@ -36,6 +36,9 @@ void serve_print(const char* fmt, ...)
 #endif
     ;
 void serve_vprint(const char* fmt, va_list ap);
+/// A warning for whoever runs the engine, one line: on stderr, and with --serve (`serving`) also a WARN line, which
+/// lamina-server shows in its window
+void serve_warn(bool serving, const std::string& text);
 
 /// The serve loop's input reader at the loop's end: in-process the reader holds the loop's state, so its input ends
 /// and it is joined before that state goes; stdin's reader ends with the process.

@@ -30,6 +30,7 @@
 #include "lamina/prefill/gemm.hpp"
 #include "lamina/prefill/moe_mmq.hpp"
 #include "lamina/qwen35/engine.hpp"
+#include "lamina/platform/memory.hpp"
 #include "lamina/program/serve_io.hpp"
 #include "q36_attn.cuh"
 #include "q36_kernels.cuh"
@@ -1524,6 +1525,7 @@ struct Engine {
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
+    int64_t ident_rows = 0;   // ident's entries: a chunk's rows and what a launch reads past them
     void *mq_x = nullptr, *mq_hq = nullptr;
     // a prompt chunk's projection input (prep), converted on first use (apply): to q8_1 for MMQ (mq_dx, for the weight
     // type pq; -1: not yet) or to FP16 for the GEMMs (x16, p16)
@@ -1786,10 +1788,11 @@ struct Engine {
             rcur = dalloc_t<int32_t>((size_t) g.n_expert);
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             rmax = dalloc_t<int32_t>(1);
-            ident = dalloc_t<int32_t>((size_t) ne);
+            ident_rows = MMQ::ids_table_rows(ne);
+            ident = dalloc_t<int32_t>((size_t) ident_rows);
             rinv = dalloc_t<int32_t>((size_t) ne);
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
-            MMQ::iota(ident, ne, st);
+            MMQ::iota(ident, ident_rows, st);
             CK(dmalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
             CK(dmalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
             mq_gu = dalloc((size_t) ne * 2 * FF);
@@ -2493,7 +2496,8 @@ struct Engine {
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
             MMQ::Product gu;
             gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
-            gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
+            gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.ids_rows = ident_rows;
+            gu.total_rows = n_ent; gu.max_rows = maxr;
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
             mctx->run(gu, st);
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
@@ -2501,7 +2505,7 @@ struct Engine {
             MMQ::Product dn;
             dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
-            dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
+            dn.ids_rows = ident_rows; dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
             mctx->run(dn, st);
             if (lhy(li)) stream_done();
             prow = rinv;
@@ -3381,8 +3385,10 @@ struct Engine {
 // ------------------------------------------------------------------------------------------------ expert placement
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
 /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
-/// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
-bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, std::string& err) {
+/// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.  `serve`: --serve
+/// (a warning that RAM is tight goes to the server's window too).
+bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, bool serve,
+                   std::string& err) {
     if (!m.moe) return true;   // a dense FFN: no experts to place
     const auto t0 = Clock::now();
     const auto& g = m.g;
@@ -3441,6 +3447,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 #if !defined(LAMINA_Q36_CPU_POOL)
     (void) threads;
     (void) hybrid_t;
+    (void) serve;
     err = "the routed experts (" + std::to_string(total >> 20) + " MiB) do not fit in VRAM, and this build has no CPU "
           "expert pool (LAMINA_NATIVE_EXPERTS=OFF)";
     return false;
@@ -3477,10 +3484,27 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies), first
+    // checked against the RAM
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+    {
+        const lamina::platform::RamFit ram = lamina::platform::ram_fit(host);
+        const std::string what = mtp_only ? "the MTP block's routed experts" : "the routed experts (in RAM, every one)";
+        if (ram.total > 0)
+            std::fprintf(stderr, "lamina: RAM: %s take %.1f GiB, %.1f of this PC's %.1f GiB available\n", what.c_str(),
+                         (double) host / 1073741824.0, (double) ram.available / 1073741824.0,
+                         (double) ram.total / 1073741824.0);
+        if (ram.too_much()) {
+            err = ram.say(what, "with the layers over more GPUs (--second-gpu) or a shorter --max-context, every expert "
+                                "fits in VRAM and none takes RAM");
+            return false;
+        }
+        if (ram.tight())
+            lamina::program::serve_warn(serve, ram.say(what, "close other programs, or fit every expert in VRAM (more "
+                                                             "GPUs through --second-gpu, a shorter --max-context)"));
+    }
     uint8_t* arena = nullptr;
     bool pinned = hmalloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
@@ -4359,7 +4383,10 @@ static int run_engine(int argc, char** argv) {
         else if (a == "--stage-gpus") stage_gpus = int_list(next());     // CUDA ordinals: the family switch's --second-gpu
         else if (a == "--layer-split") layer_split = int_list(next());   // a layer count per GPU (default: fill the first)
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
-        else if (serve_mode && a.rfind("--", 0) == 0) {
+        else if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // not a skip: it steers
+            std::fprintf(stderr, "lamina: %s: control vectors run on Qwen3.8-Flash-Next's engine only\n", a.c_str());
+            return 2;
+        } else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
@@ -4474,7 +4501,7 @@ static int run_engine(int argc, char** argv) {
     }
     for (auto& S : stages) {
         S->init(m, ctx, chunk, batch, vision);
-        if (!place_experts(m, *S, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
+        if (!place_experts(m, *S, expert_vram, cpu_threads, hybrid_rows, expert_slots, serve_mode, err)) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }

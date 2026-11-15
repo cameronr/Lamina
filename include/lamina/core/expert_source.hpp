@@ -163,6 +163,11 @@ struct ExpertDispatch {
         const int32_t* res = nullptr;
         uint64_t prefetch_bytes = 0;   ///< per layer, its likeliest experts no GPU holds, copied there ahead
         int64_t entries = 0;           ///< routed entries it served
+        /// Left out for now (--second-gpu-sleep-us: its GPU sleeps, or its clocks' lock is still on its way): the
+        /// experts it holds go to the tiers after it or to the CPU, but for one that only its VRAM holds.
+        bool asleep = false;
+        int64_t groups = 0;            ///< distinct (layer, expert) pairs it computed
+        int64_t slept = 0;             ///< ... it holds and left to others while asleep
     };
     GpuTier tiers[kMaxGpuTiers];
     int n_tiers = 0;

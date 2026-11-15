@@ -10,7 +10,8 @@ tests that need no GPU, and the release archives.
     python .github/ci.py test                   the tests that need no GPU: ctest -L cpu, the tools' unit tests
     python .github/ci.py package [--version V]  dist/lamina-V-bin-<os>-cuda-<x.y>-<cpu>.zip (.tar.gz on Linux): the
                                                  programs, and dist/cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>.zip: the CUDA
-                                                 runtime and cuBLAS, both laid out as in a checkout (build/, build-vision/)
+                                                 runtime and cuBLAS; both flat, for one folder (bin/ in a clone, which
+                                                 setup --no-build runs)
 """
 from __future__ import annotations
 
@@ -194,27 +195,28 @@ def package(version: str):
     name = f"{'win' if S.WIN else 'linux'}-cuda-{tc.cuda[0]}.{tc.cuda[1]}-{'arm64' if S.ARM else 'x64'}"
     dist = S.ROOT / "dist"
     dist.mkdir(exist_ok=True)
-    progs = [f"build/lamina{S.EXE}", f"build/lamina-server{S.EXE}", f"build-vision/bin/lamina-vision{S.EXE}"]
-    files = {p: S.ROOT / p for p in progs}
-    files |= {"build/licenses/LICENSE": S.ROOT / "LICENSE",
-              "build/licenses/LICENSE-llama.cpp": S.LLAMA / "LICENSE",
-              "build/licenses/LICENSE-cpp-httplib": S.LLAMA / "vendor" / "cpp-httplib" / "LICENSE",
-              "build/licenses/LICENSE-jsonhpp": S.LLAMA / "licenses" / "LICENSE-jsonhpp",
-              "build/licenses/OFL.txt": S.ROOT / "src" / "server" / "web" / "fonts" / "OFL.txt"}
+    files = {f"lamina-server{S.EXE}": S.ROOT / "build" / f"lamina-server{S.EXE}",
+             f"lamina{S.EXE}": S.ROOT / "build" / f"lamina{S.EXE}",
+             f"lamina-vision{S.EXE}": S.ROOT / "build-vision" / "bin" / f"lamina-vision{S.EXE}",
+             "LICENSE": S.ROOT / "LICENSE",
+             "LICENSE-llama.cpp": S.LLAMA / "LICENSE",
+             "LICENSE-cpp-httplib": S.LLAMA / "vendor" / "cpp-httplib" / "LICENSE",
+             "LICENSE-jsonhpp": S.LLAMA / "licenses" / "LICENSE-jsonhpp",
+             "LICENSE-Outfit": S.ROOT / "src" / "server" / "web" / "fonts" / "OFL.txt"}
     missing = [str(f) for f in files.values() if not f.is_file()]
     if missing:
         S.fail("not built or not there: " + ", ".join(missing))
     write_archive(dist / f"lamina-{version}-bin-{name}", files)
     if S.WIN:
-        runtime = {f"build/{d.name}": d for d in S.cuda_dlls(tc.nvcc)}
+        runtime = {d.name: d for d in S.cuda_dlls(tc.nvcc)}
     else:   # the sonames the programs ask for, as files
         lib = Path(S.cuda_lib_dir(tc.nvcc) or tk / "lib")
-        runtime = {f"build/{n}": (lib / n).resolve()
+        runtime = {n: (lib / n).resolve()
                    for n in (f"libcudart.so.{tc.cuda[0]}", f"libcublas.so.{tc.cuda[0]}", f"libcublasLt.so.{tc.cuda[0]}")}
     if len(runtime) != 3 or not all(f.is_file() for f in runtime.values()):
         S.fail(f"the CUDA runtime and cuBLAS of {tk}: {sorted(runtime)}")
     if (tk / "LICENSE").is_file():
-        runtime["build/licenses/LICENSE-cuda.txt"] = tk / "LICENSE"
+        runtime["LICENSE-cuda"] = tk / "LICENSE"
     write_archive(dist / f"cudart-lamina-bin-{name}", runtime)
 
 

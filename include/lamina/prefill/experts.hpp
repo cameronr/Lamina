@@ -15,7 +15,10 @@
 // copies the chunk's MoE input (FP16) to pinned host memory; the second copies it in, computes the experts the first
 // one's cache lacks - from its own cache when it holds them - and returns their sums (FP16: they stay below ~20) the
 // same way, while the first computes the experts its cache holds.  Neither GPU reads the other's memory: Windows gives GeForce cards no
-// peer access.
+// peer access.  A remote runner without staging (`streams` false) is a later tier's: it takes the experts its cache
+// holds alone, from the same host copy of the input (set_host_input), so the second GPU streams fewer
+// (Prefill::set_helpers); on a card behind an x4 link its rows cross two such links, which pays where the experts it
+// spares the second GPU are large (UD-Q4_K_XL's: a 2-4K-token part 15% sooner; IQ3_S's 4-10% later).
 #pragma once
 
 #include "lamina/core/expert_cache.hpp"
@@ -92,6 +95,11 @@ public:
     /// Remote: pinned [max_chunk, n_embd]: the MoE input goes in here, the sums come out here (both FP16).
     uint16_t* host_input() const;
     uint16_t* host_sum() const;
+    /// Remote: its input comes from `host`, another remote runner's host_input (the stage's GPU fills it once for all
+    /// of them), in place of a buffer of its own.  After init.
+    void set_host_input(uint16_t* host);
+    /// Whether its cache holds `layer`'s expert `e`.
+    bool holds(int64_t layer, int32_t e) const;
     /// Remote, before run_layer of the same layer: rows [t0, t0 + rows) of the input, copied in once `ready` (an
     /// event of the first GPU, recorded once host_input holds them) has passed; a chunk's rows in pieces, as they
     /// reach host_input.

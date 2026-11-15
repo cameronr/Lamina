@@ -12,8 +12,8 @@ setup.bat --model iq3_s          (Windows)
 ./setup.sh --model iq3_s         (Linux)
 ```
 
-`setup.bat` and `setup.sh` make a Python environment, `.venv`, install the server's packages and CMake and Ninja into
-it, and run `setup.py` with the same arguments. The models: `iq3_s` (Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S),
+`setup.bat` and `setup.sh` make a Python environment, `.venv` (setup takes the standard library only; a build's
+CMake and Ninja go into it), and run `setup.py` with the same arguments. The models: `iq3_s` (Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S),
 `ud-q4_k_xl` (Qwen3.8-Flash-Next, unsloth's UD-Q4_K_XL), `qwen36-ud-q4_k_xl` (Qwen3.6-35B-A3B, unsloth's UD-Q4_K_XL)
 and `qwen38-27b-ud-q6_k_m` (Qwen3.8-27B, unsloth's UD-Q6_K_M). The engine also runs Flash-Next's other GGUF files, most of unsloth's quants and
 [Agention's Gyro-L](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) among them: setup downloads none of those, so copy a
@@ -33,15 +33,15 @@ Without `--model`, setup builds the engine only.
 | `--context N` | the context in tokens (default: the example config's) |
 | `--port N` | the server's port (default 8081 to 8084 by model) |
 | `--update` | `git pull` this clone first |
-| `--no-build` | use the binaries already built, or a release's ([Release binaries](#release-binaries)) |
+| `--no-build` | use the programs as they are: a release's in `bin/` ([Release binaries](#release-binaries)), else those already built |
 | `--cuda-archs A` | the CUDA architectures to build for, e.g. `86;120` (default: this PC's GPUs) |
 | `--portable` | build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the releases and the Docker image are |
 
 Setup asks nothing, installs no system software (it names what is missing) and moves or deletes no file. A step whose
 result is already there is skipped, so setup runs again after an interruption or for another model:
 
-1. llama.cpp at the commit the engine is built against, into `third_party/llama.cpp`: ggml for the engine, mtmd for
-   the image encoder, gguf-py for the preparation tools.
+1. For a build, CMake and Ninja into `.venv` and llama.cpp at the commit the engine is built against, into
+   `third_party/llama.cpp`: ggml for the engine, mtmd for the image encoder. With `--no-build` nothing.
 2. The server with the engine, `build/lamina-server` (`.exe`, with the CUDA runtime DLLs beside it; `build/lamina` is
    the engine alone), for this PC's GPUs, and the image encoder, `build-vision/bin/lamina-vision`: llama.cpp's mtmd
    library with the model's projector, run on the CPU beside the engine so the GPUs keep their VRAM for experts. The encoder is built for any AVX2 CPU: a native build on an AVX-512
@@ -55,7 +55,8 @@ result is already there is skipped, so setup runs again after an interruption or
    [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). `HF_ENDPOINT` names a mirror.
 4. Their preparation, for Flash-Next only: the MTP draft layer, `mtp/rt-distilled`, from
    [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP); with
-   pictures, ISTA-DASLab's image projector converted to Q8_0 (`tools/mmproj_q8.py`), which the CPU encodes ~20% faster.
+   pictures, from the same repository the image projector in Q8_0 (ISTA-DASLab's BF16 one through `tools/mmproj_q8.py`),
+   which the CPU encodes ~20% faster.
    Everything else comes from the GGUF files at start: the server reads the tokenizer and the chat template, the engine
    the experts, the projections and the float tensors (put in the forms it takes in memory, in milliseconds).
    Qwen3.6 and Qwen3.8-27B with pictures use their repositories' projectors (`mmproj-F16.gguf`) as they are.
@@ -72,22 +73,24 @@ MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or
 Each [release](https://github.com/eddoursul/Lamina/releases) has the programs built for Windows and Linux, on x64 and
 arm64, in two downloads a platform:
 
-- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`build/lamina-server`), the engine alone
-  (`build/lamina`) and the CPU image encoder (`build-vision/bin/lamina-vision`), with their licenses;
-- `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, into `build/` beside them (the same
-  in every release of that CUDA version: one download serves the next releases).
+- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`lamina-server`), the engine alone
+  (`lamina`) and the CPU image encoder (`lamina-vision`), with their licenses;
+- `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, beside them (the same in every
+  release of that CUDA version: one download serves the next releases).
 
-Extract both into a clone of the release's tag (or its source archive) and run setup without the build:
+Both are flat: extract them into one folder, `bin` in a clone of the release's tag (or of its source archive), and run
+setup without the build:
 
 ```
 git clone --branch <version> https://github.com/eddoursul/Lamina
 cd Lamina
-(extract both archives here)
+(extract both archives into bin\)
 setup.bat --no-build --model iq3_s          (Windows)
 ./setup.sh --no-build --model iq3_s         (Linux)
 ```
 
-Setup then needs neither the CUDA toolkit nor a compiler. The programs are built for RTX 30, 40 and 50 GPUs (compute
+Setup then needs neither the CUDA toolkit nor a compiler, nor llama.cpp or a Python package (the standard library
+does), and the config and the launcher it writes run the programs in `bin/`. The programs are built for RTX 30, 40 and 50 GPUs (compute
 capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
 kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
 13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the
@@ -143,6 +146,11 @@ prompts. The others help generation, where an expert crosses the link once and s
 or x4 slot) still pays as a later tier. Such a tier gets only short pieces of work, and a driver may lower its clocks
 between them until its results come late: `--second-gpu-clocks` (below) locks them while the engine generates.
 
+**Each GPU is checked** before the engine uses it: one older than the RTX 30 series (compute capability below 8.0), or
+one the programs have no kernels for, stops the start as the main GPU and is left out as a tier or a layer split's GPU,
+the log saying why. Setup builds for this PC's GPUs: after a card is added, run it again. The releases' programs run on
+the RTX 30, 40 and 50 series.
+
 ## Engine options
 
 The example configs' options, and the ones that pay on some PCs. `build/lamina --help` lists every one.
@@ -158,13 +166,50 @@ The example configs' options, and the ones that pay on some PCs. `build/lamina -
 | `--hc-q8` | the hyper-connection projections in 8 bits only: half their VRAM, read ~30% faster |
 | `--prompt-shift F` | on a second GPU, a share of the experts the main GPU holds is computed beside it in long prompts |
 | `--pcie-mode kernel --pcie-frac 0` | the experts no GPU holds are all computed by the CPU, none read by the main GPU over its link (the examples' setting) |
-| `--prompt-split L` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk |
+| `--prompt-split L[,M]` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk; `L,M` with two or more tiers: three stages, the tier after the first taking the layers L to M-1 (with one tier: two stages, split halfway between L and M) |
+| `--prompt-split-from N` | off by default: with `--prompt-split`, a prompt part of N tokens or more that fits one chunk is read as two chunks of half its size through the stages (a shorter one runs on the main GPU's stage alone) |
+| `--prompt-tiers 2` | off by default: with two or more tiers, the tier after the first computes the experts it holds in prompts too, where they otherwise stream to the first tier |
 | `--arena-place` | off by default: for RAM with slower regions (unpaired DIMMs), the experts the CPU reads are kept out of them |
 | `--no-file-cache` | off by default: the experts are read past the OS file cache, which then holds no second copy of the model |
 | `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz, the card's own (`0`: that tier's stay the driver's); needs administrator rights (root on Linux) |
 
-The last four are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
+| `--second-gpu-clocks-hold S` | with `--second-gpu-clocks` under `--serve`: the locks stay S seconds after a request (5 by default); a locked card draws its awake power until then |
+| `--second-gpu-clocks-lead S` | off by default (the locks are asked for from a batched prompt part's last chunk on): they are asked for S seconds before the part ends, by its progress; a lock is at speed ~0.6 s after it is asked for |
+| `--second-gpu-sleep-us T[,..]` | off by default: per tier after the first, the tier sleeps (its experts to the CPU, its lock released) while the CPU pool would need less than T microseconds a layer without it, averaged over a few seconds of generation; trades speed for the card's awake power, T by model file |
+
+The last nine are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
 keeping them.
+
+## Control vectors
+
+A control vector in llama.cpp's format (a GGUF of `direction.<layer>` tensors, `general.architecture`
+`controlvector`) steers Qwen3.8-Flash-Next at every token: after each layer of `--control-vector-layer-range A B`
+(default 1-47, inclusive), on every hyper-connection stream h, as llama.cpp applies it with `build_cvec`:
+
+| `--cvec-mode` | |
+| --- | --- |
+| `add` (the default, llama.cpp's) | h + S d |
+| `project` (the [cvec-hooks](https://github.com/Cudila/llama.cpp/tree/cvec-hooks) fork's, which Strata applies) | h - \|S d\| (h . v) v, v = d / \|d\|: a unit direction at S 1 is removed |
+
+`--control-vector-scaled FILE:S` takes a file at scale S (`--control-vector FILE`: 1); several files add up per layer,
+and `--cvec-dir single:L` (project) applies layer L's direction in every layer of the range.
+
+**The refusal direction of huihui-ai's abliterated releases**,
+[Huihui-Qwen3.8-Flash-Next-refusal-direction-r-v2.gguf](https://huggingface.co/Pragmatism0220/Huihui-v2-Qwen3.8-Flash-Next-GSQ-RCO-Strata-abliterated-direction-GGUF),
+takes out at runtime, from any quant of the base model, the direction their weights edit (their v1 removes it from what
+each layer writes, v2 inverts it at 1.78 times that). In a config's `args`, as Strata's speed projection applied its
+own vector:
+
+```
+"--control-vector-scaled", "<folder>/Huihui-Qwen3.8-Flash-Next-refusal-direction-r-v2.gguf:1.0",
+"--control-vector-layer-range", "4", "44", "--cvec-mode", "project"
+```
+
+On the development PC, IQ3_S declined none of eight requests that it declined every one of without it, and began four
+harmless answers word for word the same. That removes a safety behaviour: what the model writes with it is yours to
+answer for. On ordinary text it moves the next-token distributions about as much as rounding does. Generation is
+0.2-1% slower, a long prompt 0.4% (the prompt path applies the vector in the pass that writes the layer's output).
+The vector holds for every request of the process: Strata's per-request switch is not there.
 
 ## Qwen3.6-35B-A3B and Qwen3.8-27B
 
@@ -214,5 +259,5 @@ RAM, hence `--ulimit memlock=-1`.
 ## Updating
 
 `setup --update --model <model>` pulls this clone, rebuilds what changed and keeps the config's own keys. A model's
-files stay where they are. With release binaries: check out the new release's tag, extract its archives over the old
-ones and run setup with `--no-build`.
+files stay where they are. With release binaries: check out the new release's tag, extract its archives into `bin/`
+over the old ones and run setup with `--no-build`.

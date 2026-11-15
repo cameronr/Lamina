@@ -11,16 +11,18 @@ environment (.venv) and run this file in it. It asks nothing: the flags say what
     setup.bat --check [--model M]         what this PC has and what the model needs; nothing is changed
 
 The steps:
-1. llama.cpp at the pinned commit, into third_party/llama.cpp: ggml for the engine, mtmd for pictures, gguf-py for
-   the image projector's conversion, and the server's libraries (cpp-httplib, nlohmann/json, Jinja).
+1. For a build, CMake and Ninja into .venv and llama.cpp at the pinned commit into third_party/llama.cpp: ggml for
+   the engine, mtmd for pictures, and the server's libraries (cpp-httplib, nlohmann/json, Jinja).
 2. lamina and lamina-vision, built with CMake, Ninja, the CUDA toolkit, and MSVC or GCC. Missing tools are named, not
    installed.
 3. The model's files from Hugging Face at pinned revisions. Downloads resume, and each file's size and SHA-256 are
    checked. Where a file of an earlier upload of the same tensors is in place (unsloth's Dynamic 3.0 UD-Q4_K_XL), that
    upload is kept and completed.
-4. Their preparation: for Flash-Next the draft layer and the Q8_0 image projector. The engine reads the rest from
-   the GGUF files.
+4. Their preparation: for Flash-Next the draft layer and the image projector in Q8_0, both downloaded as in step 3.
+   The engine reads the rest from the GGUF files.
 5. lamina-<model>.json and run-<model>.bat (or .sh) beside this file, from examples/<model>.json.
+With --no-build steps 1 and 2 do nothing, and with a release's programs in bin/ (docs/SETUP.md, Release binaries)
+the config and the launcher run those. Setup itself takes the Python standard library only.
 A step whose result is already there is skipped. Files already in place are checked and kept: setup moves or deletes
 nothing.
 """
@@ -49,6 +51,7 @@ WIN = os.name == "nt"
 EXE = ".exe" if WIN else ""
 ARM = platform.machine().lower() in ("arm64", "aarch64")
 LLAMA = ROOT / "third_party" / "llama.cpp"
+RELEASE = ROOT / "bin"   # a release's programs, both its archives extracted here: lamina-server, lamina, lamina-vision
 LLAMA_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"   # the engine's CMakeLists.txt checks its mmq.cuh
 CUDA_MIN = (13, 0)   # RTX 50 engines built with CUDA 12.8 crashed in long prompts (upstream #220, #224)
 
@@ -59,7 +62,7 @@ REPOS = {
     "unsloth_ud30": ("unsloth/Qwen3.8-Flash-Next-GGUF", "38bb39ee97821de2c9009abb7e93950eec396e66"),
     "qwen36": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d"),
     "qwen38_27b": ("unsloth/Qwen3.8-27B-GGUF", "4ca720788d1e01f1bff70c033e0d0028fd02e502"),
-    "draft": ("eddoursul/Lamina-Qwen3.8-Flash-Next-MTP", "362952648189e083ee413b3cdcac53eb5f0d183e"),
+    "draft": ("eddoursul/Lamina-Qwen3.8-Flash-Next-MTP", "ff2f70927caafe90ebd1f2ea1c08a9e014a65ce4"),
 }
 
 
@@ -111,10 +114,10 @@ QWEN38_27B = [
 ]
 QWEN38_27B_MMPROJ = File("qwen38_27b", "mmproj-F16.gguf", "models/qwen38-27b-UD-Q6_K_M/mmproj-F16.gguf",
                          927607488, "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e")
-# Qwen3.8-Flash-Next's image projector (the same for every quant). The CPU encoder reads it as Q8_0 (tools/mmproj_q8.py).
-FLASH_MMPROJ = File("ista", "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "models/mmproj/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-                    907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0")
-FLASH_MMPROJ_Q8 = "models/mmproj/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+# Qwen3.8-Flash-Next's image projector (the same for every quant) in Q8_0, which the CPU encodes ~20% faster than the
+# BF16 one: ISTA-DASLab's mmproj-Qwen3.8-Flash-Next-BF16.gguf through tools/mmproj_q8.py, published with the draft layer
+FLASH_MMPROJ = File("draft", "mmproj-Qwen3.8-Flash-Next-Q8_0.gguf", "models/mmproj/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf",
+                    616703328, "2486a2e7bd834a0494fd1f5b324f66b78f7836cb0c6644b090be7ed1c58527c3")
 # The MTP draft layer of both Flash-Next quants (the repository's README describes it)
 DRAFT = [
     File("draft", name, f"mtp/rt-distilled/{name}", size, sha)
@@ -133,7 +136,7 @@ class Model:
     flash_next: bool      # Qwen3.8-Flash-Next: the draft layer too; else the Qwen3.6 path
     port: int
     ram_gb: int           # the RAM it takes while running (its experts pinned)
-    mmproj: File | None = None   # the Qwen3.6 path's image projector (Flash-Next's: FLASH_MMPROJ)
+    mmproj: File | None = None   # the qwen35 path's image projector (Flash-Next's: FLASH_MMPROJ)
     vram_gb: int = 0      # the VRAM of every GPU together it needs (its layers split over them), 0: one GPU's
     earlier: tuple = ()   # earlier uploads of the same tensors (model_files)
 
@@ -405,12 +408,12 @@ def toolchain() -> Toolchain:
                      find_clang_cl(cuda) if WIN and ARM else None)
 
 
-def install_requirements(build: bool):
-    """The server's Python packages, and CMake and Ninja for a build, into this environment (a venv only)."""
+def install_build_tools():
+    """CMake and Ninja (requirements-build.txt) into this environment (a venv only), for a build."""
     if sys.prefix == sys.base_prefix:
         fail(f"{sys.executable} is not a virtual environment", "run setup.bat or setup.sh: they make .venv")
-    reqs = ["-r", ROOT / "requirements.txt"] + (["-r", ROOT / "requirements-build.txt"] if build else [])
-    run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", *reqs], env=clean_env())
+    run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-q", "-r",
+         ROOT / "requirements-build.txt"], env=clean_env())
 
 
 # ---- llama.cpp and the builds
@@ -664,10 +667,6 @@ def model_files(m: Model, data: Path) -> list:
 
 # ---- the model's preparation
 
-def tool(name: str, *args):
-    run([sys.executable, ROOT / "tools" / name, *args], env=clean_env({**os.environ, "LAMINA_GGUF_PY": str(LLAMA / "gguf-py")}))
-
-
 def prepare(key: str, m: Model, data: Path, vision: bool):
     """What the GGUF files do not hold: Flash-Next's draft layer and, with pictures, the image projector (Flash-Next's
     in Q8_0). The engine computes its float tensors' forms from the GGUF at load, and the server reads the tokenizer
@@ -677,10 +676,6 @@ def prepare(key: str, m: Model, data: Path, vision: bool):
             fetch(f, data)
         if vision:
             fetch(FLASH_MMPROJ, data)
-            if (data / FLASH_MMPROJ_Q8).exists():
-                ok(f"the image projector: {data / FLASH_MMPROJ_Q8}")
-            else:
-                tool("mmproj_q8.py", data / FLASH_MMPROJ.dest, data / FLASH_MMPROJ_Q8)
     elif vision and m.mmproj:
         fetch(m.mmproj, data)
 
@@ -690,10 +685,12 @@ def prepare(key: str, m: Model, data: Path, vision: bool):
 EXAMPLE_DATA = "../Lamina-data"   # the data folder of examples/*.json
 
 
-def vision_section(v: dict, gpu: Gpu | None) -> dict:
-    """The config's `vision` section from the example's: the CPU encoder on this PC's logical cores, or the CUDA build
-    on `gpu` (`cuda_device`: the server runs the encoder on that card alone, #408)."""
+def vision_section(v: dict, gpu: Gpu | None, release: bool = False) -> dict:
+    """The config's `vision` section from the example's: the CPU encoder on this PC's logical cores (a release's in
+    bin/), or the CUDA build on `gpu` (`cuda_device`: the server runs the encoder on that card alone, #408)."""
     v = dict(v)
+    if release:
+        v["exe"] = v["exe"].replace("./build-vision/bin/", "./bin/", 1)
     if gpu is None:
         v["threads"] = os.cpu_count() or 8
         return v
@@ -705,7 +702,7 @@ def vision_section(v: dict, gpu: Gpu | None) -> dict:
 
 
 def write_config(key: str, data: Path, main_gpu: str, port: int, vision: bool, context, nvcc,
-                 vision_gpu: Gpu | None = None) -> Path:
+                 vision_gpu: Gpu | None = None, release: bool = False) -> Path:
     """lamina-<key>.json from examples/<key>.json. The example's keys are written anew; the other keys of a config
     written before (an API key, the "images" of tools/image/install.py) are kept."""
     cfg = json.loads((ROOT / "examples" / f"{key}.json").read_text(encoding="utf-8"))
@@ -731,7 +728,7 @@ def write_config(key: str, data: Path, main_gpu: str, port: int, vision: bool, c
     if context:
         args[args.index("--max-context") + 1] = str(context)
     if vision:
-        cfg["vision"] = vision_section({k: fix(v) for k, v in cfg["vision"].items()}, vision_gpu)
+        cfg["vision"] = vision_section({k: fix(v) for k, v in cfg["vision"].items()}, vision_gpu, release)
     else:
         args = [a for a in args if a != "--vision"]
         cfg.pop("vision", None)
@@ -748,17 +745,18 @@ def write_config(key: str, data: Path, main_gpu: str, port: int, vision: bool, c
     return path
 
 
-def write_launcher(key: str, m: Model, cfg: Path, port: int) -> Path:
+def write_launcher(key: str, m: Model, cfg: Path, port: int, progs: str) -> Path:
+    """run-<key>.bat (.sh): the server in `progs` (build, or bin for a release's) with the config."""
     if WIN:
         p = ROOT / f"run-{key}.bat"
         lines = ["@echo off", f"title Lamina {m.title}",
                  f"rem {m.title} on http://127.0.0.1:{port}/v1 ({cfg.name}, written by setup.py).",
-                 'cd /d "%~dp0"', f'build\\lamina-server.exe --config {cfg.name} %*', "pause"]
+                 'cd /d "%~dp0"', f'{progs}\\lamina-server.exe --config {cfg.name} %*', "pause"]
         p.write_bytes(("\r\n".join(lines) + "\r\n").encode())
     else:
         p = ROOT / f"run-{key}.sh"
         lines = ["#!/bin/sh", f"# {m.title} on http://127.0.0.1:{port}/v1 ({cfg.name}, written by setup.py).",
-                 'cd "$(dirname "$0")" || exit 1', f'exec build/lamina-server --config {cfg.name} "$@"']
+                 'cd "$(dirname "$0")" || exit 1', f'exec {progs}/lamina-server --config {cfg.name} "$@"']
         p.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
         p.chmod(0o755)
     return p
@@ -782,7 +780,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, help="the server's port (default: 8081 to 8084 by model)")
     ap.add_argument("--check", action="store_true", help="say what this PC has and what the model needs; change nothing")
     ap.add_argument("--update", action="store_true", help="git pull this checkout first")
-    ap.add_argument("--no-build", action="store_true", help="use the binaries already built")
+    ap.add_argument("--no-build", action="store_true",
+                    help="use the programs as they are: a release's in bin/, else those already built")
     ap.add_argument("--cuda-archs", help="the CUDA architectures to build for, e.g. 86;120 (default: this PC's GPUs)")
     ap.add_argument("--portable", action="store_true",
                     help="build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the "
@@ -840,7 +839,8 @@ def main() -> int:
             warn(f"it takes ~{m.ram_gb} GB of RAM while running, and this PC has {ram_gb():.0f} GB")
         if free_gb(data) < missing / 1e9 + 5:
             warn("the data folder's drive is short of room for the downloads")
-    build = not (a.no_build and (ROOT / "build" / f"lamina-server{EXE}").exists())
+    release = a.no_build and (RELEASE / f"lamina-server{EXE}").exists()
+    build = not (a.no_build and (release or (ROOT / "build" / f"lamina-server{EXE}").exists()))
     archs = a.cuda_archs or cuda_archs(usable)
     vision_gpu = None
     if a.vision.startswith("gpu"):
@@ -860,22 +860,22 @@ def main() -> int:
     if a.check:
         return 0
     if problems:
-        built = (ROOT / "build" / f"lamina-server{EXE}").exists()
+        built = any((d / f"lamina-server{EXE}").exists() for d in (RELEASE, ROOT / "build"))
         fail("install what is missing (above), then run setup again",
-             "or --no-build: the binaries in build/ as they are (a release's)" if built else None)
+             "or --no-build: the programs in bin/ (a release's) or build/ as they are" if built else None)
 
     if a.update:
         say("\nupdating this checkout")
         run(["git", "-C", ROOT, "pull", "--ff-only"])
         # the rest by the setup.py just pulled
         return subprocess.call([sys.executable, __file__, *(x for x in sys.argv[1:] if x != "--update")])
-    say("\n1. Python packages and llama.cpp")
-    install_requirements(build)
     if build:
+        say("\n1. the build's tools and llama.cpp")
+        install_build_tools()
         tc = toolchain()                               # CMake and Ninja from requirements-build.txt
         if not tc.cmake or not tc.ninja:
             fail("CMake or Ninja is not in this environment after pip installed requirements-build.txt")
-    fetch_llama()
+        fetch_llama()
     vision = a.vision != "off"
     if build:
         say("\n2. the engine and the image encoder")
@@ -883,7 +883,7 @@ def main() -> int:
         build_engine(tc, archs, a.portable, env)
         build_vision(tc, env, archs if vision_gpu else None)
     else:
-        say("\n2. the binaries as they are (--no-build)")
+        say("\n2. the programs as they are (--no-build): " + ("a release's, in bin/" if release else "build/'s"))
         if vision_gpu and not (ROOT / "build-vision-cuda" / "bin" / f"lamina-vision{EXE}").exists():
             fail("--vision gpu: build-vision-cuda/bin/lamina-vision is not built: run setup without --no-build")
     if not m:
@@ -896,8 +896,8 @@ def main() -> int:
     prepare(a.model, m, data, vision)
     say("\n5. the config and the launcher")
     port = a.port or m.port
-    cfg = write_config(a.model, data, gpu_spec(main_gpu, gl), port, vision, a.context, tc.nvcc, vision_gpu)
-    launcher = write_launcher(a.model, m, cfg, port)
+    cfg = write_config(a.model, data, gpu_spec(main_gpu, gl), port, vision, a.context, tc.nvcc, vision_gpu, release)
+    launcher = write_launcher(a.model, m, cfg, port, "bin" if release else "build")
     ok(f"{cfg.name}, {launcher.name}")
     say(f"\nDone. Start it with {launcher.name}: the API on http://127.0.0.1:{port}/v1 (OpenAI and Anthropic), "
         f"a chat page on http://127.0.0.1:{port}/")

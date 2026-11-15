@@ -93,6 +93,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     auto tier_of = [&](int32_t e, int32_t& slot) -> int {
         const size_t at = (size_t) d.layers * (size_t) d.n_expert + (size_t) e;
         for (int t = 0; t < NT; ++t) {
+            if (d.tiers[t].asleep && d.src->in_ram(d.layers, e)) {   // a sleeping tier's experts are the others'
+                if (d.tiers[t].res[at] >= 0) ++d.tiers[t].slept;
+                continue;
+            }
             if (d.tiers[t].res[at] >= 0) { slot = d.tiers[t].res[at]; return t; }
             const int p = d.tiers[t].gpu->prefetched(d.layers, e);
             if (p >= 0) { slot = -2 - p; return t; }
@@ -309,7 +313,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     };
     bool shares = false;
-    for (int t = 0; t < NT; ++t) shares = shares || n2g[t] > 0;
+    for (int t = 0; t < NT; ++t) {
+        shares = shares || n2g[t] > 0;
+        d.tiers[t].groups += n2g[t];
+    }
     if (!shares) submit2 = nullptr;
     pt("run", njobs);
     // LAMINA_POOL_FUSED=1 (opt-in): the layer's gate/up and down rows as one batch, no barrier between them
@@ -346,7 +353,8 @@ void expert_prefetch_multi(ExpertDispatch& d, int64_t layer, const int32_t* ids,
     const uint64_t bb = lamina::kernels::cpu::expert_layout().blob_bytes(layer);
     int room = 0;   // the prefetch slots the tiers' budgets take
     for (int t = 0; t < d.n_tiers; ++t)
-        room += (int) (std::min)((uint64_t) d.tiers[t].gpu->prefetch_slots(), d.tiers[t].prefetch_bytes / bb);
+        if (!d.tiers[t].asleep)
+            room += (int) (std::min)((uint64_t) d.tiers[t].gpu->prefetch_slots(), d.tiers[t].prefetch_bytes / bb);
     if (room <= 0) return;
     // the predicted experts no GPU holds, ranked by their summed routing weight over the window's tokens
     int32_t cand[128];
@@ -357,7 +365,7 @@ void expert_prefetch_multi(ExpertDispatch& d, int64_t layer, const int32_t* ids,
         if (e < 0 || e >= d.n_expert) continue;
         const size_t at = (size_t) layer * (size_t) d.n_expert + (size_t) e;
         bool held = d.host_res[at] >= 0 || !d.src->pinned(layer, e);
-        for (int t = 0; t < d.n_tiers && !held; ++t) held = d.tiers[t].res[at] >= 0;
+        for (int t = 0; t < d.n_tiers && !held; ++t) held = !d.tiers[t].asleep && d.tiers[t].res[at] >= 0;
         if (held) continue;
         int c = 0;
         while (c < nc && cand[c] != e) ++c;
@@ -367,6 +375,7 @@ void expert_prefetch_multi(ExpertDispatch& d, int64_t layer, const int32_t* ids,
     // the likeliest first, the first tier's slots filled first
     int m[kMaxGpuTiers] = {}, total = 0;
     for (int t = 0; t < d.n_tiers; ++t) {
+        if (d.tiers[t].asleep) continue;   // (and its experts are candidates for the tiers awake)
         m[t] = (int) (std::min)((uint64_t) (std::min)(nc - total, d.tiers[t].gpu->prefetch_slots()),
                                 d.tiers[t].prefetch_bytes / bb);
         total += m[t];

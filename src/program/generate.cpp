@@ -43,6 +43,7 @@
 #include "lamina/prefill/split.hpp"
 #include "lamina/kernels/f16_bits.hpp"
 #include "lamina/spec/suffix_drafter.hpp"
+#include "lamina/core/control_vector.hpp"
 #include "lamina/core/native_dense.hpp"
 #include "lamina/core/pack_image.hpp"
 #include "lamina/platform/cpu_arch.hpp"
@@ -89,6 +90,8 @@ int64_t even_chunk(int64_t len, int64_t cap) {
     const int64_t k = (len + cap - 1) / cap;
     return std::min(cap, ((len + k - 1) / k + 255) / 256 * 256);
 }
+/// --prompt-split-from: the chunk that reads a part of `len` tokens in two of one size (a multiple of 256).
+int64_t half_chunk(int64_t len) { return even_chunk(len, ((len + 1) / 2 + 255) / 256 * 256); }
 // A prompt's chunk: of one size where a second GPU takes the experts the first lacks (a short last chunk streams
 // nearly every expert of every layer, and under --prompt-split runs its second stage alone after the first's); whole
 // chunks on one GPU, whose copy-ahead area grows with a chunk's tokens (UD-Q4_K_XL's 64K prompt on the 3090 alone
@@ -191,6 +194,15 @@ struct Options {
     /// per tier, its clocks' lock while the engine generates, "<graphics min>-<graphics max>/<memory>" in MHz
     /// (core::GpuClocks), or "0": the driver's clocks
     std::vector<std::string> second_gpu_clocks;
+    /// Those locks' timing (--serve): kept this long after a request (--second-gpu-clocks-hold), and asked for this
+    /// long before a batched prompt part's end, by its progress (--second-gpu-clocks-lead; < 0: from the part's last
+    /// chunk on).
+    double clocks_hold = 5.0, clocks_lead = -1.0;
+    /// Per tier after the first: the CPU pool's time a layer (us) without the tier, averaged over a few seconds of
+    /// generation, below which it sleeps, its experts the CPU's, its clocks' lock released and its moves stopped until
+    /// the pool needs longer (--second-gpu-sleep-us; 0: it never sleeps).  Such a tier is also left out while a lock of
+    /// its own is on its way (tier_power).
+    std::vector<double> second_gpu_sleep_us;
     /// Keep the GPU tiers resident and executing, but do not adapt their residency while the main tier adapts.
     /// The default remains coupled adaptation of every tier.
     bool no_second_gpu_adapt = false;
@@ -208,13 +220,23 @@ struct Options {
     bool no_file_cache = false;
     /// The prompt path's share of the experts the main GPU holds that the second GPU computes (Prefill::set_shift).
     double prompt_shift = 0.0;
-    /// The prompt path in two stages (prefill/split.hpp): the second GPU runs each chunk's layers from this one on
-    /// while the main GPU runs the next chunk (0: off).  Prompts of more than one chunk.
-    double prompt_split = 0.0;
+    /// The prompt path in stages (prefill/split.hpp): the second GPU runs each chunk's layers from this one on
+    /// while the main GPU runs the next chunk (0: off).  Prompts of more than one chunk.  With `prompt_split2` (a
+    /// later layer; 0: none) three stages: the tier after the first runs the layers from prompt_split up to it, the
+    /// second GPU those from it on (without such a tier: two stages, split halfway between the two layers).
+    double prompt_split = 0.0, prompt_split2 = 0.0;
+    /// With the split: a batched part of this many tokens or more that fits one chunk is read in two chunks of one
+    /// size, through the stages (0: a part of one chunk runs on the main GPU's stage alone).
+    double prompt_split_from = 0.0;
+    /// The GPU tiers that compute their experts in prompts, counted from the first (1: the second GPU alone, which
+    /// streams the later tiers' experts; 2: the tier after it computes the ones its cache holds).
+    double prompt_tiers = 1.0;
     /// The elastic K/V (--kv-grow, LAMINA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
     bool kv_grow = false;
     bool no_kv_grow = false;   ///< --no-kv-grow: off whatever LAMINA_KV_GROW says
     bool hc_q8 = false;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
+    /// --control-vector*, --cvec-mode, --cvec-dir: a control vector on the residual stream (core::ControlVector)
+    lamina::core::ControlVectorSpec cvec;
     double head_split = 0.45;                ///< the second GPU's share of the head's rows (0: all on the main GPU)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
@@ -403,6 +425,17 @@ void usage() {
                  "                       0: the driver's), 0 = none (the default). For a tier the driver slows\n"
                  "                       between its short shares; from a prompt's last chunk until a few seconds\n"
                  "                       after the request. Needs administrator rights (root on Linux)\n"
+                 "  --second-gpu-clocks-hold S  --serve: those locks stay S seconds after a request (default 5)\n"
+                 "  --second-gpu-clocks-lead S  --serve: they are asked for S seconds before a batched prompt part\n"
+                 "                       ends, by its progress, instead of from its last chunk on (a lock is at\n"
+                 "                       speed ~0.6 s after it is asked for)\n"
+                 "  --second-gpu-sleep-us T[,..]  per tier after the first: it sleeps (its experts to the CPU, its\n"
+                 "                       lock released, its moves stopped) while the CPU pool would need less than\n"
+                 "                       T us a layer without it, averaged over a few seconds of generation, and\n"
+                 "                       wakes when that average passes 1.15 T or text turns heavy (twice T);\n"
+                 "                       such a tier is also left out until a lock of its own is at speed (0 =\n"
+                 "                       never, the default; not with --adapt-every 0 or --deterministic-adapt).\n"
+                 "                       Trades speed for the card's awake power: measure T per model file\n"
                  "  --no-second-gpu-adapt  with --second-gpu: keep the tiers\' resident expert assignment static while\n"
                  "                       the main GPU\'s adaptive tier continues to replace experts\n"
                  "  --deterministic-adapt  fixed-epoch adaptive copies and stable equal-gain ordering; default async\n"
@@ -420,10 +453,20 @@ void usage() {
                  "  --prompt-shift F     with --second-gpu: in prompt chunks of 8K tokens and more the second GPU also\n"
                  "                       computes the likeliest F (0..1) of each layer's experts the main GPU holds, copied\n"
                  "                       ahead with the ones it streams (when the main GPU's share is the longer; default 0)\n"
-                 "  --prompt-split L     with --second-gpu: a prompt of more than one chunk runs in two stages, the\n"
+                 "  --prompt-split L[,M] with --second-gpu: a prompt of more than one chunk runs in two stages, the\n"
                  "                       second GPU running each chunk's layers L.. whole (their weights and state\n"
                  "                       copied into its lent cache slots) while the main GPU runs the next chunk\n"
-                 "                       through the first ones (0: off, the default)\n"
+                 "                       through the first ones (0: off, the default).  L,M with two or more GPU\n"
+                 "                       tiers: three stages, the tier after the first running the layers L..M-1 (the\n"
+                 "                       experts its cache lacks on the second GPU), the second GPU the layers M..;\n"
+                 "                       with one tier, two stages split halfway between L and M\n"
+                 "  --prompt-split-from N  with --prompt-split: a prompt part of N tokens or more that fits one chunk\n"
+                 "                       (--prefill) is read in two chunks of one size through the stages too (the\n"
+                 "                       stages' own costs set N: by default, 0, such a part is read in one chunk)\n"
+                 "  --prompt-tiers N     with two or more GPU tiers: the first N of them compute their experts in\n"
+                 "                       prompts (default 1: the first tier alone, the experts of the later ones\n"
+                 "                       streaming to it; 2: the tier after it computes the ones its cache holds,\n"
+                 "                       their input and sums over its own link)\n"
                  "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
                  "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
                  "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
@@ -441,6 +484,14 @@ void usage() {
                  "                       windows read them, the prompt path takes them in BF16 a layer at a time\n"
                  "  --head-split F       with --second-gpu: its share of the output head's rows (default 0.45;\n"
                  "                       each GPU streams its part after the last layer; 0 = all on the main GPU)\n"
+                 "  --control-vector F[,F]  a control vector in llama.cpp's GGUF format (direction.<layer> tensors),\n"
+                 "                       applied to every hyper-connection stream after each layer's FFN write\n"
+                 "  --control-vector-scaled F:S[,F:S]  the same at scale S (the vectors of several files add up)\n"
+                 "  --control-vector-layer-range A B  the layers it follows, inclusive (default 1 .. the last)\n"
+                 "  --cvec-mode add|project  add: h += S d (llama.cpp's, the default); project: h -= |S d| (h . v) v,\n"
+                 "                       v = d / |d| (the cvec-hooks fork's: a unit direction at S 1 is removed)\n"
+                 "  --cvec-dir per-layer|single:L  project: each layer's own direction (default) or layer L's in every\n"
+                 "                       layer\n"
                  "  --no-prompt-offload  with --second-gpu: the prompt path streams the experts the main GPU's cache\n"
                  "                       lacks to the main GPU instead of computing them on the second\n"
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the argmax and\n"
@@ -548,6 +599,7 @@ struct Drive {
     std::vector<double> ring_us;   // by window size and layer
     Clock::time_point rows_at{};   // this window's last CPU rows (none yet: the epoch)
     int win_t = 0;                 // this window's tokens
+    bool win_prompt = false;       // ... are a prompt's (the serve loop's feed)
     int64_t n_layers = 0;
     /// The GPU tiers' adaptive tiers, paced: their copies go between windows, where the RAM is idle (the head, the
     /// commit, the drafts); through the layers they slowed the CPU pool's RAM reads, and on the 5070 Ti's one copy engine
@@ -562,6 +614,28 @@ struct Drive {
     bool adapt_next = false;                     // an update is ranked at this window's tail
     bool flush_next = false;                     // the next window's tail ranks one: this gap takes the rest
     std::string tier_err;
+    /// --second-gpu-sleep-us: a tier after the first that sleeps while the CPU pool would not need it (tier_power,
+    /// before each window).  `avg` and `fast`: the pool's us a layer without the tier over ~kLong and ~kFast rounds,
+    /// measured while it sleeps and predicted while it works.
+    struct TierPower {
+        double sleep_us = 0;          // the threshold (0: the tier never sleeps)
+        int device = -1;
+        lamina::core::AdaptiveTier* adapt = nullptr;
+        bool asleep = false;
+        double avg = 0, fast = 0;
+        int64_t in_state = 0;         // rounds since the last change of state
+        int64_t rounds = 0, rounds_asleep = 0, sleeps = 0, groups0 = 0;
+        double us_awake = 0, us_asleep = 0;   // that time summed over the rounds awake (predicted) and asleep (measured)
+    } power[lamina::core::kMaxGpuTiers];
+    lamina::core::GpuClocks* clocks = nullptr;
+    bool power_on = false;            // a tier has a threshold
+    // the pool's marginal cost of an expert (ms a (layer, expert) pair): a regression over the rounds that forgets,
+    // and no less than an expert's bytes at the pool's rate (`expert_ms`: few experts a layer hide in its threads)
+    double reg_n = 0, reg_x = 0, reg_y = 0, reg_xx = 0, reg_xy = 0;
+    double expert_ms = 0.05;
+    double cpu_ms0 = 0;
+    int64_t misses0 = 0, calls0 = 0;
+    int64_t pos = 0;                  // the window's position (LAMINA_TIER_POWER_LOG)
     /// The adaptive tiers' update (ranking, the second tier's first copies) on a thread of its own, started at the
     /// window's tail and joined before the next window.
     std::function<bool()> adapt;
@@ -594,9 +668,92 @@ double tier1_rate(const Drive* t) {
     return r > 0 ? r : 5e6;
 }
 
+/// --second-gpu-sleep-us, before a window: the round before it into each such tier's averages, then its state.
+/// Without a tier at work the pool would need the round's own time plus kAbsorb of the tier's experts at the pool's
+/// marginal cost: the first tier's prefetch takes the others at once (0.34 of IQ3_S's reached the CPU on thinking
+/// text; 0.5-0.76 on code, past the prefetch's budget, where the time is far over any threshold either way).
+/// The card's way down and back up takes ~2 s (1.3 s to its idle watts, 0.6 s to its locked clocks), and an agent's
+/// text crosses a threshold many times a second: an average over 64 rounds of a recorded session stayed under 55
+/// us for 0.5 s at a time, one over 256-512 rounds for 7-8 s.  So one long average decides both ways: a tier
+/// sleeps when it is under the threshold after kDwell rounds awake, and wakes when it passes kWake of it, or at
+/// once when the quick average passes kGuard of it (code and edits: three to ten times a thinking text's load).
+/// Asleep or with its clocks' lock still on its way, the tier is left out of the windows (ExpertDispatch::GpuTier).
+/// LAMINA_TIER_POWER_LOG=<file>: a line a round with the policy's inputs (scratch/power's sleep_trace.py and
+/// load_stretches.py read it): the window's tokens, the round's ms, the pool's ms, its experts, the second tier's
+/// (the third GPU's), the policy's state and the dispatch's, both averages, the marginal cost, the first tier's
+/// experts, the position.
+void tier_power(Drive* t) {
+    if (!t->power_on) return;
+    constexpr double kAbsorb = 0.35, kWake = 1.15, kGuard = 2.0, kForget = 0.98;
+    constexpr double kLong = 384, kFast = 16;   // rounds: ~6 s and ~0.25 s of IQ3_S's
+    constexpr int64_t kDwell = 128;             // rounds awake before a sleep, ~2 s
+    // a window of generated text ran since the last call (a prompt's tokens come in windows as wide as the verifier
+    // takes, whatever the text's drafts would be: they move neither the averages nor a tier's state)
+    const bool round = t->calls > t->calls0 && !t->win_prompt;
+    const double pool_ms = t->cpu_ms - t->cpu_ms0, cpu_exp = (double) (t->d.multi_misses - t->misses0);
+    t->cpu_ms0 = t->cpu_ms;
+    t->misses0 = t->d.multi_misses;
+    t->calls0 = t->calls;
+    if (round) {
+        t->reg_n = kForget * t->reg_n + 1.0;
+        t->reg_x = kForget * t->reg_x + cpu_exp;
+        t->reg_y = kForget * t->reg_y + pool_ms;
+        t->reg_xx = kForget * t->reg_xx + cpu_exp * cpu_exp;
+        t->reg_xy = kForget * t->reg_xy + cpu_exp * pool_ms;
+    }
+    const double den = t->reg_n * t->reg_xx - t->reg_x * t->reg_x;
+    const double cost = std::clamp(t->reg_n > 30.0 && den > 1e-6 ? (t->reg_n * t->reg_xy - t->reg_x * t->reg_y) / den : 0.0,
+                                   t->expert_ms, 6.0 * t->expert_ms);
+    static std::FILE* const plog = [] {
+        const char* f = std::getenv("LAMINA_TIER_POWER_LOG");
+        return f != nullptr ? std::fopen(f, "w") : nullptr;
+    }();
+    static Clock::time_point plast{};
+    if (plog != nullptr) {
+        const Clock::time_point now = Clock::now();
+        if (round)
+            std::fprintf(plog, "%d %.3f %.3f %.0f %lld %d %d %.1f %.1f %.4f %lld %lld\n", t->win_t,
+                         plast == Clock::time_point{} ? 0.0 : std::chrono::duration<double, std::milli>(now - plast).count(),
+                         pool_ms, cpu_exp, (long long) (t->d.tiers[1].groups - t->power[1].groups0),
+                         t->power[1].asleep ? 1 : 0, t->d.tiers[1].asleep ? 1 : 0, t->power[1].avg, t->power[1].fast, cost,
+                         (long long) (t->d.tiers[0].groups - t->power[0].groups0), (long long) t->pos);
+        t->power[0].groups0 = t->d.tiers[0].groups;
+        plast = now;
+    }
+    for (int i = 1; i < t->d.n_tiers; ++i) {
+        Drive::TierPower& p = t->power[i];
+        if (p.sleep_us <= 0) continue;
+        const double groups = (double) (t->d.tiers[i].groups - p.groups0);
+        p.groups0 = t->d.tiers[i].groups;
+        if (round) {
+            ++p.rounds;
+            ++p.in_state;
+            p.rounds_asleep += p.asleep ? 1 : 0;
+            const double us = 1e3 * (pool_ms + kAbsorb * groups * cost) / (double) t->n_layers;
+            (p.asleep ? p.us_asleep : p.us_awake) += us;
+            // (a mean until an average has its length of rounds: one seeded by a first round would keep it that long)
+            p.avg += (us - p.avg) / std::min((double) p.rounds, kLong);
+            p.fast += (us - p.fast) / std::min((double) p.rounds, kFast);
+            if (!p.asleep && p.in_state >= kDwell && p.avg < p.sleep_us && p.fast < kWake * p.sleep_us) {
+                p.asleep = true;
+                p.in_state = 0;
+                ++p.sleeps;
+            } else if (p.asleep && p.in_state >= 4 && (p.avg > kWake * p.sleep_us || p.fast > kGuard * p.sleep_us)) {
+                p.asleep = false;
+                p.in_state = 0;
+            }
+        }
+        if (p.adapt != nullptr) p.adapt->set_asleep(p.asleep);
+        if (t->clocks != nullptr) t->clocks->sleep(p.device, p.asleep);
+        t->d.tiers[i].asleep = p.asleep || (t->clocks != nullptr && !t->clocks->at_speed(p.device));
+    }
+}
+
 /// Before a window of `T` tokens: the tiers' landed moves admitted, and the first tier's next moves staged for what
 /// this window's layers take (their residents leave before the window's residency snapshot).
-void drive_window(Drive* t, int T) {
+void drive_window(Drive* t, int T, bool prompt = false) {
+    tier_power(t);   // (the round before this window)
+    t->win_prompt = prompt;
     t->win_t = T;
     t->rows_at = Clock::time_point{};
     if (t->placement != nullptr && t->d.pool != nullptr) {
@@ -973,26 +1130,61 @@ struct PromptBuffers {
     const lamina::core::SessionState* ss = nullptr;
     SlotLoan loan, loan2;   // each GPU's cache (a null cache lends nothing)
     bool lend = false, lend2 = false;
-    void* split_region = nullptr;   // take's region of the second GPU's loan for the split (null: none this prompt)
-    uint64_t split_bytes = 0;
+    // --prompt-split: take's region for each stage of the split, in its order (empty: no split this prompt)
+    std::vector<lamina::prefill::PromptSplit::Region> split_regions;
+    // --prompt-split L,M: the middle stage, on the tier after the first (`mid`), has the second GPU compute the
+    // experts its cache lacks, on this runner; its region comes from that tier's cache (loan3, where it may lend)
+    lamina::prefill::ExpertRunner offload_mid;
+    bool mid = false, borrow3 = false;
+    // --prompt-tiers 2: the later tier's runner for the main GPU's stage, set up or not (`help`); its buffers in its
+    // cache's last slots (loan3) unless the card has the room beside its cache (own3: allocated once, nothing to
+    // refill after a prompt).  `helping`: this prompt has it (use_helper: not while that tier runs a middle stage)
+    lamina::prefill::ExpertRunner helper;
+    bool help = false, helping = false;
+    SlotLoan loan3;
+    bool lend3 = false, own3 = false;
 
+    uint64_t helper_bytes(int64_t chunk) const {
+        return (lamina::prefill::ExpertRunner::bytes_needed(chunk, g->n_expert, true, false) + 255) & ~255ull;
+    }
     /// After the prompt path and its second GPU's runner have been initialized.
     bool init(int64_t max_chunk, bool borrow, std::string& err) {
+        if (help) {   // (a card with neither the room nor the slots: the prompts run without its share)
+            lend3 = !own3 && borrow && loan3.cache != nullptr && loan3.res != nullptr && !loan3.res->empty() &&
+                    loan3.plan(helper_bytes(max_chunk));
+            std::string he;
+            if (!lend3 && !helper.bind(nullptr, 0, max_chunk, he)) {
+                std::fprintf(stderr, "lamina: --prompt-tiers off: %s\n", he.c_str());
+                help = false;
+                prefill->set_helpers({});
+            }
+        }
+        helping = help;
+        borrow3 = borrow && loan3.cache != nullptr && loan3.res != nullptr && !loan3.res->empty();
         lend = borrow && loan.cache != nullptr && loan.res != nullptr && !loan.res->empty() &&
-               loan.plan(lamina::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, offload != nullptr));
+               loan.plan(lamina::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, offload != nullptr, help ? 1 : 0));
         lend2 = offload != nullptr && borrow && loan2.cache != nullptr && loan2.res != nullptr && !loan2.res->empty() &&
                 loan2.plan(lamina::prefill::ExpertRunner::bytes_needed(max_chunk, g->n_expert, true, true));
         return (lend || prefill->bind(nullptr, 0, max_chunk, err)) &&
                (offload == nullptr || lend2 || offload->bind(nullptr, 0, max_chunk, err));
     }
-    /// Before a prompt whose chunks hold up to `chunk` tokens; `split_need`: the split's bytes on the second GPU too
-    /// (PromptSplit::bytes_for), which `split_region` then holds when its cache could lend them.
-    bool take(int64_t chunk, std::string& err, uint64_t split_need = 0) {
+    /// Before take: whether this prompt's main stage has the later tier's runner (--prompt-tiers 2).
+    void use_helper(bool on) {
+        on = on && help;
+        if (on == helping) return;
+        helping = on;
+        prefill->set_helpers(on ? std::vector<lamina::prefill::ExpertRunner*>{&helper}
+                                : std::vector<lamina::prefill::ExpertRunner*>{});
+    }
+    /// Before a prompt whose chunks hold up to `chunk` tokens; `split_need`: with a split, each stage's bytes
+    /// (PromptSplit::bytes_for, in its order), which `split_regions` then hold when the stages' caches could lend
+    /// them (else they stay empty: no split this prompt).
+    bool take(int64_t chunk, std::string& err, const std::vector<uint64_t>& split_need = {}) {
+        auto up = [](uint64_t n) { return (n + 255) & ~255ull; };
         // sized before either loan, from the residency both GPUs' prefetch areas are sized for
         const uint64_t need = lend ? prefill->bytes_for(chunk) : 0;
         const uint64_t need2 = lend2 ? offload->bytes_for(chunk, loan.res ? loan.res->data() : nullptr) : 0;
-        split_region = nullptr;
-        split_bytes = 0;
+        split_regions.clear();
         if (lend) {
             loan.plan(need);
             loan.lend();
@@ -1001,36 +1193,55 @@ struct PromptBuffers {
         // so neither the last loan's slots, refilled since, nor another chunk size stays bound
         if (!prefill->bind(loan.base(), loan.bytes(), chunk, err)) return false;
         if (offload == nullptr) return true;
-        uint64_t r2 = 0;
-        bool with_split = false;
+        // the later tier's cache lends its --prompt-tiers runner's buffers (unless they are its own) and a middle
+        // stage's region; the second GPU's its runner for the main GPU's stage, then with a split the middle stage's
+        // runner and its own stage's region
+        const uint64_t one3 = helping ? helper_bytes(chunk) : 0;
+        const uint64_t h3 = lend3 ? one3 : 0;
+        const bool want = !split_need.empty() && split_need.size() == (mid ? 2u : 1u);
+        const uint64_t r2 = up(need2);
+        const uint64_t r2m = want && mid ? up(offload_mid.bytes_for(chunk, loan3.res ? loan3.res->data() : nullptr)) : 0;
+        bool with_split = want && lend2 && loan2.plan(r2 + r2m + up(split_need.back()));
+        if (with_split && mid) with_split = borrow3 && loan3.plan(h3 + up(split_need.front()));
         if (lend2) {
-            r2 = (need2 + 255) & ~255ull;
-            with_split = split_need > 0 && loan2.plan(r2 + split_need);
             if (!with_split) loan2.plan(need2);
             loan2.lend();
         }
+        if (!(with_split && mid)) {
+            if (h3 > 0) loan3.plan(h3);
+            else loan3.first = -1;
+        }
+        loan3.lend();
         if (!offload->bind(loan2.base(), with_split ? r2 : loan2.bytes(), chunk, err)) return false;
+        uint8_t* const base2 = (uint8_t*) loan2.base();
+        uint8_t* const base3 = (uint8_t*) loan3.base();
+        const bool in3 = lend3 && base3 != nullptr;   // the later tier's runner in its cache's last slots, else its own
+        if (helping && !helper.bind(in3 ? base3 : nullptr, in3 ? one3 : 0, chunk, err)) return false;
         if (with_split) {
-            split_region = (uint8_t*) loan2.base() + r2;
-            split_bytes = loan2.bytes() - r2;
+            if (mid) {
+                if (!offload_mid.bind(base2 + r2, r2m, chunk, err)) return false;
+                split_regions.push_back({base3 + h3, loan3.bytes() - h3});
+            }
+            split_regions.push_back({base2 + r2 + r2m, loan2.bytes() - r2 - r2m});
         }
         return true;
     }
     /// After it: the lent slots refilled.
     bool give_back(lamina::core::ExpertSource& src, std::string& err) {
-        return loan.give_back(src, g->n_expert, err) && loan2.give_back(src, g->n_expert, err);
+        return loan.give_back(src, g->n_expert, err) && loan2.give_back(src, g->n_expert, err) &&
+               loan3.give_back(src, g->n_expert, err);
     }
     /// After it, through the tiers of the loans' GPUs (null or off: that loan's blocking give_back): what the lent
     /// slots take back (refill_plan, `routed` the prompt's counts) goes out as their moves at once, each admitted as
     /// it lands while the first windows run (the blocking refill held a prompt up 0.12 s after 2K tokens, 0.31 s
     /// after 16K: the 3090's share over its x4 link).
-    bool give_back_tiers(lamina::core::AdaptiveTier* t1, lamina::core::AdaptiveTier* t2,
+    bool give_back_tiers(lamina::core::AdaptiveTier* t1, lamina::core::AdaptiveTier* t2, lamina::core::AdaptiveTier* t3,
                          const std::vector<uint32_t>* routed, lamina::core::ExpertSource& src, std::string& err) {
         std::vector<uint8_t> taken(loan.res ? loan.res->size() : loan2.res ? loan2.res->size() : 0, 0);
-        for (const SlotLoan* l : {&loan, &loan2})
+        for (const SlotLoan* l : {&loan, &loan2, &loan3})
             if (l->res != nullptr)
-                for (size_t i = 0; i < taken.size(); ++i) taken[i] |= (*l->res)[i] >= 0 ? 1 : 0;
-        const std::pair<SlotLoan*, lamina::core::AdaptiveTier*> loans[2] = {{&loan, t1}, {&loan2, t2}};
+                for (size_t i = 0; i < taken.size() && i < l->res->size(); ++i) taken[i] |= (*l->res)[i] >= 0 ? 1 : 0;
+        const std::pair<SlotLoan*, lamina::core::AdaptiveTier*> loans[3] = {{&loan, t1}, {&loan2, t2}, {&loan3, t3}};
         for (const auto& [l, t] : loans) {
             if (l->lent.empty()) continue;
             if (t == nullptr || !t->on()) {
@@ -1042,7 +1253,7 @@ struct PromptBuffers {
             cudaSetDevice(l->main_device);
             const auto moves = refill_plan(*l, routed, taken, g->n_expert, src);
             l->lent.clear();
-            if (!t->refill(moves, l == &loan ? (64ull << 20) : (256ull << 20), err)) return false;
+            if (!t->refill(moves, l == &loan2 ? (256ull << 20) : (64ull << 20), err)) return false;
         }
         return true;
     }
@@ -1086,13 +1297,24 @@ int qwen35_switch(int argc, char** argv) {
         std::fprintf(stderr, "lamina: --main-gpu %s: %s\n", main_gpu.c_str(), dev < 0 ? why.c_str() : "cannot use it");
         return 2;
     }
+    if (const std::string no = lamina::core::gpu_unusable(dev); !no.empty()) {
+        std::fprintf(stderr, "lamina: --main-gpu %s: GPU %d, %s: %s\n", main_gpu.c_str(), dev,
+                     gpus[(size_t) dev].name.c_str(), no.c_str());
+        return 2;
+    }
     // --second-gpu: the GPUs a layer split may add, in order (names or numbers, comma-separated, a name no visible GPU
-    // answers to left out; auto: every other GPU in CUDA's order; -1: none); the engine takes the fewest that hold the
-    // model
+    // answers to left out; auto: every other GPU in CUDA's order; -1: none), each one this build's kernels do not run
+    // on left out; the engine takes the fewest that hold the model
     std::vector<int> stages{dev};
+    auto usable = [&](int d) {   // (the split's GPUs have their contexts made here, as its sizing would)
+        const std::string no = lamina::core::gpu_unusable(d);
+        if (!no.empty())
+            std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(), no.c_str());
+        return no.empty();
+    };
     if (second == "auto") {
         for (const lamina::core::GpuInfo& gi : gpus)
-            if (gi.ordinal != dev) stages.push_back(gi.ordinal);
+            if (gi.ordinal != dev && usable(gi.ordinal)) stages.push_back(gi.ordinal);
     } else if (!second.empty() && second != "-1") {
         for (size_t at = 0; at <= second.size();) {
             const size_t comma = std::min(second.find(',', at), second.size());
@@ -1105,9 +1327,10 @@ int qwen35_switch(int argc, char** argv) {
                              d < 0 ? why.c_str() : "the split has that GPU already");
                 continue;
             }
-            stages.push_back(d);
+            if (usable(d)) stages.push_back(d);
         }
     }
+    cudaSetDevice(dev);   // current again for the path's first CUDA call
     std::string list, more, flag = "--stage-gpus";
     for (const int d : stages) {
         list += (list.empty() ? "" : ",") + std::to_string(d);
@@ -1163,6 +1386,37 @@ int lamina::program::run(int argc, char** argv) {
                 continue;
             }
         }
+        if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // core/control_vector.hpp
+            std::string e;
+            bool ok = true;
+            if (a == "--control-vector" || a == "--control-vector-scaled") {
+                ok = lamina::core::parse_control_vectors(next(a.c_str()), a == "--control-vector-scaled",
+                                                         o.cvec.files, e);
+            } else if (a == "--control-vector-layer-range") {
+                o.cvec.first = std::atoi(next(a.c_str()));
+                o.cvec.last = std::atoi(next(a.c_str()));
+            } else if (a == "--cvec-mode") {
+                const std::string m = next(a.c_str());
+                ok = m == "add" || m == "project";
+                o.cvec.project = m == "project";
+                if (!ok) e = "--cvec-mode: add or project, not '" + m + "'";
+            } else if (a == "--cvec-dir") {
+                const std::string d = next(a.c_str());
+                char* end = nullptr;
+                const long l = d.rfind("single:", 0) == 0 ? std::strtol(d.c_str() + 7, &end, 10) : -1;
+                ok = d == "per-layer" || (l >= 1 && end != d.c_str() + 7 && *end == '\0');
+                o.cvec.single = d == "per-layer" ? -1 : (int) l;
+                if (!ok) e = "--cvec-dir: per-layer or single:L (L >= 1), not '" + d + "'";
+            } else {
+                ok = false;
+                e = "unknown argument: " + a;
+            }
+            if (!ok) {
+                std::fprintf(stderr, "%s\n", e.c_str());
+                return 2;
+            }
+            continue;
+        }
         {   // the knobs, the texts and the lists below outside the chain as well
             std::string* text = a == "--expert-profile-save" ? &o.expert_profile_save
                               : a == "--dump-draft-data" ? &o.dump_draft_data
@@ -1171,7 +1425,17 @@ int lamina::program::run(int argc, char** argv) {
                 *text = next(a.c_str());
                 continue;
             }
-            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-split" ? &o.prompt_split
+            if (a == "--prompt-split") {   // a layer, or two
+                const std::string v = next(a.c_str());
+                const size_t comma = v.find(',');
+                o.prompt_split = std::atof(v.c_str());
+                o.prompt_split2 = comma == std::string::npos ? 0.0 : std::atof(v.c_str() + comma + 1);
+                continue;
+            }
+            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-tiers" ? &o.prompt_tiers
+                         : a == "--prompt-split-from" ? &o.prompt_split_from
+                         : a == "--second-gpu-clocks-hold" ? &o.clocks_hold
+                         : a == "--second-gpu-clocks-lead" ? &o.clocks_lead
                          : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
                          : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
                          : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
@@ -1204,7 +1468,8 @@ int lamina::program::run(int argc, char** argv) {
             }
             std::vector<double>* list = a == "--second-gpu-gib" ? &o.second_gpu_gib
                                       : a == "--second-gpu-reserve-mib" ? &o.second_gpu_reserve_mib
-                                      : a == "--second-gpu-prefetch-mb" ? &o.second_gpu_prefetch_mb : nullptr;
+                                      : a == "--second-gpu-prefetch-mb" ? &o.second_gpu_prefetch_mb
+                                      : a == "--second-gpu-sleep-us" ? &o.second_gpu_sleep_us : nullptr;
             if (list != nullptr) {
                 if (!number_list(next(a.c_str()), *list)) {
                     std::fprintf(stderr, "lamina: %s takes a number or a comma-separated list\n", a.c_str());
@@ -1365,13 +1630,19 @@ int lamina::program::run(int argc, char** argv) {
                      o.main_gpu < 0 ? gpu_why.c_str() : "cannot use it");
         return 2;
     }
+    if (const std::string no = lamina::core::gpu_unusable(o.main_gpu); !no.empty()) {
+        std::fprintf(stderr, "lamina: --main-gpu %s: GPU %d, %s: %s\n", o.main_gpu_name.c_str(), o.main_gpu,
+                     gpus[(size_t) o.main_gpu].name.c_str(), no.c_str());
+        return 2;
+    }
     {
         const lamina::core::GpuInfo& gi = gpus[(size_t) o.main_gpu];
         std::fprintf(stderr, "lamina: main GPU %d, %s (%s, %s)\n", o.main_gpu, gi.name.c_str(),
                      gi.bus_id.c_str(), gi.uuid.c_str());
     }
     // the GPU tiers: the ones named, a name no visible GPU answers to (a card taken out, a failed driver) left out, or
-    // with "auto" every other GPU, ordered by the probe below
+    // with "auto" every other GPU, ordered by the probe below (and one this build's kernels do not run on left out
+    // once its context is made)
     const bool tier_auto = o.tier_names.size() == 1 && o.tier_names[0] == "auto";
     for (const lamina::core::GpuInfo& gi : gpus)
         if (tier_auto && gi.ordinal != o.main_gpu) o.tier_gpus.push_back(gi.ordinal);
@@ -1397,7 +1668,9 @@ int lamina::program::run(int argc, char** argv) {
         return 2;
     }
     // the GPU tiers' contexts, each made on a thread of its own beside the loads: a first CUDA call took ~2 s here (the
-    // head split's or the tier's, whichever came first).  Joined before either, and on any return.
+    // head split's or the tier's, whichever came first), there asked whether this build's kernels run on each.  Joined
+    // before either, and on any return.
+    std::vector<std::string> tier_unusable(o.tier_gpus.size());
     struct JoinOnExit {
         std::vector<std::thread> t;
         void join() {
@@ -1406,10 +1679,9 @@ int lamina::program::run(int argc, char** argv) {
         }
         ~JoinOnExit() { join(); }
     } second_ctx;
-    for (const int dev : o.tier_gpus)
-        second_ctx.t.emplace_back([dev] {
-            if (cudaSetDevice(dev) == cudaSuccess) (void) cudaFree(nullptr);
-            (void) cudaGetLastError();   // a failure shows where the GPU is first used
+    for (size_t i = 0; i < o.tier_gpus.size(); ++i)
+        second_ctx.t.emplace_back([dev = o.tier_gpus[i], &no = tier_unusable[i]] {
+            no = lamina::core::gpu_unusable(dev);
         });
     lamina::core::qsa_set_kv_format(o.kv == "int8"   ? lamina::core::KvFormat::Int8
                                     : o.kv == "k8v4" ? lamina::core::KvFormat::K8V4
@@ -1589,6 +1861,23 @@ int lamina::program::run(int argc, char** argv) {
                              "%.2f MiB\n", hc_q8.matrices(), hc_q8.stored_q8_0(), (double) hc_q8.bytes() / 1048576.0);
     }
 
+    // a control vector: layer weights the verify windows and the prompt path apply (and a prompt split copies)
+    lamina::core::ControlVector cvec;
+    if (!o.cvec.files.empty()) {
+        if (!cvec.load(o.cvec, lamina::core::ModelGeometry{}, wt, err)) {
+            std::fprintf(stderr, "lamina: %s\n", err.c_str());
+            return 2;
+        }
+        const lamina::core::ControlVectorTables& t = cvec.tables();
+        for (const std::string& w : t.warnings) std::fprintf(stderr, "lamina: control vector: %s\n", w.c_str());
+        std::string files;
+        for (const auto& f : o.cvec.files) files += (files.empty() ? "" : ", ") + f.path + " x " + std::to_string(f.scale);
+        std::fprintf(stderr, "lamina: control vector (%s%s), layers %lld..%lld (%zu steered): %s\n",
+                     o.cvec.project ? "project" : "add",
+                     o.cvec.single >= 0 ? (", the direction of layer " + std::to_string(o.cvec.single)).c_str() : "",
+                     (long long) t.first, (long long) t.last, t.layers.size(), files.c_str());
+    }
+
     // the native GR write and shared expert (the parity tests switch them off to compare)
     lamina::kernels::gr_set_native_mmvf(true);
     lamina::kernels::shared_expert_set_native_bf16(true);
@@ -1596,23 +1885,23 @@ int lamina::program::run(int argc, char** argv) {
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
     std::vector<int32_t> mrope_host;
-    // --prompt-split's second stage runs rope kernels on the second GPU: a copy of the table there (setup_prompt_path)
-    int32_t* d_mrope2 = nullptr;
-    int mrope2_dev = -1;
+    // --prompt-split's later stages run rope kernels on their GPUs: a copy of the table on each (setup_prompt_path)
+    std::vector<std::pair<int32_t*, int>> mrope_copies;   // (the copy, its GPU)
     // the host table to each GPU's copy, landed when it returns: a pageable copy may return before its DMA lands, and
     // the rope kernels read the table from non-blocking streams
     auto mrope_upload = [&]() -> bool {
         const size_t bytes = mrope_host.size() * sizeof(int32_t);
         bool ok = cudaMemcpy(d_mrope, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
                   cudaDeviceSynchronize() == cudaSuccess;
-        if (ok && d_mrope2 != nullptr) {
-            int cur = 0;
-            cudaGetDevice(&cur);
-            cudaSetDevice(mrope2_dev);
-            ok = cudaMemcpy(d_mrope2, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+        int cur = 0;
+        cudaGetDevice(&cur);
+        for (const auto& [t, dev] : mrope_copies) {
+            if (!ok) break;
+            cudaSetDevice(dev);
+            ok = cudaMemcpy(t, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
                  cudaDeviceSynchronize() == cudaSuccess;
-            cudaSetDevice(cur);
         }
+        cudaSetDevice(cur);
         return ok;
     };
     if (o.vision) {
@@ -1836,8 +2125,41 @@ int lamina::program::run(int argc, char** argv) {
     }
     lamina::core::ArenaExpertSource arena_src;
     lamina::core::ExpertSource* srcp = nullptr;
+    // The RAM the model takes against this PC's, before the arena takes it: the experts in it and, with --ple-io ram,
+    // the PLE table (read in after them).  False when they cannot fit, said; a warning when they leave little.
+    auto ram_fits = [&](uint64_t arena_bytes) {
+        uint64_t need = arena_bytes;
+        std::string what = "the model's experts";
+        if (o.ple_io == "ram") {
+            try {
+                const lamina::GgufFile f(o.ple_gguf);
+                if (const lamina::TensorInfo* t = f.find("per_layer_token_embd.weight")) {
+                    need += lamina::tensor_payload_bytes(*t);
+                    what += " and its PLE table";
+                }
+            } catch (const std::exception&) {   // the table's open has said what is wrong with the file
+            }
+        }
+        const lamina::platform::RamFit ram = lamina::platform::ram_fit(need);
+        if (ram.total > 0)
+            std::fprintf(stderr, "lamina: RAM: %s take %.1f GiB, %.1f of this PC's %.1f GiB available\n", what.c_str(),
+                         (double) need / 1073741824.0, (double) ram.available / 1073741824.0,
+                         (double) ram.total / 1073741824.0);
+        if (ram.too_much()) {
+            std::fprintf(stderr, "lamina: %s\n",
+                         ram.say(what, "a smaller quant of the model takes less, and --vram-pin-gib keeps experts in "
+                                       "VRAM instead").c_str());
+            return false;
+        }
+        if (ram.tight())
+            lamina::program::serve_warn(o.serve, ram.say(what, "close other programs, or use a smaller quant of the "
+                                                               "model"));
+        return true;
+    };
     auto load_experts = [&]() -> bool {
         arena_src.set_gguf(native_shards);
+        const lamina::kernels::cpu::ExpertLayout& lay = lamina::kernels::cpu::expert_layout();
+        uint64_t arena_bytes = lay.total;
         if (!vram_only.empty()) {
             // --prompt-split: the second stage streams the experts of its layers that its GPU lacks from this arena,
             // and the main GPU's pinned ones of those layers live nowhere else, so they stay here too (the first
@@ -1848,8 +2170,12 @@ int lamina::program::run(int argc, char** argv) {
                 for (int64_t l = (int64_t) o.prompt_split; l < g.n_layers; ++l)
                     for (int64_t e = 0; e < g.n_expert; ++e)
                         if (uint8_t& v = left_out[(size_t) (l * g.n_expert + e)]; v == 1) v = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (left_out[(size_t) (l * g.n_expert + e)] != 0) arena_bytes -= lay.blob_bytes(l);
             arena_src.set_vram_only(std::move(left_out));
         }
+        if (!ram_fits(arena_bytes)) return false;
         arena_src.set_uncached(o.no_file_cache);
         if (!arena_src.open(g.n_layers, g.n_expert, /*threads=*/6, err)) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
@@ -1920,6 +2246,23 @@ int lamina::program::run(int argc, char** argv) {
             return 1;
         }
         mtp.set_max_drafts(o.spec - 1);
+    }
+    // a GPU tier this build's kernels do not run on is left out
+    if (!o.tier_gpus.empty()) {
+        second_ctx.join();
+        std::vector<int> usable;
+        for (size_t i = 0; i < o.tier_gpus.size(); ++i) {
+            const int d = o.tier_gpus[i];
+            if (tier_unusable[i].empty()) usable.push_back(d);
+            else std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(),
+                              tier_unusable[i].c_str());
+        }
+        o.tier_gpus = usable;
+        o.second_gpu = usable.empty() ? -1 : usable[0];
+        if (o.second_gpu < 0 && o.second_gpu_pin_gib > 0) {
+            std::fprintf(stderr, "lamina: --second-gpu-pin-gib needs a GPU tier, and none is left\n");
+            return 2;
+        }
     }
     // The GPU tiers' links measured, and whether the desktop uses each, while no load reads the RAM: "auto" puts the
     // fastest first (host-to-device rate x multiprocessors) and keeps the first kMaxGpuTiers; a reserve or a prefetch
@@ -2481,6 +2824,21 @@ int lamina::program::run(int argc, char** argv) {
                 drive.d.tiers[t].gpu = &gp;
                 drive.d.tiers[t].res = ts.res.data();
                 drive.d.tiers[t].prefetch_bytes = pf_bytes;
+                // --second-gpu-sleep-us: a tier after the first may sleep, in a run whose experts move
+                drive.power[t].device = dev;
+                drive.power[t].adapt = &ts.adapt;
+                if (const double us = tier_value(o.second_gpu_sleep_us, ti); us > 0) {
+                    if (t == 0 || o.adapt_every <= 0 || o.deterministic_adapt) {
+                        std::fprintf(stderr, "lamina: --second-gpu-sleep-us: the %s GPU does not sleep (%s)\n", kTierName[t],
+                                     t == 0 ? "the first tier carries the prompts' share, the head's rows and the prefetch"
+                                            : "--adapt-every 0 and --deterministic-adapt keep the experts in place");
+                    } else {
+                        drive.power[t].sleep_us = us;
+                        drive.power_on = true;
+                        std::fprintf(stderr, "lamina: %s GPU %d sleeps while the CPU pool would need less than %.0f us a "
+                                             "layer without it\n", kTierName[t], dev, us);
+                    }
+                }
                 drive.d.n_tiers = ++n_tiers;
                 std::fprintf(stderr, "lamina: %s GPU %d (%s): %zu experts from the profile and %zu empty "
                                      "slots, %.2f GiB\n", kTierName[t], dev, prop.name, pre.size(), empty.size(),
@@ -2501,11 +2859,16 @@ int lamina::program::run(int argc, char** argv) {
             }
         }
         drive.d.tier_min_bytes = (uint64_t) (o.second_gpu_min_mb * 1048576.0);
+        drive.clocks = &clocks;
+        // an expert's time in the CPU pool, by its bytes at ~50 GB/s (IQ3_S's 2 MB: 0.04 ms; measured 0.04-0.06)
+        drive.expert_ms = (double) lay.total / (double) (g.n_layers * g.n_expert) / 50e9 * 1e3;
         // the tiers that work, in order: the first takes the prompt path's share and the split
         o.tier_gpus.clear();
         for (int t = 0; t < n_tiers; ++t) o.tier_gpus.push_back(tiers[(size_t) t].gpu.device());
         o.second_gpu = n_tiers > 0 ? o.tier_gpus[0] : -1;
     }
+    // --prompt-tiers 2: the main GPU's prompt buffers hold a later tier's sums too
+    const int prompt_helpers = o.prompt_tiers >= 2 && n_tiers >= 2 && !o.no_prompt_offload ? 1 : 0;
     // The largest loan the main GPU's prompt path can take: its buffers for the longest chunk with a whole layer
     // streamed (the prefetch area grows with the experts the cache does not hold).  The elastic K/V stays below it.
     auto worst_loan = [&](bool off) {
@@ -2516,7 +2879,7 @@ int lamina::program::run(int argc, char** argv) {
         // (with pinned experts and the second GPU's share of the prompt path, no layer streams here: the loan is its
         // buffers alone, Prefill::bytes_for)
         const uint64_t worst_pre = !pin1.empty() && off ? 0 : stride * (uint64_t) g.n_expert;
-        return lamina::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off) + worst_pre + worst_pre / 10;
+        return lamina::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off, prompt_helpers) + worst_pre + worst_pre / 10;
     };
     // --arena-place: the RAM's slow places go to the experts that stay on a GPU: below the slots each GPU's prompt
     // path borrows at every batched prompt (its cache's last ones) and, with the elastic K/V, below the slots the whole
@@ -2546,7 +2909,7 @@ int lamina::program::run(int argc, char** argv) {
         const int64_t chunk = o.prefill_chunk;
         const int32_t* res1 = host_res.empty() ? nullptr : host_res.data();
         const int32_t* res2 = host_res2.empty() ? nullptr : host_res2.data();
-        const uint64_t need1 = lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off) +
+        const uint64_t need1 = lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off, prompt_helpers) +
                                (off ? 0 : std::min(ExpertRunner::prefetch_need(res1, nullptr, g.n_expert, true),
                                                    ExpertRunner::area_cap(chunk, false)));
         const uint64_t need2 = ExpertRunner::bytes_needed(chunk, g.n_expert, true, true) +
@@ -2606,8 +2969,8 @@ int lamina::program::run(int argc, char** argv) {
             probe.cache = &xcache;
             probe.keep = (int64_t) pin1.size();   // the pinned slots are never lent
             int64_t chunk = o.prefill_chunk;
-            while (chunk > 256 && !probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off))) chunk /= 2;
-            if (chunk != o.prefill_chunk && probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off))) {
+            while (chunk > 256 && !probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off, prompt_helpers))) chunk /= 2;
+            if (chunk != o.prefill_chunk && probe.plan(lamina::prefill::Prefill::bytes_needed(g, ss, chunk, off, prompt_helpers))) {
                 std::fprintf(stderr, "lamina: prompt chunk %lld -> %lld tokens so its buffers fit in the expert "
                                      "cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
@@ -2632,7 +2995,7 @@ int lamina::program::run(int argc, char** argv) {
             for (size_t l = 0; l < (size_t) g.n_layers; ++l)
                 for (size_t x = 0; x < ne; ++x)
                     if (!seen[l * ne + x]) order[l * ne + at[l]++] = (int32_t) x;
-            split.set_order(order);
+            split.set_order(order);   // (kept for its stages, which init makes)
             prefill.set_order(std::move(order));
         }
         if (off) {   // --prompt-shift (without a profile the order is by id)
@@ -2641,22 +3004,53 @@ int lamina::program::run(int argc, char** argv) {
         }
         pbuf.prefill = &prefill;
         pbuf.offload = off ? &offload : nullptr;
-        // --prompt-split: the second GPU's stage (without its pinned buffers, no split)
+        // --prompt-tiers 2: the tier after the first computes the experts its cache holds, for the main GPU's stage
+        if (off && o.prompt_tiers >= 2 && n_tiers >= 2) {
+            std::string he;
+            if (pbuf.helper.init(o.tier_gpus[1], o.main_gpu, nullptr, srcp, &tiers[1].gpu.cache(), tiers[1].res.data(),
+                                 g.n_expert, o.prefill_chunk, false, he)) {
+                pbuf.help = true;
+                prefill.set_helpers({&pbuf.helper});
+            } else {
+                std::fprintf(stderr, "lamina: --prompt-tiers: the %s GPU's share of prompts is off: %s\n", kTierName[1],
+                             he.c_str());
+                pbuf.helper.~ExpertRunner();
+                new (&pbuf.helper) lamina::prefill::ExpertRunner();
+                cudaSetDevice(o.main_gpu);
+            }
+        }
         if (off && o.prompt_split > 0) {
             const auto ts = Clock::now();
             std::string se;
-            // the vision path: the second stage's rope kernels read the image positions from their GPU's copy of the
+            // three stages with a later layer and a tier after the first: that tier's GPU runs the middle layers.
+            // Without that tier (a card left out at the start), two stages split halfway between the two layers: the
+            // middle stage's layers go to its neighbours
+            const bool ordered = o.prompt_split2 > o.prompt_split;
+            const bool three = ordered && n_tiers >= 2;
+            const int64_t split_at = ordered && !three ? ((int64_t) o.prompt_split + (int64_t) o.prompt_split2) / 2
+                                                       : (int64_t) o.prompt_split;
+            if (o.prompt_split2 > 0 && !three)
+                std::fprintf(stderr, "lamina: --prompt-split %lld,%lld: %s: two stages, split at %lld\n",
+                             (long long) o.prompt_split, (long long) o.prompt_split2,
+                             ordered ? "no GPU tier after the first" : "the second layer is not after the first",
+                             (long long) split_at);
+            // the vision path: a later stage's rope kernels read the image positions from their GPU's copy of the
             // table, set before any graph there captures one
-            if (d_mrope != nullptr && d_mrope2 == nullptr) {
+            std::vector<int> stage_devs;
+            if (three) stage_devs.push_back(o.tier_gpus[1]);
+            stage_devs.push_back(o.second_gpu);
+            for (const int dev : stage_devs) {
+                bool have = d_mrope == nullptr;
+                for (const auto& c : mrope_copies) have = have || c.second == dev;
+                if (have || !se.empty()) continue;
                 const size_t bytes = mrope_host.size() * sizeof(int32_t);
-                cudaSetDevice(o.second_gpu);
+                cudaSetDevice(dev);
                 int32_t* t = nullptr;
                 const bool got = cudaMalloc(&t, bytes) == cudaSuccess;
                 if (got && cudaMemcpy(t, mrope_host.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess) {
                     lamina::kernels::mrope_table_set(t);
-                    d_mrope2 = t;
-                    mrope2_dev = o.second_gpu;
-                    at_exit.undo.push_back([t, dev = o.second_gpu] {
+                    mrope_copies.emplace_back(t, dev);
+                    at_exit.undo.push_back([t, dev] {
                         cudaSetDevice(dev);
                         lamina::kernels::mrope_table_set(nullptr);
                         cudaFree(t);
@@ -2664,18 +3058,40 @@ int lamina::program::run(int argc, char** argv) {
                 } else {
                     if (got) cudaFree(t);
                     (void) cudaGetLastError();
-                    se = "no VRAM for the image position table on the second GPU";
+                    se = "no VRAM for the image position table on a stage's GPU";
                 }
                 cudaSetDevice(o.main_gpu);
             }
-            if (se.empty() && split.init(prefill, wt, g, ss, o.mtp.empty() ? nullptr : &mtp, (int64_t) o.prompt_split,
-                                         o.second_gpu, o.main_gpu, srcp, &gpu2.cache(),
-                                         host_res2.empty() ? nullptr : host_res2.data(), o.prefill_chunk, se)) {
+            std::vector<lamina::prefill::PromptSplit::Stage> stages;
+            const int32_t* const res2 = host_res2.empty() ? nullptr : host_res2.data();
+            if (three && se.empty()) {
+                // the middle stage's missing experts: a runner of the second GPU's, driven from that stage's thread
+                if (pbuf.offload_mid.init(o.second_gpu, o.tier_gpus[1], nullptr, srcp, &gpu2.cache(), res2, g.n_expert,
+                                          o.prefill_chunk, true, se)) {
+                    stages.push_back({(int64_t) o.prompt_split, o.tier_gpus[1], &tiers[1].gpu.cache(), tiers[1].res.data(),
+                                      &pbuf.offload_mid});
+                    stages.push_back({(int64_t) o.prompt_split2, o.second_gpu, &gpu2.cache(), res2, nullptr});
+                }
+                cudaSetDevice(o.main_gpu);
+            } else if (se.empty()) {
+                stages.push_back({split_at, o.second_gpu, &gpu2.cache(), res2, nullptr});
+            }
+            if (se.empty() && split.init(prefill, wt, g, ss, o.mtp.empty() ? nullptr : &mtp, stages, o.main_gpu, srcp,
+                                         o.prefill_chunk, se)) {
                 pbuf.split = &split;
-                std::fprintf(stderr, "lamina: --prompt-split: the second GPU runs layers %lld-%lld of a prompt's "
-                                     "chunks, their %.0f MiB of weights copied from this GPU at each prompt (%.0f ms)\n",
-                             (long long) split.at(), (long long) g.n_layers - 1, (double) split.weight_bytes / 1048576.0,
-                             std::chrono::duration<double, std::milli>(Clock::now() - ts).count());
+                pbuf.mid = three;
+                if (three)
+                    std::fprintf(stderr, "lamina: --prompt-split: the %s GPU runs layers %lld-%lld of a prompt's chunks "
+                                         "and the second GPU layers %lld-%lld, their %.0f MiB of weights copied from this "
+                                         "GPU at each prompt (%.0f ms)\n", kTierName[1], (long long) split.at(0),
+                                 (long long) split.at(1) - 1, (long long) split.at(1), (long long) g.n_layers - 1,
+                                 (double) split.weight_bytes / 1048576.0,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - ts).count());
+                else
+                    std::fprintf(stderr, "lamina: --prompt-split: the second GPU runs layers %lld-%lld of a prompt's "
+                                         "chunks, their %.0f MiB of weights copied from this GPU at each prompt (%.0f ms)\n",
+                                 (long long) split.at(), (long long) g.n_layers - 1, (double) split.weight_bytes / 1048576.0,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - ts).count());
             } else {
                 std::fprintf(stderr, "lamina: --prompt-split off: %s\n", se.c_str());
             }
@@ -2695,6 +3111,25 @@ int lamina::program::run(int argc, char** argv) {
             pbuf.loan2.device = o.second_gpu;
             pbuf.loan2.main_device = o.main_gpu;
             pbuf.loan2.keep = (int64_t) pin2.size();
+        }
+        if (pbuf.help || pbuf.mid) {
+            pbuf.loan3.cache = &tiers[1].gpu.cache();
+            pbuf.loan3.res = &tiers[1].res;
+            pbuf.loan3.device = o.tier_gpus[1];
+            pbuf.loan3.main_device = o.main_gpu;
+        }
+        if (pbuf.help) {
+            // its own buffers where the card has the room beside its cache and its reserve: nothing to refill
+            size_t free3 = 0, total3 = 0;
+            cudaSetDevice(o.tier_gpus[1]);
+            cudaMemGetInfo(&free3, &total3);
+            cudaSetDevice(o.main_gpu);
+            const uint64_t need3 = pbuf.helper_bytes(o.prefill_chunk);
+            pbuf.own3 = free3 >= need3 + ((uint64_t) 512 << 20);
+            std::fprintf(stderr, "lamina: --prompt-tiers: the %s GPU computes the experts it holds for the main GPU's "
+                                 "layers of a prompt%s, %.2f GiB of buffers %s\n", kTierName[1],
+                         pbuf.mid ? " that runs unsplit" : "", (double) need3 / 1073741824.0,
+                         pbuf.own3 ? "of its own" : "in its cache's last slots");
         }
         if (!pbuf.init(o.prefill_chunk, !o.no_prefill_borrow, e)) return false;
         if (pin1.empty() && pin2.empty()) return true;
@@ -3278,15 +3713,6 @@ int lamina::program::run(int argc, char** argv) {
             serve_print("PP %lld %lld %.0f %.1f\n", (long long) (done - pp_from), (long long) pp_total, ms,
                         ms > 0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
         };
-        // --second-gpu-clocks: held from the batched part's last chunk on (a chunk takes seconds, a lock half of one);
-        // `hold_from` is where that chunk starts, `pp_chunks` the chunks begun since `pp_at`
-        constexpr double kClocksIdleS = 5.0;   // and until this long after a request
-        int64_t hold_from = 0, pp_chunk = 1, pp_chunks = 0;
-        prefill.should_stop = [&] {
-            pp_line(pp_at + prefill.processed());
-            if (pp_at + pp_chunks++ * pp_chunk >= hold_from) clocks.hold();
-            return stop_req.load();
-        };
         // LAMINA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("LAMINA_TRACE") != nullptr;
         const Clock::time_point trace_t0 = Clock::now();
@@ -3295,6 +3721,38 @@ int lamina::program::run(int argc, char** argv) {
             std::fprintf(stderr, "lamina trace: %s %lld %lld (%.1f ms)\n", what, a, b,
                          std::chrono::duration<double, std::milli>(Clock::now() - trace_t0).count());
             std::fflush(stderr);
+        };
+        // --second-gpu-clocks: held from the batched part's last chunk on (a chunk takes seconds, a lock half of one);
+        // `hold_from` is where that chunk starts, `pp_chunks` the chunks begun since `pp_at`.  With
+        // --second-gpu-clocks-lead they are asked for that long before the part's end instead: the time since the
+        // part's first layer over the share of its layer-tokens queued tells how far the end is, on the path that
+        // ends the part (the main GPU's, or with --prompt-split the last stage's, on its thread).  And until
+        // --second-gpu-clocks-hold after a request.
+        int64_t hold_from = 0, pp_chunk = 1, pp_chunks = 0;
+        std::atomic<bool> lead_on{false};
+        bool lead_split = false;
+        int64_t lead_from = 0, lead_seg = 0, lead_total = 1;
+        Clock::time_point lead_t0{};
+        const auto lead_tick = [&](double all) {   // `all`: the share of the part read
+            if (!lead_on.load(std::memory_order_relaxed)) return;
+            const Clock::time_point now = Clock::now();
+            if (lead_t0 == Clock::time_point{}) lead_t0 = now;
+            if (all < 0.02 || std::chrono::duration<double>(now - lead_t0).count() * (1.0 - all) / all > o.clocks_lead)
+                return;
+            lead_on.store(false);
+            clocks.hold();
+            tr("clocks asked for, at this 1/1000 of the part", (long long) (1000.0 * all));
+        };
+        prefill.on_progress = [&](double done) {
+            if (!lead_split) lead_tick(((double) (pp_at - lead_from) + done * (double) lead_seg) / (double) lead_total);
+        };
+        psplit.on_progress = [&](int64_t p0, int64_t T, double done) {
+            if (lead_split) lead_tick(((double) (p0 - lead_from) + done * (double) T) / (double) lead_total);
+        };
+        prefill.should_stop = [&] {
+            pp_line(pp_at + prefill.processed());
+            if (pp_at + pp_chunks++ * pp_chunk >= hold_from) clocks.hold();
+            return stop_req.load();
         };
         {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
@@ -3381,6 +3839,7 @@ int lamina::program::run(int argc, char** argv) {
             int64_t main_swaps, main_fills, main_dropped, cpu_layers;
             struct Gpu {
                 int64_t entries, experts, layers, swaps, fills, dropped, prefetched, prefetch_used;
+                int64_t rounds, rounds_asleep, sleeps;   // --second-gpu-sleep-us
             } gpu[lamina::core::kMaxGpuTiers];
         };
         const auto tier_counters = [&]() {
@@ -3389,7 +3848,8 @@ int lamina::program::run(int argc, char** argv) {
                 const lamina::core::SecondGpu& gp = tiers[(size_t) t].gpu;
                 const lamina::core::AdaptiveTier& ad = tiers[(size_t) t].adapt;
                 c.gpu[t] = {gp.entries_done, gp.experts, gp.layers, ad.swaps, ad.fills, ad.dropped,
-                            gp.prefetch_copied, gp.prefetch_used};
+                            gp.prefetch_copied, gp.prefetch_used, drive.power[t].rounds, drive.power[t].rounds_asleep,
+                            drive.power[t].sleeps};
             }
             return c;
         };
@@ -3673,16 +4133,45 @@ int lamina::program::run(int argc, char** argv) {
                 tier.apply_pending(true);   // no copy may still land in a lent slot
                 for (TierSlot& ts : tiers) ts.adapt.apply_pending(true);
                 tr("prompt tiers landed");
-                // --prompt-split: a prompt of more than one chunk, when the second GPU can lend the split's bytes.
+                // --prompt-split: a prompt of more than one chunk, when the stages' caches can lend the split's bytes.
                 // The checkpoints every --prompt-cache-every cells fall at the chunks' ends.
-                const int64_t chunk = prompt_chunk(batched_end - reuse, o.prefill_chunk, pbuf.offload != nullptr);
-                const int64_t step = std::max<int64_t>(1, o.prompt_cache_every / o.prefill_chunk) * chunk;
+                // --prompt-split-from: a part of one chunk in two, where it is long enough for the stages to pay.
+                const int64_t part = batched_end - reuse;
+                const bool halves = pbuf.split != nullptr && o.prompt_split_from > 0 && part <= o.prefill_chunk &&
+                                    part >= (int64_t) o.prompt_split_from;
+                int64_t chunk = halves ? half_chunk(part) : prompt_chunk(part, o.prefill_chunk, pbuf.offload != nullptr);
+                const bool split_try = pbuf.split != nullptr && (part > o.prefill_chunk || halves);
+                pbuf.use_helper(!(split_try && pbuf.mid));   // (that tier runs a stage of its own then)
+                std::vector<uint64_t> split_need;
+                for (int st = 0; split_try && st < psplit.stages(); ++st)
+                    split_need.push_back(psplit.bytes_for(st, chunk, batched_end));
+                if (!pbuf.take(chunk, err, split_need)) { report(err); return 1; }
+                const bool split_on = !pbuf.split_regions.empty();
+                if (split_try && !split_on) tr("prompt split: the stages' caches cannot lend its bytes");
+                if (halves && !split_on) {   // one chunk then, as without the switch (the loans grow to its size)
+                    chunk = part;
+                    if (!pbuf.take(chunk, err)) { report(err); return 1; }
+                }
+                // (a part in two halves keeps its one checkpoint, at its end)
+                const int64_t step = halves && split_on
+                                         ? part : std::max<int64_t>(1, o.prompt_cache_every / o.prefill_chunk) * chunk;
                 pp_chunk = chunk;
-                hold_from = batched_end - chunk;
-                const bool split_try = pbuf.split != nullptr && batched_end - reuse > o.prefill_chunk;
-                if (!pbuf.take(chunk, err, split_try ? psplit.bytes_for(chunk, batched_end) : 0)) { report(err); return 1; }
                 tr("prompt slots lent", chunk);
-                const bool split_on = pbuf.split_region != nullptr;
+                // (a later tier that computes its experts in the prompt, or runs a stage of it, works from its first
+                // chunk on; a part in two halves is held from its start, as in one chunk)
+                const bool tier_in_prompt = pbuf.helping || (split_on && pbuf.mid);
+                hold_from = tier_in_prompt || halves ? reuse : batched_end - chunk;
+                lead_on.store(false);
+                if (tier_in_prompt) {
+                    clocks.sleep(o.tier_gpus[1], false);   // (a tier that sleeps wakes for a prompt it computes in)
+                } else if (o.clocks_lead >= 0) {
+                    hold_from = INT64_MAX;
+                    lead_split = split_on;
+                    lead_from = reuse;
+                    lead_total = part;
+                    lead_t0 = Clock::time_point{};
+                    lead_on.store(true);
+                }
                 // a return on an error below lets the second stage end first: its worker writes checkpoints into
                 // pcache's buffers, which go before psplit (finish after a finish does nothing)
                 struct SplitEnd {
@@ -3693,7 +4182,7 @@ int lamina::program::run(int argc, char** argv) {
                     }
                 } split_end;
                 if (split_on) {
-                    if (!psplit.begin(pbuf.split_region, pbuf.split_bytes, chunk, reuse, batched_end, track, err)) {
+                    if (!psplit.begin(pbuf.split_regions, chunk, reuse, batched_end, track, err)) {
                         report(err);
                         return 1;
                     }
@@ -3716,6 +4205,7 @@ int lamina::program::run(int argc, char** argv) {
                         if (c > a0 && c < b0) { b0 = c; break; }
                     pp_at = a0;
                     pp_chunks = 0;
+                    lead_seg = b0 - a0;
                     if (!prefill.run(ids.data() + a0, b0 - a0, a0, err)) {
                         // an error while a STOP is set is still an error: the states may have gone past the chunks
                         if (!prefill.stopped()) { report(err); return 1; }
@@ -3738,7 +4228,8 @@ int lamina::program::run(int argc, char** argv) {
                 }
                 // the tiers' moves (deterministic modes: refilled before the windows, as they were)
                 const bool through_tiers = o.adapt_every > 0 && !o.deterministic_adapt;
-                if (through_tiers ? !pbuf.give_back_tiers(&tier, &tier2, &prefill.routed(), *srcp, err)
+                if (through_tiers ? !pbuf.give_back_tiers(&tier, &tier2, n_tiers >= 2 ? &tiers[1].adapt : nullptr,
+                                                          &prefill.routed(), *srcp, err)
                                   : !pbuf.give_back(*srcp, err)) {
                     report("refilling a lent slot failed: " + err);
                     return 1;
@@ -3746,6 +4237,35 @@ int lamina::program::run(int argc, char** argv) {
                 add_prompt_usage(drive.d.usage, prefill.routed(), g.n_expert);
                 add_prompt_usage(prompt_heat, prefill.routed(), g.n_expert);   // (empty: no learned profile)
                 tr("prompt done (slots refilled)");
+                if (trace) {   // the runners' totals since the start (a request's: the difference from the line before)
+                    const lamina::prefill::PrefillStats& ps = prefill.stats();
+                    std::fprintf(stderr, "lamina trace: prompt experts so far: %lld chunks in %.0f ms; main GPU streamed %lld, "
+                                         "resident %lld, %.1f ms queuing", (long long) ps.chunks, ps.ms_total,
+                                 (long long) ps.experts_streamed, (long long) ps.experts_resident, ps.ms_experts_host);
+                    if (pbuf.offload != nullptr)
+                        std::fprintf(stderr, "; second GPU streamed %lld (%lld ahead), resident %lld, %.1f ms queuing, %.1f "
+                                             "ms GPU", (long long) offload.experts_streamed,
+                                     (long long) offload.experts_prefetched, (long long) offload.experts_resident,
+                                     offload.ms_host, offload.ms_gpu);
+                    if (pbuf.help)
+                        std::fprintf(stderr, "; %s GPU resident %lld, %.1f ms queuing, %.1f ms GPU", kTierName[1],
+                                     (long long) pbuf.helper.experts_resident, pbuf.helper.ms_host, pbuf.helper.ms_gpu);
+                    for (int st = 0; pbuf.split != nullptr && st < psplit.stages(); ++st) {
+                        const lamina::prefill::PrefillStats& p2 = psplit.stats(st);
+                        std::fprintf(stderr, "; stage %d %lld chunks in %.0f ms, streamed %lld (%lld ahead), resident %lld, "
+                                             "%.1f ms queuing", st + 2, (long long) p2.chunks, p2.ms_total,
+                                     (long long) p2.experts_streamed, (long long) p2.experts_prefetched,
+                                     (long long) p2.experts_resident, p2.ms_experts_host);
+                        if (pbuf.mid && st == 0)
+                            std::fprintf(stderr, ", its share on the second GPU streamed %lld (%lld ahead), resident %lld, "
+                                                 "%.1f ms queuing, %.1f ms GPU", (long long) pbuf.offload_mid.experts_streamed,
+                                         (long long) pbuf.offload_mid.experts_prefetched,
+                                         (long long) pbuf.offload_mid.experts_resident, pbuf.offload_mid.ms_host,
+                                         pbuf.offload_mid.ms_gpu);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
             }
             // A window whose logits held a NaN or an infinity (upstream #879): nothing of it is used, the request
             // ends with the finish "nonfinite", and the next one starts from an empty sequence.
@@ -3761,7 +4281,7 @@ int lamina::program::run(int argc, char** argv) {
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     drive.adapt_next = drive.flush_next = false;
-                    drive_window(&drive, T);
+                    drive_window(&drive, T, true);
                     if (!ver.run(T, window.data(), j, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) err = drive.d.fail;
                         return false;
@@ -3887,6 +4407,7 @@ int lamina::program::run(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                drive.pos = p;
                 drive_window(&drive, T);
                 tr("window", p, T);
                 drive.adapt_next = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0;
@@ -4014,6 +4535,11 @@ int lamina::program::run(int argc, char** argv) {
                 field("empty_slots", tiers[(size_t) t].adapt.free_slots());
                 field("prefetched", b.prefetched - a.prefetched);
                 field("prefetch_used", b.prefetch_used - a.prefetch_used);
+                if (drive.power[t].sleep_us > 0) {   // --second-gpu-sleep-us: the rounds it slept through
+                    field("rounds", b.rounds - a.rounds);
+                    field("asleep_rounds", b.rounds_asleep - a.rounds_asleep);
+                    field("sleeps", b.sleeps - a.sleeps);
+                }
             }
             serve_print("TIERS main_swaps=%lld main_fills=%lld main_dropped=%lld%s deterministic_adapt=%d\n",
                         (long long) (t1.main_swaps - t0.main_swaps), (long long) (t1.main_fills - t0.main_fills),
@@ -4025,7 +4551,7 @@ int lamina::program::run(int argc, char** argv) {
             serve_print("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld\n", (long long) produced_n, (long long) n,
                         prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) reuse, (long long) (hits1 - hits0), (long long) (look1 - look0));
-            clocks.release_after(kClocksIdleS);
+            clocks.release_after(o.clocks_hold);
             const int64_t fresh = n - reuse;
             std::fprintf(stderr, "lamina serve: %lld prompt tokens (%lld cached) in %.0f ms (%.1f tok/s), %lld generated "
                                  "in %.0f ms (%.1f tok/s)\n", (long long) n, (long long) reuse, prompt_ms,
@@ -4053,9 +4579,21 @@ int lamina::program::run(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         const int64_t n_batched = n_prompt - 1;
         const bool path_ok = setup_prompt_path(prefill, offload, pbuf, psplit, err);
-        const int64_t chunk = path_ok ? prompt_chunk(n_batched, o.prefill_chunk, pbuf.offload != nullptr) : 0;
-        if (!path_ok ||
-            !pbuf.take(chunk, err, pbuf.split != nullptr && n_batched > o.prefill_chunk ? psplit.bytes_for(chunk, n_batched) : 0)) {
+        const bool halves = path_ok && pbuf.split != nullptr && o.prompt_split_from > 0 && n_batched <= o.prefill_chunk &&
+                            n_batched >= (int64_t) o.prompt_split_from;
+        int64_t chunk = !path_ok ? 0 : halves ? half_chunk(n_batched)
+                                              : prompt_chunk(n_batched, o.prefill_chunk, pbuf.offload != nullptr);
+        const bool split_try = path_ok && pbuf.split != nullptr && (n_batched > o.prefill_chunk || halves);
+        if (path_ok) pbuf.use_helper(!(split_try && pbuf.mid));
+        std::vector<uint64_t> split_need;
+        for (int st = 0; split_try && st < psplit.stages(); ++st)
+            split_need.push_back(psplit.bytes_for(st, chunk, n_batched));
+        bool taken = path_ok && pbuf.take(chunk, err, split_need);
+        if (taken && halves && pbuf.split_regions.empty()) {   // the stages' caches cannot lend: one chunk
+            chunk = n_batched;
+            taken = pbuf.take(chunk, err);
+        }
+        if (!taken) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }
@@ -4073,8 +4611,8 @@ int lamina::program::run(int argc, char** argv) {
             prefill.draft = &mtp;   // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
         }
         prefill.profile = o.prefill_profile;
-        const bool split_on = pbuf.split_region != nullptr;
-        psplit.set_profile(o.prefill_profile);
+        const bool split_on = !pbuf.split_regions.empty();
+        if (pbuf.split != nullptr) psplit.set_profile(o.prefill_profile);
         const Clock::time_point tp0 = Clock::now();
         // LAMINA_PREFILL_CUT=n (tests): the prompt in two runs split at position n, as a follow-up turn continues a
         // cached prefix (the split's second stage copies that prefix's state in)
@@ -4082,14 +4620,15 @@ int lamina::program::run(int argc, char** argv) {
         const int64_t cut = cut_env != nullptr ? std::min<int64_t>(std::max<int64_t>(std::atoll(cut_env), 0), n_batched) : 0;
         int64_t run_at = 0, run_chunks = 0;   // --second-gpu-clocks: held from the prompt's last chunk on
         prefill.should_stop = [&] {
-            if (run_at + run_chunks++ * chunk >= n_batched - chunk) clocks.hold();
+            if (pbuf.helping || (split_on && pbuf.mid) || run_at + run_chunks++ * chunk >= n_batched - chunk)
+                clocks.hold();
             return false;
         };
         for (int64_t a = 0; a < n_batched;) {
             const int64_t b = a < cut ? cut : n_batched;
             run_at = a;
             run_chunks = 0;
-            if ((split_on && !psplit.begin(pbuf.split_region, pbuf.split_bytes, chunk, a, n_batched, false, err)) ||
+            if ((split_on && !psplit.begin(pbuf.split_regions, chunk, a, n_batched, false, err)) ||
                 !prefill.run(o.tokens.data() + a, b - a, a, err) || (split_on && !psplit.finish(err))) {
                 std::fprintf(stderr, "lamina: %s\n", err.c_str());
                 return 1;
@@ -4098,18 +4637,22 @@ int lamina::program::run(int argc, char** argv) {
         }
         prefill.should_stop = nullptr;
         // refill the lent slots from the arena and give them back to the decode tiers
-        const size_t n_lent[2] = {pbuf.loan.lent.size(), pbuf.loan2.lent.size()};
+        const size_t n_lent[3] = {pbuf.loan.lent.size(), pbuf.loan2.lent.size(), pbuf.loan3.lent.size()};
         const Clock::time_point tr = Clock::now();
         const bool through_tiers = o.adapt_every > 0 && !o.deterministic_adapt;
-        if (through_tiers ? !pbuf.give_back_tiers(&tier, &tier2, &prefill.routed(), *srcp, err)
+        if (through_tiers ? !pbuf.give_back_tiers(&tier, &tier2, n_tiers >= 2 ? &tiers[1].adapt : nullptr,
+                                                  &prefill.routed(), *srcp, err)
                           : !pbuf.give_back(*srcp, err)) {
             std::fprintf(stderr, "lamina: refilling a lent slot failed: %s\n", err.c_str());
             return 1;
         }
-        if (n_lent[0] + n_lent[1] > 0)
-            std::fprintf(stderr, "lamina: lent slots %s (%zu, %zu on the second GPU) in %.1f ms\n",
-                         through_tiers ? "given back to the tiers" : "refilled", n_lent[0], n_lent[1],
+        if (n_lent[0] + n_lent[1] + n_lent[2] > 0) {
+            char third[48] = "";   // (the tier after the first: PromptBuffers::loan3)
+            if (n_tiers >= 2) std::snprintf(third, sizeof third, ", %zu on the %s", n_lent[2], kTierName[1]);
+            std::fprintf(stderr, "lamina: lent slots %s (%zu, %zu on the second GPU%s) in %.1f ms\n",
+                         through_tiers ? "given back to the tiers" : "refilled", n_lent[0], n_lent[1], third,
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+        }
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
         pos_start = n_batched;
@@ -4128,6 +4671,9 @@ int lamina::program::run(int argc, char** argv) {
                                  "resident %lld; %.1f ms queuing, %.1f ms GPU\n", (long long) offload.experts_streamed,
                          (long long) offload.experts_prefetched, (long long) offload.experts_resident, offload.ms_host,
                          offload.ms_gpu);
+        if (pbuf.helping)
+            std::fprintf(stderr, "lamina: prefill on the %s GPU: resident %lld; %.1f ms queuing, %.1f ms GPU\n", kTierName[1],
+                         (long long) pbuf.helper.experts_resident, pbuf.helper.ms_host, pbuf.helper.ms_gpu);
         if (split_on) {
             const lamina::prefill::PrefillStats& s2 = psplit.stats();
             std::fprintf(stderr, "lamina: prefill split at layer %lld: the second stage %.1f ms (its experts "
@@ -4136,11 +4682,25 @@ int lamina::program::run(int argc, char** argv) {
                          (long long) psplit.at(), s2.ms_total, (long long) s2.experts_streamed,
                          (long long) s2.experts_prefetched, (long long) s2.experts_resident, s2.ms_experts_host,
                          psplit.ms_first_waited, psplit.ms_finish, psplit.ms_copy_in);
+            if (pbuf.mid) {
+                const lamina::prefill::PrefillStats& s3 = psplit.stats(1);
+                std::fprintf(stderr, "lamina: prefill split at layer %lld: the third stage %.1f ms (its experts streamed "
+                                     "%lld (%lld ahead), resident %lld, host %.1f ms); the second stage's share on the "
+                                     "second GPU: experts streamed %lld (%lld ahead), resident %lld; %.1f ms queuing, "
+                                     "%.1f ms GPU\n", (long long) psplit.at(1), s3.ms_total,
+                             (long long) s3.experts_streamed, (long long) s3.experts_prefetched,
+                             (long long) s3.experts_resident, s3.ms_experts_host,
+                             (long long) pbuf.offload_mid.experts_streamed, (long long) pbuf.offload_mid.experts_prefetched,
+                             (long long) pbuf.offload_mid.experts_resident, pbuf.offload_mid.ms_host,
+                             pbuf.offload_mid.ms_gpu);
+            }
         }
         if (o.prefill_profile) {
-            for (int st = 0; st < (split_on ? 2 : 1); ++st) {
-                const lamina::prefill::PrefillStats& px = st == 0 ? ps : psplit.stats();
-                std::fprintf(stderr, "lamina: prefill GPU ms by section%s:", st == 0 ? "" : " (the second stage)");
+            const int n_st = split_on ? 1 + psplit.stages() : 1;
+            for (int st = 0; st < n_st; ++st) {
+                const lamina::prefill::PrefillStats& px = st == 0 ? ps : psplit.stats(st - 1);
+                std::fprintf(stderr, "lamina: prefill GPU ms by section%s:",
+                             st == 0 ? "" : st == 1 ? " (the second stage)" : " (the third stage)");
                 for (int i = 0; i < lamina::prefill::kPsCount; ++i)
                     std::fprintf(stderr, "%s %s %.0f", i ? ";" : "", lamina::prefill::prefill_section_name(i),
                                  px.ms_section[i]);
@@ -4297,6 +4857,7 @@ int lamina::program::run(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
+            drive.pos = p;
             drive_window(&drive, T);
             drive.adapt_next = !drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0;
             drive.flush_next = !drive.d.usage.empty() && ((rounds + 2) % o.adapt_every) == 0;
@@ -4459,6 +5020,15 @@ int lamina::program::run(int argc, char** argv) {
                         ad.copy_rate() / 1e6, (double) gp.prefetch_copied / (double) rounds,
                         (double) gp.prefetch_used / (double) rounds, ver.ms_predict / (double) rounds,
                         (long long) ver.predict_late);
+            if (const Drive::TierPower& pw = drive.power[t]; pw.sleep_us > 0)
+                serve_print("%-24s asleep in %lld of %lld rounds, %lld sleeps (below %.0f us a layer of the pool without "
+                            "it: %.0f predicted over the rounds awake, %.0f measured over the rounds asleep; %.1f of "
+                            "its experts a round left to others)\n",
+                            (std::string(kTierName[t]) + " GPU").c_str(), (long long) pw.rounds_asleep,
+                            (long long) pw.rounds, (long long) pw.sleeps, pw.sleep_us,
+                            pw.us_awake / (double) std::max<int64_t>(1, pw.rounds - pw.rounds_asleep),
+                            pw.us_asleep / (double) std::max<int64_t>(1, pw.rounds_asleep),
+                            (double) drive.d.tiers[t].slept / (double) rounds);
         }
         if (rounds > 0 && !drive.d.routed.empty()) {
             // the share of the routed entries the N most-routed experts of this run take

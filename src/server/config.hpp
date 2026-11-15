@@ -59,7 +59,5 @@ void prepend_lib_dirs(const json& cfg, Environment& env);
 const std::vector<std::pair<std::string, std::string>>& offline_env();
 /// why this config cannot be strictly offline (empty: it can)
 std::vector<std::string> offline_blockers(const json& cfg);
-/// the experts' RAM (INFO arena_mib) leaves less than ~6 GB for everything else: a warning
-void warn_tight_ram(const json& arena_mib);
 
 }  // namespace lamina

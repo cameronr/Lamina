@@ -35,7 +35,8 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
   The engine also runs unsloth's other Flash-Next quants, all but UD-IQ1_S and BF16: UD-IQ1_M, UD-Q2_0, UD-IQ2_XS,
   UD-Q2_K_XL, UD-IQ3_XXS, UD-Q3_K_XL, UD-IQ4_XS, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, whose experts take ~35 GB (UD-IQ1_M)
   to ~128 GB (Q8_0) of RAM, and [Agention's Gyro-L](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF).
-  Setup downloads none of them: [docs/SETUP.md](docs/SETUP.md) says how to run one.
+  Setup downloads none of them: [docs/SETUP.md](docs/SETUP.md) says how to run one. The engine compares the experts
+  with the PC's RAM before it loads them: it stops when they do not fit, and warns when little would be left.
 
 - **An SSD**: Flash-Next reads a 28.8 GB table of per-layer embeddings from the model file at every token.
 - **A 64-bit x86 CPU with AVX2** (AVX-512 is used when it is there), or a 64-bit Arm CPU with Armv8.2's dot product
@@ -59,8 +60,8 @@ Setup builds the engine and the image encoder for this PC's GPUs, downloads the 
 checks them, prepares them, and writes a config and a launcher. `--model ud-q4_k_xl`, `--model qwen36-ud-q4_k_xl` and
 `--model qwen38-27b-ud-q6_k_m` set up the others; `--check` says what the PC has and what a model needs, without
 changing anything. Setup asks nothing and installs no system software: it names what is missing. A release's programs,
-extracted into the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)). Details:
-[docs/SETUP.md](docs/SETUP.md).
+extracted into `bin` in the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)).
+Details: [docs/SETUP.md](docs/SETUP.md).
 
 ## Run
 

@@ -82,14 +82,19 @@ class VisionSection(unittest.TestCase):
         setup.vision_section(self.EXAMPLE, SMALL)
         self.assertEqual(self.EXAMPLE, before)
 
+    def test_a_releases_encoder_in_bin(self):
+        v = setup.vision_section(self.EXAMPLE, None, True)
+        self.assertEqual(v["exe"], "./bin/lamina-vision")
+        self.assertFalse(v["gpu"])
+
 
 class WriteConfig(unittest.TestCase):
-    def written(self, vision_gpu):
+    def written(self, vision_gpu, release=False):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "ROOT", Path(d)):
             (Path(d) / "examples").mkdir()
             shutil.copy(ROOT / "examples" / "ud-q4_k_xl.json", Path(d) / "examples")
             path = setup.write_config("ud-q4_k_xl", Path(d) / "data", "NVIDIA GeForce RTX 3090", 8082, True, None, None,
-                                      vision_gpu)
+                                      vision_gpu, release)
             return json.loads(path.read_text(encoding="utf-8"))
 
     def test_the_examples_section_on_a_gpu(self):
@@ -102,6 +107,26 @@ class WriteConfig(unittest.TestCase):
         v = self.written(None)["vision"]
         self.assertTrue(v["exe"].startswith("./build-vision/bin/lamina-vision"))
         self.assertEqual((v["gpu"], v["threads"]), (False, os.cpu_count() or 8))
+
+    def test_a_releases_programs_in_bin(self):
+        v = self.written(None, True)["vision"]
+        self.assertEqual(v["exe"], "./bin/lamina-vision" + (".exe" if setup.WIN else ""))
+
+
+class WriteLauncher(unittest.TestCase):
+    def launcher(self, progs):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "ROOT", Path(d)):
+            p = setup.write_launcher("ud-q4_k_xl", setup.MODELS["ud-q4_k_xl"], Path(d) / "lamina-ud-q4_k_xl.json", 8082,
+                                     progs)
+            return p.read_bytes().decode()
+
+    def test_the_built_server(self):
+        server = "build\\lamina-server.exe" if setup.WIN else "exec build/lamina-server"
+        self.assertIn(server + " --config lamina-ud-q4_k_xl.json", self.launcher("build"))
+
+    def test_a_releases_server_in_bin(self):
+        server = "bin\\lamina-server.exe" if setup.WIN else "exec bin/lamina-server"
+        self.assertIn(server + " --config lamina-ud-q4_k_xl.json", self.launcher("bin"))
 
 
 class BuildVision(unittest.TestCase):

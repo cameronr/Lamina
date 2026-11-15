@@ -77,9 +77,17 @@ public:
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t max_chunk,
               void* stream, ExpertRunner* offload, std::string& err);
 
-    /// Device bytes of the buffers for chunks of `chunk` tokens.
+    /// Device bytes of the buffers for chunks of `chunk` tokens (`helpers`: with that many of set_helpers' runners).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                 bool offload);
+                                 bool offload, int helpers = 0);
+    /// Runners on other GPUs that take the experts their caches hold (initialized, bound by the caller; nothing
+    /// streams to them): an expert this GPU's cache lacks goes to the `offload` runner when that GPU holds it, else to
+    /// the first of these that holds it, and only the rest stream.  Each takes its share in two passes as `offload`
+    /// does, from one host copy of the input (ExpertRunner::set_host_input), and its sums come back to this GPU
+    /// beside the others', added to the MoE output before the FFN write.  Between prompts (it changes the buffers'
+    /// size: bytes_for); empty: none.
+    static constexpr int kMaxHelpers = 2;
+    void set_helpers(const std::vector<ExpertRunner*>& helpers);
     /// The same with the area its experts are prefetched into (without a second GPU), for the residency as it is now.
     uint64_t bytes_for(int64_t chunk) const;
     /// The buffers for chunks of up to `chunk` tokens, carved from `region` (`bytes` long: lent expert-cache
@@ -125,8 +133,14 @@ public:
     /// work never holds the other's up for long (0: off).  Before init.
     void set_pacing(int sections);
     float* residual() const;
-    /// The second stage, before each run() of one chunk: piece k of its residual is in `residual()` at ev[k].
+    /// A later stage, before each run() of one chunk: piece k of its residual is in `residual()` at ev[k].
     void set_in_events(const cudaEvent_t* ev, int64_t n);
+    /// A later stage that hands its residual on, before each run() of one chunk: whether that chunk ends the first
+    /// stage's run() call, which the stage after it is told in turn (SplitOut::out_end's run_end).
+    void set_run_end(bool run_end);
+    /// A stage that hands its residual on: the event at which piece k of its last chunk's rows had gone out (null
+    /// before its first chunk); the next chunk's rows may take their place in `residual()` then.
+    cudaEvent_t out_done(int64_t k) const;
     /// The draft layer's weights and cells in place of `draft->prompt_kv()` (the second stage's copies), or null.
     const core::MtpPromptKv* draft_kv = nullptr;
     /// Called after each chunk's last layer (with every layer here) with its final residual rows on the device
@@ -141,6 +155,9 @@ public:
     /// Checked before every chunk: true stops the prompt there (`run` returns false with err "cancelled", and the
     /// state and `ss.ple_prev` hold the chunks before it, `processed()` positions).
     std::function<bool()> should_stop;
+    /// Called before each layer of each chunk with the share of this `run`'s layer-tokens already queued (0..1): how
+    /// near its end is (the clock locks of --second-gpu-clocks-lead), or null.
+    std::function<void(double done)> on_progress;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.

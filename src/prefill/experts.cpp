@@ -24,6 +24,7 @@ constexpr int64_t N = 2560, FF2 = 1280, FF = 640, K = 10;
 constexpr int G = 16;
 static_assert(G <= mmq::kGatherGroupMax, "a batch's experts gathered in one launch");
 constexpr int64_t ROWS = 8192;
+constexpr int64_t IDENT_ROWS = mmq::ids_table_rows(ROWS);   // MMQ's row map: what a launch of ROWS rows reads
 constexpr int SLOTS = 2;                 // batches in staging: the copies of one overlap the work on the other
 constexpr size_t GEMM_WS = 32u << 20;    // cuBLAS workspace
 constexpr int NPTR = 7;                  // per-expert device pointers: blob, xs, gate/up, gu, h, down, d
@@ -31,6 +32,25 @@ constexpr int NPTR = 7;                  // per-expert device pointers: blob, xs
 // copies in submission order, whatever their stream)
 constexpr uint64_t PIECE_REMOTE = 32ull << 20, PIECE_LOCAL = 4ull << 20;   // its x16 link, the first GPU's x4
 constexpr size_t MMQ_TAIL = 4096;        // zeroed after a batch's gathered experts: MMQ reads past the last one
+
+// A remote runner's GPU current for one call, the caller's again afterwards: the main GPU's for the prompt path's
+// thread, a later stage's own on its thread, which drives its runner on the second GPU (prefill/split.hpp; `fallback`:
+// when the caller's is unknown).
+struct OnDevice {
+    int prev;
+    bool set;
+    OnDevice(int dev, int fallback, bool remote) : prev(fallback), set(remote) {
+        if (!set) return;
+        int cur = 0;
+        if (cudaGetDevice(&cur) == cudaSuccess) prev = cur;
+        cudaSetDevice(dev);
+    }
+    ~OnDevice() {
+        if (set) cudaSetDevice(prev);
+    }
+    OnDevice(const OnDevice&) = delete;
+    OnDevice& operator=(const OnDevice&) = delete;
+};
 
 // Bump allocation from a region; without one it only counts (bytes_needed).
 struct Alloc {
@@ -111,6 +131,7 @@ struct ExpertRunner::Impl {
     bool up_live[2] = {};
     int up_cur = 0;
     uint16_t *h_input = nullptr, *h_sum = nullptr;
+    bool own_input = true;   // h_input is its own (set_host_input: another runner's)
     // a layer's blobs copied ahead: at pre_off[e] in `pre` (-1: not there), covered by event pre_ev[pre_grp[e]] (its
     // piece); pre_list the experts to copy in order, pre_next the next one, pre_at the area's next free byte
     uint8_t* pre = nullptr;
@@ -146,7 +167,7 @@ struct ExpertRunner::Impl {
         *ws = a.take<uint8_t>(GEMM_WS, ok);
         const bool q = mmq_any();
         uint8_t* xq = q ? a.take<uint8_t>(mmq::q8_bytes(ROWS, N), ok) : nullptr;
-        int32_t* ident = q ? a.take<int32_t>((size_t) ROWS, ok) : nullptr;
+        int32_t* ident = q ? a.take<int32_t>((size_t) IDENT_ROWS, ok) : nullptr;
         if (m == nullptr) return;
         m->xq = xq; m->ident = ident;
         m->input = input; m->sum = sum; m->rows_src = rows_src; m->w = w; m->adds = adds;
@@ -161,7 +182,7 @@ ExpertRunner::ExpertRunner() : impl_(new Impl) {}
 ExpertRunner::~ExpertRunner() {
     Impl& m = *impl_;
     if (m.dev < 0) return;
-    core::DeviceScope on(m.dev, m.main, m.remote);
+    OnDevice on(m.dev, m.main, m.remote);
     if (m.s) cudaStreamSynchronize(m.s);
     if (m.copy) cudaStreamSynchronize(m.copy);
     for (int i = 0; i < SLOTS; ++i) {
@@ -171,7 +192,7 @@ ExpertRunner::~ExpertRunner() {
     for (cudaEvent_t e : {m.t0, m.t1, m.pre_used, m.up_done[0], m.up_done[1]}) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.pre_ev) if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : m.piece_ev) if (e) cudaEventDestroy(e);
-    if (m.h_input) cudaFreeHost(m.h_input);
+    if (m.h_input && m.own_input) cudaFreeHost(m.h_input);
     if (m.h_sum) cudaFreeHost(m.h_sum);
     for (uint8_t* p : m.h_up) if (p) cudaFreeHost(p);
     if (m.owned) cudaFree(m.owned);
@@ -204,7 +225,7 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
     m.mark.assign((size_t) max_chunk, -1);
     m.first.resize((size_t) max_chunk);
     m.count.resize((size_t) max_chunk);
-    core::DeviceScope on(device, main_device, m.remote);
+    OnDevice on(device, main_device, m.remote);
     bool ok = cudaEventCreate(&m.t0) == cudaSuccess && cudaEventCreate(&m.t1) == cudaSuccess;
     for (int i = 0; ok && i < 2; ++i)
         ok = cudaEventCreateWithFlags(&m.up_done[i], cudaEventDisableTiming) == cudaSuccess &&
@@ -242,7 +263,7 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
 
 bool ExpertRunner::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err, void* area, uint64_t area_bytes) {
     Impl& m = *impl_;
-    core::DeviceScope on(m.dev, m.main, m.remote);
+    OnDevice on(m.dev, m.main, m.remote);
     m.pre_layer = -1;
     if (region == nullptr) {   // its own buffers, allocated once for the longest chunk, carved for this one
         if (m.owned == nullptr) {
@@ -366,7 +387,7 @@ int ExpertRunner::prefetch_pending() const {
 bool ExpertRunner::prefetch_next(std::string& err) {
     Impl& m = *impl_;
     if (!prefetch_left()) return true;
-    core::DeviceScope on(m.dev, m.main, m.remote);
+    OnDevice on(m.dev, m.main, m.remote);
     const int64_t layer = m.pre_layer;
     const size_t bb = (size_t) lamina::kernels::cpu::expert_layout().blob_bytes(layer);
     const size_t stride = (size_t) area_stride(layer);
@@ -416,11 +437,25 @@ bool ExpertRunner::prefetch_next(std::string& err) {
 
 uint16_t* ExpertRunner::host_input() const { return impl_->h_input; }
 uint16_t* ExpertRunner::host_sum() const { return impl_->h_sum; }
+
+void ExpertRunner::set_host_input(uint16_t* host) {
+    Impl& m = *impl_;
+    if (host == m.h_input) return;
+    if (m.h_input && m.own_input) cudaFreeHost(m.h_input);
+    m.h_input = host;
+    m.own_input = false;
+}
+
+bool ExpertRunner::holds(int64_t layer, int32_t e) const {
+    const Impl& m = *impl_;
+    return m.res != nullptr && m.cache != nullptr && m.res[(size_t) layer * (size_t) m.n_expert + (size_t) e] >= 0;
+}
+
 cudaEvent_t ExpertRunner::piece_done(int64_t k) const { return impl_->piece_ev[(size_t) k]; }
 
 void ExpertRunner::stage_input(int64_t t0, int64_t rows, cudaEvent_t ready) {
     Impl& m = *impl_;
-    core::DeviceScope on(m.dev, m.main, m.remote);
+    OnDevice on(m.dev, m.main, m.remote);
     cudaStreamWaitEvent(m.s, ready, 0);   // behind the previous layer's sums, which pass through `input`
     cudaMemcpyAsync(m.input + t0 * N, m.h_input + t0 * N, (size_t) rows * N * 2, cudaMemcpyHostToDevice, m.s);
 }
@@ -437,7 +472,7 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
         err = "prompt experts: a layer's share is out of range";
         return false;
     }
-    core::DeviceScope on(m.dev, m.main, m.remote);
+    OnDevice on(m.dev, m.main, m.remote);
     const auto h0 = std::chrono::steady_clock::now();
     if (t_begin == 0) {
         if (m.timed && cudaEventQuery(m.t1) == cudaSuccess) {   // the previous layer (the main GPU waited for it)
@@ -557,7 +592,7 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
         cudaMemcpyAsync(m.rows_src, h_rows, n_rows * 4, cudaMemcpyHostToDevice, m.s);
         cudaMemcpyAsync(m.w, h_w, n_rows * 4, cudaMemcpyHostToDevice, m.s);
     }
-    if (use_mmq) mmq::iota(m.ident, ROWS, m.s);   // each layer: the local runner's buffers share the dense steps'
+    if (use_mmq) mmq::iota(m.ident, IDENT_ROWS, m.s);   // each layer: the local runner's buffers share the dense steps'
     cudaEventRecord(m.up_done[ub], m.s);
     m.up_live[ub] = true;
     if (m.remote) cudaMemsetAsync(m.sum + t_begin * N, 0, (size_t) (t_end - t_begin) * N * 4, m.s);
@@ -675,7 +710,8 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
             for (size_t j = j0; j < j1; ++j) maxr = std::max<int64_t>(maxr, off[j + 1] - off[j]);
             mmq::Product p;
             p.w = m.dq_gu; p.type = f.gu_type; p.w_rows = FF2; p.w_cols = N; p.expert_bytes = gub; p.n = n;
-            p.xq = m.xq; p.bounds = m.adds + bounds_at[b]; p.ids = m.ident; p.total_rows = rows; p.max_rows = maxr;
+            p.xq = m.xq; p.bounds = m.adds + bounds_at[b]; p.ids = m.ident; p.ids_rows = IDENT_ROWS;
+            p.total_rows = rows; p.max_rows = maxr;
             p.dst = m.gu; p.ld_dst = FF2;
             if (in_place) p.tab = (const void* const*) (P + 0 * E + j0);
             m.mmq_ctx->run(p, m.s);

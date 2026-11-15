@@ -35,6 +35,25 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 /// The RAM the system can still give without swapping, in `bytes`: MemAvailable on Linux, ullAvailPhys on Windows.
 /// False (and 0) when it cannot be read.
 bool available_ram(uint64_t& bytes);
+/// The RAM the system has, in `bytes`: MemTotal on Linux, ullTotalPhys on Windows.  False (and 0) when it cannot be
+/// read.
+bool total_ram(uint64_t& bytes);
+
+/// A model's host memory (`need`: its experts in RAM, a table read into it) against the RAM before any of it is taken,
+/// in bytes; `total` 0 when the RAM cannot be read, and then nothing is said.
+struct RamFit {
+    uint64_t need = 0, total = 0, available = 0;
+    /// It cannot run here: beside it the system and the engine's other memory (CUDA's, its buffers, the server's) take
+    /// ~4 GiB of the RAM.
+    bool too_much() const;
+    /// It runs, but less than 6 GiB would stay available once it is taken: other programs' memory goes to the page file
+    /// (Linux: the engine may be ended), and the conversation cache parks nothing (its --ram-reserve-mib, 6 GiB).
+    bool tight() const;
+    /// What too_much() or tight() says, `what` the need's name ("the model's experts"), then `remedy`; "" when it fits.
+    std::string say(const std::string& what, const std::string& remedy) const;
+};
+/// `need` against the RAM as it is now; LAMINA_FORCE_RAM_MIB=T,A (tests) stands for RAM of T MiB, A of them available.
+RamFit ram_fit(uint64_t need);
 
 /// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with LAMINA_READ_AHEAD=0.
 bool read_ahead_enabled();

@@ -83,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           NOTES: |
-            Each platform has two downloads: `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`, the programs, and `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`, the CUDA runtime and cuBLAS they load (the same in every release of that CUDA version). Extract both into a clone of this tag and run setup with `--no-build`: [docs/SETUP.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md#release-binaries). The programs are built for RTX 30, 40 and 50 GPUs.
+            Each platform has two downloads: `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`, the programs, and `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`, the CUDA runtime and cuBLAS they load (the same in every release of that CUDA version). Extract both into a folder `bin` in a clone of this tag and run setup with `--no-build`: [docs/SETUP.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md#release-binaries). The programs are built for RTX 30, 40 and 50 GPUs.
         run: |
           ls -l dist
           pre=; [[ "$TAG" == *-* ]] && pre=--prerelease
