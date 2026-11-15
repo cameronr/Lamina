@@ -1,11 +1,11 @@
 # Using Lamina
 
 The server, `lamina-server`, runs the engine in its own process and serves the OpenAI, Anthropic and Responses APIs and
-a web app. The launchers setup writes start it with the model's config (`run-iq3_s.bat`, or from the clone's folder
-`build\lamina-server.exe --config lamina-iq3_s.json`). It listens on the config's `port` (setup's defaults: 8081 for
-IQ3_S, 8082 for UD-Q4_K_XL, 8083 for Qwen3.6-35B-A3B, 8084 for Qwen3.8-27B; `--port` overrides it), on this PC only
-unless told otherwise ([below](#from-other-devices)). Ctrl+C in its window stops the engine, which saves its learned
-expert profile, and the server.
+a web app. It starts with a model file, `lamina-server -m MODEL.gguf`, or a config, `lamina-server --config FILE`
+([SETUP.md](SETUP.md#a-model-file)). It listens on the config's `port` (the presets': 8081 for ISTA-DASLab's Flash-Next
+files, 8082 for the family's others, 8083 for Qwen3.6-35B-A3B, 8084 for Qwen3.8-27B; `--port` overrides it), on this PC
+only unless told otherwise ([below](#from-other-devices)). Ctrl+C in its window stops the engine, which saves its
+learned expert profile, and the server.
 
 ## The web app
 
@@ -58,7 +58,7 @@ dashboard of both name sets (`grafana-lamina.json`).
   `api_key`). Zed's llama.cpp provider reads `/props` and offers tools from its `chat_template_caps`.
 - **Claude Code**: `ANTHROPIC_BASE_URL=http://127.0.0.1:8081`, `ANTHROPIC_MODEL` set to a Claude model name it knows
   (the server ignores the name), and any `ANTHROPIC_AUTH_TOKEN` (or the `api_key`).
-- **OpenCode**: a provider in `opencode.jsonc`, with the context setup chose:
+- **OpenCode**: a provider in `opencode.jsonc`, with the server's context (its `--max-context`):
 
   ```jsonc
   {
@@ -84,8 +84,8 @@ dashboard of both name sets (`grafana-lamina.json`).
 
   OpenCode compacts the conversation before `limit.context`; keep `limit.output` well under it.
 - **Codex CLI**: [below](#codex-cli-and-the-responses-api).
-- **A terminal chat**: `.venv\Scripts\python.exe chat.py --port 8081` (`/image <path>` attaches a picture, `/think`
-  sets the thinking level, `/reset` starts over).
+- **A terminal chat**: `python chat.py --port 8081` in a clone (Python 3.10 or newer, no packages; `/image <path>`
+  attaches a picture, `/think` sets the thinking level, `/reset` starts over).
 
 ## Thinking
 
@@ -217,16 +217,17 @@ config renders Codex's compaction requests with the conversation's tools, so the
 
 ## Pictures
 
-With pictures set up (setup's default), OpenAI `image_url` parts and Anthropic `image` blocks (base64 data, http(s)
-URLs or local file paths) go through the image encoder, the `lamina-vision` in the server's own folder (no config key
-names another), and reach the model as up to 1,024 tokens each
-(the `vision` section's `max_tokens`; a 640x480 photo is ~300). JPEG, PNG, BMP and GIF are read as they are; WebP,
-TIFF, AVIF and others are converted to PNG first. The encoder runs on the CPU (the `vision` section's `threads`), so
-the GPUs keep their VRAM for experts: on the development PC's 8-core Ryzen 7 9700X a picture of ~1,000 tokens takes
-~9 s, once per picture (a picture sent again, as chat apps do every turn, is not encoded again). Set up with
-`--vision gpu`, it runs on a GPU instead (the section's `gpu` and `cuda_device`): on the development PC, on the RTX 3090
-of its last expert tier, which keeps room to spare beside it, the first question about a picture of ~1,000 tokens takes
-1.4-2.2 s instead of ~10.5 s with the encoder on the CPU. `--offline` refuses URLs. Qwen3.6-35B-A3B and Qwen3.8-27B read pictures with their repositories' own projectors.
+With pictures on (an image projector beside the model, or a config's `vision` section), OpenAI `image_url` parts and
+Anthropic `image` blocks (base64 data, http(s) URLs or local file paths) go through the image encoder, the
+`lamina-vision` in the server's own folder (no config key names another), and reach the model as up to 1,024 tokens each
+(the `vision` section's `max_tokens`; a 640x480 photo is ~300). JPEG, PNG, BMP and GIF are read as they are; WebP, TIFF,
+AVIF and others are converted to PNG first. The encoder runs on the CPU (the `vision` section's `threads`), so the GPUs
+keep their VRAM for experts: on the development PC's 8-core Ryzen 7 9700X a picture of ~1,000 tokens takes ~9 s, once
+per picture (a picture sent again, as chat apps do every turn, is not encoded again). With `--vision-gpu` it runs on a
+GPU instead (the section's `gpu` and `cuda_device`; [SETUP.md](SETUP.md#a-model-file) says which card): on the
+development PC, on the RTX 3090 of its last expert tier, which keeps room to spare beside it, the first question about a
+picture of ~1,000 tokens takes 1.4-2.2 s instead of ~10.5 s with the encoder on the CPU. `--offline` refuses URLs.
+Qwen3.6-35B-A3B and Qwen3.8-27B read pictures with their repositories' own projectors.
 
 ## Image generation
 
@@ -236,14 +237,39 @@ Optional: [Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turb
 Research License, not Apache 2.0: read [its license](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE)
 before using the images commercially.
 
-```
-.venv\Scripts\python.exe tools\image\install.py --config lamina-iq3_s.json
-```
+It takes three things, then a start of the server with them:
 
-compiles `sd-cli` at a pinned commit for this PC's GPUs (`--backend cpu` for the CPU), downloads three files into the
-data folder's `models/qwen-image-2.1-turbo/`, checked by SHA-256 (the denoiser by the GPU's VRAM: Q4_K_M up to 8 GB,
-Q6_K up to 12 GB, Q8_0 above, 4.2-7.6 GB; the text encoder 5.1 GB; the VAE 0.7 GB; `--quant` picks), and writes an
-`images` section into the config (`--print` shows it instead).
+- **`sd-cli`**, built from stable-diffusion.cpp at the commit Lamina was tested with, `2988060a`, with CUDA:
+
+  ```
+  git clone --recursive https://github.com/leejet/stable-diffusion.cpp
+  cd stable-diffusion.cpp
+  git checkout 2988060a4338a5dcd94721c964a8e87003c1ac8b
+  git submodule update
+  cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_CUDA=ON -DSD_BUILD_EXAMPLES=ON -DSD_WEBP=OFF -DSD_WEBM=OFF -DSD_BUILD_SHARED_LIBS=OFF
+  cmake --build build --config Release --target sd-cli
+  ```
+
+  `python tools/image/sdcpp_native/apply.py <the checkout>` before the build adds Lamina's own runner of the model's
+  denoiser, which the section's `"native": true` then takes.
+- **The model's three files**: a denoiser from [unsloth/Qwen-Image-2.1-Turbo-GGUF](https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF)
+  by the GPU's VRAM (`qwen-image-2.1-turbo-Q4_K_M.gguf` up to 8 GB, `-Q6_K` up to 12 GB, `-Q8_0` above: 4.2, 6.3 and
+  7.6 GB), the VAE `vae/qwen_image_2.1_vae_bf16.safetensors` (0.7 GB) of
+  [unsloth/Qwen-Image-2.1-FP8](https://huggingface.co/unsloth/Qwen-Image-2.1-FP8), and the text encoder
+  `Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf` (5.1 GB) of
+  [unsloth/Qwen3-VL-8B-Instruct-GGUF](https://huggingface.co/unsloth/Qwen3-VL-8B-Instruct-GGUF).
+- **An `images` section** in the config that names them:
+
+  ```json
+  "images": {"exe": "D:/sd/build/bin/Release/sd-cli.exe", "backend": "cuda",
+             "diffusion_model": "D:/Models/qwen-image/qwen-image-2.1-turbo-Q8_0.gguf",
+             "vae": "D:/Models/qwen-image/qwen_image_2.1_vae_bf16.safetensors",
+             "llm": "D:/Models/qwen-image/Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf",
+             "args": ["--diffusion-fa"], "gpu_policy": "auto"}
+  ```
+
+  `gpu` names the card `sd-cli` runs on (its `nvidia-smi` number or UUID), and the server's window says at the start
+  which of the files is missing.
 
 `POST /v1/images/generations` takes OpenAI's request: `prompt`, `size` (`WIDTHxHEIGHT`, each side a multiple of 32 from
 256 to 2048; default 1024x1024), `n` (1-4), `response_format` (`b64_json`, or `url`: the server keeps the newest 64),
@@ -277,7 +303,7 @@ OS file cache, so loading again is quick while that RAM is not needed elsewhere.
 
 **Behind [llama-swap](https://github.com/mostlygeek/llama-swap)**, which starts the server a request names and stops
 the others: run the server itself with llama-swap's port, so that stopping it stops the engine too
-(`cmd: sh -c 'cd /path/to/Lamina && exec build/lamina-server --config lamina-iq3_s.json --port ${PORT}'`),
+(`cmd: sh -c 'cd /path/to/Lamina && exec build/lamina-server --config iq3_s.json --port ${PORT}'`),
 with `checkEndpoint: /health` (the server listens once the model has loaded) and a `healthCheckTimeout` of a few
 minutes. llama-swap passes the client's `Host` through: without an API key, add the name clients reach it by to
 `allowed_hosts` ([below](#from-other-devices)), or those requests get 403.
@@ -306,9 +332,8 @@ put a reverse proxy in front of it.
 
 ## The config
 
-The server reads `lamina-<model>.json` at its start, or with `-m` builds one from the model file
-([SETUP.md](SETUP.md#a-model-file-without-setup); `--write-config` writes it). Setup's keys:
-[SETUP.md](SETUP.md#the-config).
+The server reads a config file at its start (`--config FILE`), or with `-m` builds one from the model file
+([SETUP.md](SETUP.md#a-model-file); `--write-config` writes it). The preset's keys: [SETUP.md](SETUP.md#the-config).
 
 **Every key is an option of the command line too, and every option a key** (`lamina-server --help` lists them all,
 each with its key). A value given on the command line takes the place of the config file's, and the file's takes the

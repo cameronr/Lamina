@@ -1,7 +1,8 @@
 # Troubleshooting
 
-The engine's log is the config's `log`, `lamina-<model>.log` in the clone's folder; the server writes to its window.
-`setup --check` says what the PC has and what a model needs.
+The engine's log is the config's `log` (`<model>.log` beside the config file, beside the server with `-m` alone); the
+server writes to its window. `lamina-server -m MODEL.gguf --check` (or `--config FILE --check`) says what the PC has
+and what a model needs.
 
 ## Building
 
@@ -30,31 +31,12 @@ portable`, or name them (`-DCMAKE_CUDA_ARCHITECTURES=86;120`, quoted for `build.
 
 **Linux: the build stops at `unsupported GNU version`.** The GCC is newer than the CUDA toolkit accepts. Install an
 older one beside it (g++-14) and name it: `CXX=g++-14 ./build.sh --fresh` (nvcc then takes it too; `CUDAHOSTCXX`
-names nvcc's alone). For setup: `CXX=g++-14 ./setup.sh ...`.
+names nvcc's alone).
 
 **"llama.cpp ...: the download failed".** The build fetches llama.cpp from GitHub at its first configure: check the
 network (an HTTPS proxy is taken from `https_proxy`) and build again. **"... holds a llama.cpp this build did not
 download"**: `third_party/llama.cpp` is a copy of another origin; move it away, or name it with
 `-DLAMINA_GGML_DIR=<folder>`.
-
-## Setup
-
-**"missing for the build: ...".** Setup installs no system software: install what it names (the CUDA toolkit 13.0 or
-newer; on Windows Visual Studio 2022's Build Tools with the workload "Desktop development with C++"; on Linux a C++
-compiler, `build-essential` on Debian and Ubuntu), then run setup again. `LAMINA_NVCC=<path to nvcc>` and
-`LAMINA_VCVARS=<path to vcvars64.bat>` pick a toolkit and a Visual Studio when there are several.
-
-**"no NVIDIA GPU of compute capability 8.0 or newer ... was found by nvidia-smi".** The NVIDIA driver is missing, or
-`nvidia-smi` is not on the PATH, or the GPUs are older than the RTX 30 series, which Lamina does not run on.
-
-**Setup warns about CUDA 13.2.0 or 13.2.1.** Their compiler builds some of the engine's kernels wrong for RTX 50 GPUs
-(sm_120): the answers are garbage. Use CUDA 13.0, 13.1 or 13.2.2 and newer; `LAMINA_NVCC` picks one installed beside
-it.
-
-**A download broke off.** Run setup again: it goes on from where it stopped.
-
-**"... has the right size but not the pinned file's SHA-256", or "... bytes, not the pinned file's".** The file in the
-data folder is an older or damaged copy. Move it away and run setup again to download it.
 
 ## Starting
 
@@ -97,13 +79,13 @@ off with `--no-mmproj`.
 config's port: close it, or start this one with `--port`.
 
 **"the config has a "vision" section, and the image encoder is not there: ...".** The server starts the
-`lamina-vision` (`.exe`) in its own folder and no other: a release has it there, and setup copies the one it builds
-there. Put it back (a release's programs archive extracted whole, or setup run again), or take the `vision` section
+`lamina-vision` (`.exe`) in its own folder and no other: a release has it there, and the build writes it there. Put
+it back (a release's programs archive extracted whole, or the build run again), or take the `vision` section
 and `"--vision"` out of the config to run without pictures.
 
 **"the vision encoder did not start: ERR this lamina-vision was built without CUDA ...".** The `lamina-vision` beside
 the server is a CPU-only build and the config's `vision` section asks for a GPU (`"gpu": true`). Set `"gpu"` to
-`false` (and remove `cuda_device`), or put the CUDA build back: a release's programs archive, or setup run again.
+`false` (and remove `cuda_device`), or put the CUDA build back: a release's programs archive, or the build run again.
 
 **"the vision encoder did not start: ERR lamina-vision sees no GPU (CUDA_VISIBLE_DEVICES=...)".** The config's
 `vision` section asks for a GPU (`"gpu": true`) and the encoder sees none: its `cuda_device` names a card that is not
@@ -116,14 +98,14 @@ neither beside the model nor beside the server, or the config's `args` name a fi
 server runs, and the model writes new text at
 roughly half to two thirds of its speed. Run the command the warning gives (`download-draft-layer.bat FOLDER`,
 `./download-draft-layer.sh FOLDER` on Linux: 0.8 GB), do what it adds about the config, and start the server again
-([SETUP.md](SETUP.md#setup), The draft layer without setup).
+([SETUP.md](SETUP.md#a-model-file), The draft layer).
 
 **"mtp: ... is not a draft layer this engine reads".** The file `--mtp` names is another GGUF (a model, a projector) or
 the draft layer of another format: download the layer again with the script.
 
 **"this build has no kernels for its compute capability, ...".** The engine was built for other GPUs: a card added after
 the build, or a release's programs on a card other than the RTX 30, 40 and 50 series. Build again from the source
-(`build.bat`, `./build.sh`, or setup): the build is for this PC's GPUs. As the main GPU, such a card stops the start; as
+(`build.bat`, `./build.sh`): the build is for this PC's GPUs. As the main GPU, such a card stops the start; as
 a tier it is left out.
 
 **"its compute capability is ..., and Lamina needs 8.0 or newer".** The card is older than the RTX 30 series: name
@@ -143,7 +125,7 @@ unit, `--ulimit memlock=-1` for a container.
 
 **"Windows blocked ... Smart App Control".** Smart App Control on Windows 11 refuses programs that are not signed, and
 the engine and the image encoder are built on this PC. Turn it off (Windows Security > App & browser control > Smart
-App Control settings), or, if only the image encoder is blocked, run setup with `--vision off`.
+App Control settings), or, if only the image encoder is blocked, start the server without pictures (`--no-mmproj`).
 
 **"ExpertCache: cudaMalloc(...) failed: out of memory" although the GPU has VRAM free.** On Windows, every allocation
 on a GPU also counts against Windows' commit limit (RAM and the page file), and the locked experts already take much of
@@ -159,7 +141,7 @@ almost no VRAM; Windows then pages the GPU's memory, and a request can stall. Ra
 
 **Generation is far slower than expected, a few tokens a second.** Something else uses the main GPU: a display
 plugged into it, a browser or a game drawing on it, another CUDA program. The engine's GPU waits on the host by
-spinning, and a GPU shared in time slices stalls it. Plug the displays into another GPU (setup picks a GPU that drives
+spinning, and a GPU shared in time slices stalls it. Plug the displays into another GPU (`-m` picks a GPU that drives
 no display as the main one) and check `nvidia-smi` for other processes on it.
 
 **It is slower than [COMPARISON.md](COMPARISON.md).** Those are the development PC's numbers: three GPUs holding most
@@ -167,7 +149,7 @@ experts, a 3090's VRAM bandwidth, 8 cores and DDR5-5600 for the rest. Fewer or s
 CPU, and the RAM's bandwidth sets its speed: run the RAM at its rated speed (EXPO or XMP), in both channels.
 `lamina-server -m MODEL.gguf --bench` measures an install the way it is used, through the API, and writes a report
 without personal details, to compare after a change or to attach to an issue
-([SETUP.md](SETUP.md#a-model-file-without-setup)).
+([SETUP.md](SETUP.md#a-model-file)).
 
 **Answers turn into nonsense, or the PC crashes under load.** Check the RAM first: an overclock that passes everyday
 use can flip bits when the CPU and the GPUs' copies read it at once, which on the development PC (DDR5-6000 XMP with
@@ -179,19 +161,20 @@ The end of its log says why. On Linux the usual cause is the RAM running out: `s
 process|out of memory'`.
 
 **"request exceeds the context window".** The conversation and the answer's room are longer than the context. Start a
-new conversation, or run setup again with a larger `--context` (with `--kv-grow`, the configs' setting, a larger
+new conversation, or start the server with a larger `--max-context` (with `--kv-grow`, the configs' setting, a larger
 context takes VRAM only as a conversation reaches it).
 
 **"the engine said nothing for ... s during the request".** The engine and the server lost step, or the engine froze
 (a driver stall): the server ends the engine and the next request starts it again. A prompt that takes longer than
 that on a slow PC: raise `engine_silence_s` in the config (default 300).
 
-**"this server was started without the vision encoder".** The model was set up without pictures: run setup again with
-`--vision on`.
+**"this server was started without the vision encoder".** The server started without pictures: no image projector
+beside the model (`--mmproj FILE` names one), `--no-mmproj`, or a config without a `vision` section. The server's
+window said why at the start.
 
 **Pictures take seconds.** The image encoder runs on the CPU: about 9 s for a picture of ~1,000 image tokens on an
 8-core CPU. The config's `vision.max_tokens` caps a picture's tokens (1,024 in the configs). With a GPU that has
-~1.3 GB to spare, setup's `--vision gpu` runs the encoder there (about 2 s for such a picture).
+~1.3 GB to spare, `--vision-gpu` runs the encoder there (about 2 s for such a picture).
 
 **Two runs of one greedy request differ.** Where an expert is computed changes its rounding a little, and the GPUs'
 expert caches change as their copies land, so runs can part at a near-tie
@@ -200,4 +183,4 @@ expert caches change as their copies land, so runs can part at a near-tie
 ## Reporting a problem
 
 Open an [issue](https://github.com/eddoursul/Lamina/issues) with the engine's log and the server's output, the output
-of `setup --check`, the commit (`git rev-parse --short HEAD`) and what the request was.
+of `--check` (with the model's `-m` or `--config`), the commit (`git rev-parse --short HEAD`) and what the request was.

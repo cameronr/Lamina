@@ -43,7 +43,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Python packages, CMake and Ninja
-        run: python -m pip install -r requirements.txt cmake==4.4.3 ninja==1.13.2 regex==2026.9.10   # regex: the tools' tests
+        run: python -m pip install -r requirements.txt cmake==4.4.3 ninja==1.13.2
       - name: OpenSSL's headers
         if: matrix.os == 'linux'
         run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libssl-dev
@@ -82,7 +82,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           NOTES: |
-            Each platform has two downloads: `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`, the programs, and `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`, the CUDA runtime and cuBLAS they load (the same in every release of that CUDA version). Extract both into one folder and run `lamina-server -m MODEL.gguf` ([docs/SETUP.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md#a-model-file-without-setup)), or into `bin` in a clone of this tag for setup with `--no-build` ([Release binaries](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md#release-binaries)). The programs are built for RTX 30, 40 and 50 GPUs.
+            Each platform has two downloads: `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`, the programs, and `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`, the CUDA runtime and cuBLAS they load (the same in every release of that CUDA version). Extract both into one folder and run `lamina-server -m MODEL.gguf` ([docs/SETUP.md](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/docs/SETUP.md#a-model-file)). The programs are built for RTX 30, 40 and 50 GPUs.
         run: |
           ls -l dist
           pre=; [[ "$TAG" == *-* ]] && pre=--prerelease

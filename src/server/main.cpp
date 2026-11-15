@@ -2,7 +2,7 @@
 // which runs on a thread of this process (serve/server.py's main).
 //
 //   lamina-server -m MODEL.gguf                      a model file, its config built from the preset for it
-//   lamina-server --config lamina-<model>.json       the model a run config names
+//   lamina-server --config FILE                      the model a run config names
 //   lamina-server --engine mock --tokenizer <gguf>   a scripted engine (the tests')
 //   lamina-server -m MODEL.gguf --bench              the model measured through this server's API (bench.hpp)
 #include "bench.hpp"
@@ -672,7 +672,7 @@ int run(int argc, char** argv) {
                 throw ConfigError("\"short_opening_tokens\" must be a whole number, 0 or more, not " + py_repr_value(n));
             svc.short_opening_tokens = n.get<int64_t>();
         }
-        if (truthy(jget(cfg, "images"))) {   // image generation, set up by setup --images
+        if (truthy(jget(cfg, "images"))) {   // image generation (docs/USING.md, Image generation)
             json icfg = cfg["images"];
             for (const char* k : {"exe", "diffusion_model", "vae", "llm", "out_dir"})
                 if (jget(icfg, k).is_string() && !u8_path(icfg[k].get<std::string>()).is_absolute())
@@ -680,7 +680,7 @@ int run(int argc, char** argv) {
             svc.images = std::make_shared<images::ImageGen>(icfg, jstr(cfg, "log"));
             const std::vector<std::string> gone = svc.images->missing();
             if (!gone.empty())
-                say("[lamina] image generation: missing " + join(gone, ", ") + " - requests fail until setup --images has run again");
+                say("[lamina] image generation: missing " + join(gone, ", ") + " - requests fail until the images section names files that are there");
             say("[lamina] image generation: " + py_str(svc.images->model) + " " + jstr(icfg, "quant") + " on " +
                 (jstr(icfg, "backend").empty() ? "?" : jstr(icfg, "backend")) + " (POST /v1/images/generations; GPU policy " +
                 svc.images->policy + ")");

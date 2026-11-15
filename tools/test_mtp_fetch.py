@@ -1,6 +1,6 @@
 """Tests for tools/mtp_fetch.py (#327): a range read needs a 206 with the asked Content-Range, the pinned revision's
 tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
-setup fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
+a second fetch replaces it), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
 urlopen - nothing is downloaded.
 
     python -m unittest tools.test_mtp_fetch
@@ -161,7 +161,7 @@ class Ranges(FetchCase):
         bad = bytes(len(A))                       # an install the #327 mirror corrupted: right size, wrong bytes
         (self.out / "tensors" / "mtp.a.bin").write_bytes(bad)
         self.assertEqual(M.verify(str(self.out)), ["mtp.a"])
-        err = self.fetch(Mirror())                # setup runs fetch again: the bad one is fetched again
+        err = self.fetch(Mirror())                # fetch again: the bad one is fetched again
         self.assertIn("mtp.a: wrong bytes", err)
         self.assertEqual(self.tensor("mtp.a"), A)
         self.assertEqual(M.verify(str(self.out)), [])

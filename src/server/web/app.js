@@ -313,7 +313,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
-    setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+    setMetric("disk", null, "", "");
   } else {
     const big = hw.disk_read_mb >= 1000;
     setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",

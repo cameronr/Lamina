@@ -141,7 +141,7 @@ const std::vector<Param> kParams = {
     {"--env-to-user", "", "env_to_user", K::Bool, "",
      "opencode's <env> block moved to the first user message, so the system turn stays the same"},
 
-    {"", "", "", K::Str, "", "Image generation (the images section, which tools/image/install.py writes)"},
+    {"", "", "", K::Str, "", "Image generation (the images section: docs/USING.md, Image generation)"},
     {"--images-exe", "", "images.exe", K::Path, "FILE", "sd-cli"},
     {"--images-diffusion-model", "", "images.diffusion_model", K::Path, "FILE", "the denoiser"},
     {"--images-vae", "", "images.vae", K::Path, "FILE", "the VAE"},
@@ -470,7 +470,7 @@ std::string params_help() {
                    0, kWidth, 0);
     out += "\nCommands\n";
     for (const auto& [left, help] : {
-             std::pair<const char*, const char*>{"--config FILE", "the run config (lamina-<model>.json) to start from"},
+             std::pair<const char*, const char*>{"--config FILE", "the run config to start from"},
              {"--write-config FILE", "write the config this command line runs to FILE and stop; an earlier FILE is "
                                      "kept as FILE.bak, and its keys outside the preset stay"},
              {"--check", "say what this PC has and, for the model, what it needs, how it would run and whether it "

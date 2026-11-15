@@ -1,4 +1,4 @@
-// src/server/config.hpp - the run config (lamina-<model>.json) as the server reads it: the engine's arguments and what
+// src/server/config.hpp - the run config as the server reads it: the engine's arguments and what
 // the config's other keys add to them, the GPUs it names, the environment the engine runs in, the offline policy.
 #pragma once
 

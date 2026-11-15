@@ -32,7 +32,8 @@ The server (`lamina-server`) serves the model over HTTP. Its settings: [USING.md
 
 ## What runs and what is downloaded
 
-Setup downloads llama.cpp at a pinned commit and the model files at pinned Hugging Face revisions, each checked by
-size and SHA-256, and installs the Python packages of `requirements.txt` with pip. The engine and the image encoder are
-built on your PC from this repository. Running a model downloads nothing; the server fetches only image URLs a request
+The build downloads llama.cpp at a pinned commit, checked by its SHA-256, and the draft layer's script the layer at a
+pinned Hugging Face revision, checked the same way; the model files are yours to download. The engine and the image
+encoder are built on your PC from this repository, or come from a release's archives, which GitHub's workflow builds
+from it. Running a model downloads nothing; the server fetches only image URLs a request
 sends (`--offline` refuses them), and the MCP servers and image generation the config sets up.

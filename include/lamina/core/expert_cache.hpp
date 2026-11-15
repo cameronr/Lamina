@@ -19,7 +19,7 @@
 // **WHAT THIS FILE IS.** The SLOT STORAGE and the RESIDENCY TABLE: it allocates the VRAM, fills it from the host
 // arena, and answers `(layer, expert) -> slot or -1`. It computes nothing itself: the GPU computes the experts it
 // holds in the verify window's grouped kernels and the prompt path (the hit/miss split), and the CPU pool the rest.
-// (Written when nothing consumed the slots yet and `--expert-cache` defaulted to 0; setup's configs use `auto`.)
+// (Written when nothing consumed the slots yet and `--expert-cache` defaulted to 0; the presets use `auto`.)
 #pragma once
 
 #include <cstddef>

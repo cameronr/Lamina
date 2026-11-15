@@ -27,7 +27,7 @@ td.log
 
 # llama.cpp as the build downloads it (cmake/lamina_llama.cmake), with its lock, zip and unpack folder
 /third_party/llama.cpp*
-# setup.py's outputs (and tools/image/install.py's); the build trees are build*/ above
+# what earlier versions' setup wrote in the clone; the build trees are build*/ above
 /.venv/
 /third_party/stable-diffusion.cpp
 /third_party/*.zip
@@ -40,7 +40,7 @@ td.log
 /*-learned.bin
 # the web app's settings shared with other apps, written next to the config the server runs
 *.shared-settings.json
-# model data kept in the checkout (setup's data folder is ../Lamina-data)
+# model data kept in the checkout
 /models/
 /packs/
 /mtp/

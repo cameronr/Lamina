@@ -1,8 +1,8 @@
 # Setup
 
-What a PC needs: [the README](../README.md#what-you-need). This page covers the build from the source, what setup
-does, a model file run without it (`lamina-server -m`), the release binaries, the config, the GPUs, the engine options
-worth knowing, and Qwen3.6-35B-A3B and Qwen3.8-27B.
+What a PC needs: [the README](../README.md#what-you-need). This page covers the build from the source, a model file
+run with `lamina-server -m`, the release binaries, the config, the GPUs, the engine options worth knowing, and
+Qwen3.6-35B-A3B and Qwen3.8-27B.
 
 ## Building
 
@@ -18,10 +18,10 @@ build.bat                        (Windows)
 They build the preset `native` of `CMakePresets.json` into `build/`: `lamina-server`, `lamina` and the image encoder
 `lamina-vision`, on Windows with the CUDA runtime's DLLs beside them (on Linux they take the toolkit's), for this PC's
 CPU and its GPUs of the RTX 30 series and newer, as `nvidia-smi` names them at each build (after a card is added, build
-again). The programs run from there: `build\lamina-server -m MODEL.gguf` ([below](#a-model-file-without-setup)).
+again). The programs run from there: `build\lamina-server -m MODEL.gguf` ([below](#a-model-file)).
 `build.bat portable` (`./build.sh portable`) builds them for other PCs into `build-portable/`, as the releases are: RTX
 30, 40 and 50 GPUs (compute capability 8.6, 8.9 and 12.0, with PTX for newer ones), any x64 CPU with AVX2 or arm64 CPU
-with Armv8.2's dot product and FP16 instructions, the MSVC runtime linked in. CMake options after the preset's name go
+with Armv8.2's dot product and FP16 instructions, the C++ runtime linked in. CMake options after the preset's name go
 to its configure (`build.bat native -DLAMINA_BUILD_TESTS=ON`, `--fresh` for a new start of the build folder). The
 presets work with CMake alone too: `cmake --preset native`, `cmake --build --preset native` (on Windows in a Visual
 Studio developer prompt).
@@ -49,83 +49,6 @@ downloads extract: the programs, `download-draft-layer.bat` (`.sh` on Linux) and
 `lamina`), and the CUDA runtime and cuBLAS the programs load, with NVIDIA's license (`cudart`; `--component` installs
 one). Installed on Linux, the programs load the libraries in their own folder.
 
-## Setup
-
-From a clone of this repository:
-
-```
-setup.bat --model iq3_s          (Windows)
-./setup.sh --model iq3_s         (Linux)
-```
-
-`setup.bat` and `setup.sh` make a Python environment, `.venv` (setup takes the standard library only; a build's
-CMake and Ninja go into it), and run `setup.py` with the same arguments. The models: `iq3_s` (Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S),
-`ud-q4_k_xl` (Qwen3.8-Flash-Next, unsloth's UD-Q4_K_XL), `qwen36-ud-q4_k_xl` (Qwen3.6-35B-A3B, unsloth's UD-Q4_K_XL)
-and `qwen38-27b-ud-q6_k_m` (Qwen3.8-27B, unsloth's UD-Q6_K_M). The engine also runs Flash-Next's other GGUF files, most of unsloth's quants and
-[Agention's Gyro-L](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) among them: setup downloads none of those, so copy a
-config, name the file after `--native` and give it a port of its own ([COMPARISON.md](COMPARISON.md#gyro-l-and-the-three-files-at-one-build)).
-Of unsloth's Dynamic 3.1 quants it refuses UD-IQ1_S (a layer with its gate and up in two formats) and BF16, saying so
-at load. A quant's n-gram table can be one of
-unsloth's engram tables (BF16, Q8_0, Q5_1 or IQ4_NL): add `"--ple-gguf", "<the table's file>"` to the config's `args`,
-or rename the file over the quant's table shard as unsloth's README says.
-Without `--model`, setup builds the engine only.
-
-| Option | |
-| --- | --- |
-| `--check` | say what this PC has (GPUs, RAM, disk, the tools) and what the model needs; change nothing |
-| `--data-dir DIR` | where the model files go (default `../Lamina-data`, beside the clone) |
-| `--vision on\|off\|gpu[:GPU]` | pictures (default on; the image encoder runs on the CPU). `gpu` runs it on a GPU: the one named (name, UUID or nvidia-smi index), else the one with the least VRAM besides the main GPU, of those that drive no display if any; it takes ~1.3 GB there |
-| `--main-gpu GPU` | the GPU the model runs on (default: the one with the most VRAM that drives no display) |
-| `--context N` | the context in tokens (default: the example config's) |
-| `--port N` | the server's port (default 8081 to 8084 by model) |
-| `--update` | `git pull` this clone first |
-| `--no-build` | use the programs as they are: a release's in `bin/` ([Release binaries](#release-binaries)), else those already built |
-| `--cuda-archs A` | the CUDA architectures to build for, e.g. `86;120` (default: this PC's GPUs) |
-| `--portable` | build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the releases are |
-
-Setup asks nothing, installs no system software (it names what is missing) and moves or deletes no file. A step whose
-result is already there is skipped, so setup runs again after an interruption or for another model:
-
-1. For a build, CMake and Ninja into `.venv` and llama.cpp at the commit the engine is built against, into
-   `third_party/llama.cpp`: ggml for the engine, mtmd for the image encoder. With `--no-build` nothing.
-2. The server with the engine, `build/lamina-server` (`.exe`, with the CUDA runtime DLLs beside it; `build/lamina` is
-   the engine alone), for this PC's GPUs, and the image encoder, `build/lamina-vision`: llama.cpp's mtmd
-   library with the model's projector, built with CUDA for the same GPUs in `build-vision-cuda` and copied beside the
-   server, which starts the `lamina-vision` in its own folder (no config key names another). The config's `vision`
-   section decides where it runs at each start: on the CPU beside the engine (`"gpu": false`, the default), where it
-   hides the GPUs so they keep their VRAM for experts, or with `--vision gpu` on the GPU the option picks (`"gpu":
-   true`, `cuda_device`). Its CPU code is built for any AVX2 CPU: a native build on an AVX-512 CPU loses flash
-   attention and encodes about half as fast.
-3. The model's files from Hugging Face at pinned revisions, into the data folder, resumed when interrupted and checked
-   once by size and SHA-256 (`<file>.sha256` beside each records the check):
-   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
-   [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF),
-   [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) and
-   [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF). `HF_ENDPOINT` names a mirror.
-4. Their preparation, for Flash-Next only: the MTP draft layer, `mtp/Lamina-Qwen3.8-Flash-Next-MTP.gguf`, from
-   [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP); with
-   pictures, from the same repository the image projector in Q8_0 (ISTA-DASLab's BF16 one through `tools/mmproj_q8.py`),
-   which the CPU encodes ~20% faster.
-   Everything else comes from the GGUF files at start: the server reads the tokenizer and the chat template, the engine
-   the experts, the projections and the float tensors (put in the forms it takes in memory, in milliseconds).
-   Qwen3.6 and Qwen3.8-27B with pictures use their repositories' projectors (`mmproj-F16.gguf`) as they are.
-5. The config, `lamina-<model>.json`, and its launcher, `run-<model>.bat` (`run-<model>.sh` on Linux), from
-   `examples/<model>.json` with this PC's GPUs and data folder. A config written before keeps the keys the example
-   lacks (an `api_key`, an `images` section).
-
-**The draft layer without setup.** `download-draft-layer.bat FOLDER` (`./download-draft-layer.sh FOLDER` on Linux; a
-release's archive has its platform's script beside the programs) downloads step 4's file into a folder, at the same
-revision, checked by its SHA-256 and a broken download resumed. A config whose `args` name no `--mtp` takes
-`Lamina-Qwen3.8-Flash-Next-MTP.gguf` from beside the model, else from beside the server, and the server's window says
-which; elsewhere the `args` name it: `"--mtp", "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"`. A folder of the
-layer's earlier layout (`dense.txt`, `dense.bin`, `experts.bin`, `draft_vocab.bin`), as earlier setups downloaded it to
-`mtp/rt-distilled`, still works as `--mtp`. Flash-Next's server starts without the layer too, when none is found or
-the named file or folder is not there, and warns in its window with the script's command. It then generates a token a
-verify window, or prompt lookup's drafts (`--spec-lookup`). On the development PC, new text came at 44-61% of IQ3_S's
-speed with the layer and 50-68% of UD-Q4_K_XL's, an edit that quotes its prompt at 92-96%. The layer's file holds its
-draft vocabulary, the 40,525 tokens it proposes from; `tools/mtp_rt.py --gguf <the file> --draft-vocab <ids> --out
-<new file>` writes one over another (`data/draft_vocab_fr.bin`, `draft_vocab_cyrillic.bin`, `tools/draft_vocab.py`).
-
 **A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 5 MB instead of the CUDA build's
 ~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone (on Windows in a Visual Studio developer
 prompt; it downloads llama.cpp as the engine's build does when `third_party/llama.cpp` is not there):
@@ -137,14 +60,9 @@ cmake --build build-vision --target lamina-vision
 
 Copy `build-vision/bin/lamina-vision` (`.exe`) beside `lamina-server`, over the one there, and keep `"gpu": false` in
 the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. The engine's
-build with `-DLAMINA_BUILD_VISION=OFF` leaves it there; setup with `--no-build` keeps an encoder it finds beside the
-server, setup with a build replaces it with the CUDA one it builds.
+build with `-DLAMINA_BUILD_VISION=OFF` leaves it there; a build with the encoder writes its CUDA one over it.
 
-On Windows on Arm the build takes LLVM's clang-cl for the C and C++ code (ggml's CPU code for Arm does not build with
-MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or LLVM's own install
-(`LAMINA_CLANG_CL` names another).
-
-## A model file without setup
+## A model file
 
 `lamina-server -m MODEL.gguf` runs a model file as it lies, a split one by any of its shards:
 
@@ -152,7 +70,7 @@ MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or
 lamina-server -m D:\Models\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
 ```
 
-The server builds the config setup would write for the file and says in its window what it took:
+The server builds a config for the file and says in its window what it took:
 
 - **The preset**, one of `examples/*.json`, built into the server and picked by the file's header: ISTA-DASLab's
   Qwen3.8-Flash-Next files take `iq3_s`, the family's other files (unsloth's quants, Agention's Gyro-L) `ud-q4_k_xl`,
@@ -163,18 +81,40 @@ The server builds the config setup would write for the file and says in its wind
 - **Flash-Next's draft layer**, `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, beside the model, else beside the server
   ([the README](../README.md#the-draft-layer)).
 - **Pictures**: an image projector made for the model beside it (an `mmproj*.gguf` whose width is the model's; of
-  several the smallest), read by the `lamina-vision` beside the server on the CPU's logical cores, or with
-  `--vision-gpu --vision-cuda-device <UUID>` on that GPU (`nvidia-smi -L` lists the UUIDs; ~1.3 GB of its VRAM).
-  `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a projector or the encoder the window
-  says why there are none. For Qwen3.8-Flash-Next on the CPU, download Lamina's Q8_0 projector into the model's folder:
-  `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
+  several the smallest; Qwen3.6's and Qwen3.8-27B's repositories have theirs, `mmproj-F16.gguf`), read by the
+  `lamina-vision` beside the server on the CPU's logical cores, where it hides the GPUs so that they keep their VRAM for
+  experts. With `--vision-gpu` it runs on a GPU (~1.3 GB of its VRAM): of the cards besides the main one, the one with
+  the least VRAM that drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another
+  (`nvidia-smi -L` lists the UUIDs). `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
+  projector or the encoder the window says why there are none. For Qwen3.8-Flash-Next on the CPU, download Lamina's Q8_0
+  projector into the model's folder: `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
   [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) beside the
-  draft layer. The CPU encodes a picture with it in ~20% less time than with the BF16 one and 280 MiB less RAM, with
-  the same answers.
+  draft layer. The CPU encodes a picture with it in ~20% less time than with the BF16 one and 280 MiB less RAM, with the
+  same answers.
 - **The expert profile**, Qwen3.8-Flash-Next's, built into the programs (`--expert-profile builtin`, the engine's
   default under `--serve`).
 - **What a run writes**, beside the server: the engine's log (`<model>.log`) and what the run learned about the
   experts (`<model>-learned.bin`, [below](#the-config)), which the next start begins from.
+
+The engine also runs Flash-Next's other GGUF files, most of unsloth's quants and
+[Agention's Gyro-L](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) among them. Of unsloth's Dynamic
+3.1 quants it refuses UD-IQ1_S (a layer with its gate and up in two formats) and BF16, saying so at load. A quant's
+n-gram table can be one of unsloth's engram tables (BF16, Q8_0, Q5_1 or IQ4_NL): `--ple-gguf <the table's file>`, on
+the command line or in a config's `args`, or the file renamed over the quant's table shard as unsloth's README says.
+
+**The draft layer.** `download-draft-layer.bat FOLDER` (`./download-draft-layer.sh FOLDER` on Linux; a release's archive
+has its platform's script beside the programs) downloads `Lamina-Qwen3.8-Flash-Next-MTP.gguf` from
+[eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) into a folder,
+at a pinned revision, checked by its SHA-256 and a broken download resumed. A config whose `args` name no `--mtp` takes
+`Lamina-Qwen3.8-Flash-Next-MTP.gguf` from beside the model, else from beside the server, and the server's window says
+which; elsewhere the `args` name it: `"--mtp", "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"`. A folder of the layer's
+earlier layout (`dense.txt`, `dense.bin`, `experts.bin`, `draft_vocab.bin`), as earlier versions downloaded it to
+`mtp/rt-distilled`, still works as `--mtp`. Flash-Next's server starts without the layer too, when none is found or the
+named file or folder is not there, and warns in its window with the script's command. It then generates a token a verify
+window, or prompt lookup's drafts (`--spec-lookup`). On the development PC, new text came at 44-61% of IQ3_S's speed
+with the layer and 50-68% of UD-Q4_K_XL's, an edit that quotes its prompt at 92-96%. The layer's file holds its draft
+vocabulary, the 40,525 tokens it proposes from; `tools/mtp_rt.py --gguf <the file> --draft-vocab <ids> --out <new file>`
+writes one over another (`data/draft_vocab_fr.bin`, `draft_vocab_cyrillic.bin`, `tools/draft_vocab.py`).
 
 Every key of a config is an option of the command line too ([USING.md](USING.md#the-config)), and a value given there
 takes the place of the config file's, the file's that of the preset: `lamina-server -m MODEL.gguf --port 8090
@@ -222,26 +162,14 @@ arm64, in two downloads a platform:
   release of that CUDA version: one download serves the next releases).
 
 Both are flat: extract them into one folder, and `lamina-server -m` runs a model file from there
-([above](#a-model-file-without-setup)). For setup's configs and launchers, extract them into `bin` in a clone of the
-release's tag (or of its source archive), and run setup without the build:
-
-```
-git clone --branch <version> https://github.com/eddoursul/Lamina
-cd Lamina
-(extract both archives into bin\)
-setup.bat --no-build --model iq3_s          (Windows)
-./setup.sh --no-build --model iq3_s         (Linux)
-```
-
-Setup then needs neither the CUDA toolkit nor a compiler, nor llama.cpp or a Python package (the standard library
-does), and the config and the launcher it writes run the programs in `bin/`. The programs are built for RTX 30, 40 and 50 GPUs (compute
-capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
-kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
-13; the Linux ones for glibc 2.34 and OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9 (and Rocky Linux, AlmaLinux),
-Amazon Linux 2023, openSUSE Leap 15.6 and newer systems have them (the C++ runtime is linked in), and without the
-runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a
-GH200's 9.0) and a native build for the PC's CPU need a build from the source ([above](#building)). The arm64 programs
-are built and their CPU tests run on each release, not yet run with a GPU.
+([above](#a-model-file)). The programs are built for RTX 30, 40 and 50 GPUs (compute capability 8.6, 8.9 and 12.x, the
+GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512 kernels where the CPU has them) or arm64
+CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA 13; the Linux ones for glibc 2.34 and
+OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9 (and Rocky Linux, AlmaLinux), Amazon Linux 2023, openSUSE Leap 15.6 and
+newer systems have them (the C++ runtime is linked in), and without the runtime archive they take the CUDA 13 libraries
+of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a GH200's 9.0) and a native build for the PC's CPU need a
+build from the source ([above](#building)). The arm64 programs are built and their CPU tests run on each release, not
+yet run with a GPU.
 
 The releases come from the GitHub workflow `.github/workflows/build.yml` at a `v*` tag; it also builds every push to
 `main` and every pull request, and runs the tests that need no GPU. Its steps are `.github/ci.py`'s, which runs on a PC
@@ -249,30 +177,29 @@ the same way (`toolkit`, `build`, `test`, `package`).
 
 ## The config
 
-`lamina-<model>.json` holds the engine's command line and the server's settings. Its keys from setup (and
-`--write-config`'s, without `cwd` and `lib_dirs`: its paths are absolute):
+A config holds the engine's command line and the server's settings; `--write-config` writes one from a preset
+([above](#a-model-file)). Its keys:
 
 | Key | |
 | --- | --- |
 | `args` | the engine's options (below and `build/lamina --help`) |
-| `cwd`, `lib_dirs` | the folder the engine runs in; on Linux, folders for the CUDA libraries (setup writes the toolkit's) |
+| `cwd`, `lib_dirs` | the folder the engine runs in, where the config's relative paths start (the folder the server starts in when it has none); on Linux, folders put first on the library path |
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder's files and settings: the projector, the model, `threads` (the CPU's logical cores), or with `--vision gpu` `gpu` and `cuda_device` (the card it runs on, by its UUID: the server does not start when that card is not there). The encoder itself is the `lamina-vision` in the server's folder |
+| `vision` | the image encoder's files and settings: the projector, the model, `threads` (the CPU's logical cores), or `gpu` and `cuda_device` (the card it runs on, by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does). The encoder itself is the `lamina-vision` in the server's folder |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):
-[USING.md](USING.md#the-config). Relative paths are the clone's: the launchers start the server there.
+[USING.md](USING.md#the-config).
 
 **The learned expert profile.** The GPUs' expert caches start from a ranking of the experts by how often the model
 routes to them (`data/expert-profile.bin`, built into the programs). With `expert_profile_save`, the engine also counts
-this PC's routing and writes a profile (`<model>-learned.bin` in setup's data folder, beside the server with `-m`) at
-exit, on Ctrl+C and between requests at most once a minute (`expert_profile_save_every`); the next start fills the
-caches from it. It ranks the experts by this PC's routing
-and the profile it started from at equal weight. On the development PC, after a session of code and reasoning requests,
-a round of fixed text took 9-14% less time on code, -3.8 to +0.9% on thinking and edits. Remove both keys to start from
-the shipped profile every time.
+this PC's routing and writes a profile (`<model>-learned.bin` beside the config file, beside the server with `-m` alone)
+at exit, on Ctrl+C and between requests at most once a minute (`expert_profile_save_every`); the next start fills the
+caches from it. It ranks the experts by this PC's routing and the profile it started from at equal weight. On the
+development PC, after a session of code and reasoning requests, a round of fixed text took 9-14% less time on code, -3.8
+to +0.9% on thinking and edits. Remove both keys to start from the shipped profile every time.
 
 ## The GPUs
 
@@ -390,6 +317,5 @@ is read again from the start), `/v1/choose` and the GPU tiers. The config's `par
 
 ## Updating
 
-`setup --update --model <model>` pulls this clone, rebuilds what changed and keeps the config's own keys; without setup,
-`git pull` and the build again do the same for the programs. A model's files stay where they are. With release binaries:
-check out the new release's tag, extract its archives into `bin/` over the old ones and run setup with `--no-build`.
+`git pull` and the build again update a clone's programs; the configs and the model files stay where they are. With
+release binaries, extract the new release's archives over the old ones.

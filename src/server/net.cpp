@@ -322,7 +322,7 @@ std::string listen_problem(const std::string& host, int port, int code) {
         hint = "Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) or a "
                "firewall rule forbids it: start this one with a different --port";
     else if (no_addr)
-        hint = host + " is not an address of this PC: check \"host\" in the model's lamina-<model>.json or --host";
+        hint = host + " is not an address of this PC: check \"host\" in the config or --host";
     else
         hint = "check --host and --port";
     return "cannot listen on " + host + ":" + std::to_string(port) + ": " + what + " [" + std::to_string(code) + "]. " + hint;

@@ -496,7 +496,7 @@ HttpServer::HttpServer(Service& svc) : svc_(svc), http_(std::make_unique<httplib
         res.set_content(py_dumps({{"error", {{"type", "forbidden"},
                                              {"message", "Host " + py_repr_value(json(host)) + " is not allowed (DNS rebinding "
                                                          "protection). Reaching Lamina under this name on purpose? Add it to "
-                                                         "\"allowed_hosts\" in the config (lamina-<model>.json) or to the "
+                                                         "\"allowed_hosts\" in the config or to the "
                                                          "LAMINA_ALLOWED_HOSTS environment variable, or set an API key "
                                                          "(\"api_key\"), which turns this check off"}}}}, false),
                         "application/json");
@@ -882,7 +882,7 @@ void post_images(Exchange& x, const json& req) {
     Service& svc = x.svc;
     if (svc.images == nullptr) {
         x.reply(404, {{"error", {{"type", "invalid_request_error"}, {"code", "images_not_set_up"},
-                                 {"message", "image generation is not set up on this server (run setup with --images qwen-image)"}}}});
+                                 {"message", "image generation is not set up on this server (the config's images section: docs/USING.md, Image generation)"}}}});
         return;
     }
     images::ImageGen& gen = *svc.images;

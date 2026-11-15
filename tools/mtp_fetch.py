@@ -37,7 +37,7 @@ REVISION = os.environ.get("LAMINA_MTP_REVISION") or PINNED_REVISION
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
-# LAMINA_SOURCE=modelscope (setup's --source): the same checkpoint from ModelScope.  It serves the repository's current
+# LAMINA_SOURCE=modelscope: the same checkpoint from ModelScope.  It serves the repository's current
 # files, not a pinned revision, so REPO and PINNED are one URL here: every tensor is still checked against the pinned
 # revision's SHA256 below, so a tensor that differs from it is caught, not used.
 if (os.environ.get("LAMINA_SOURCE") or "").strip().lower() in ("ms", "modelscope"):
@@ -136,7 +136,7 @@ def get(url, start=None, end=None, retries=4):
 
 
 def connections():
-    """Ranges read at once: LAMINA_DL_CONNECTIONS (the setting of setup's downloads), else 8; 1 reads them one by one."""
+    """Ranges read at once: LAMINA_DL_CONNECTIONS, else 8; 1 reads them one by one."""
     try:
         n = int((os.environ.get("LAMINA_DL_CONNECTIONS") or "").strip() or 8)
     except ValueError:

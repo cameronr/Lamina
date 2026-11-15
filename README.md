@@ -35,15 +35,15 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
   The engine also runs unsloth's other Flash-Next quants, all but UD-IQ1_S and BF16: UD-IQ1_M, UD-Q2_0, UD-IQ2_XS,
   UD-Q2_K_XL, UD-IQ3_XXS, UD-Q3_K_XL, UD-IQ4_XS, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, whose experts take ~35 GB (UD-IQ1_M)
   to ~128 GB (Q8_0) of RAM, and [Agention's Gyro-L](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF).
-  Setup downloads none of them: [docs/SETUP.md](docs/SETUP.md) says how to run one. The engine compares the experts
-  with the PC's RAM before it loads them: it stops when they do not fit, and warns when little would be left.
+  `lamina-server -m` runs them as it runs the table's ([Run](#run)). The engine compares the experts with the PC's
+  RAM before it loads them: it stops when they do not fit, and warns when little would be left.
 
 - **An SSD**: Flash-Next reads a 28.8 GB table of per-layer embeddings from the model file at every token.
 - **A 64-bit x86 CPU with AVX2** (AVX-512 is used when it is there), or a 64-bit Arm CPU with Armv8.2's dot product
   and FP16 instructions, where the experts run on ggml's dot products (built and its CPU tests run, not yet run with a
   GPU). The CPU computes the experts no GPU holds, so its cores and the RAM's bandwidth set much of the speed.
 - **Windows 10 / 11 or Linux** (a release's programs: glibc 2.34 and OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9
-  and newer have them), and Python 3.10 or newer for setup.
+  and newer have them).
 - **To build:** the CUDA toolkit 13.0 or newer, and Visual Studio 2022's C++ tools on Windows (their CMake and Ninja
   serve the build; on Arm also LLVM's clang-cl), or GCC 11, CMake 3.22 and Ninja or newer on Linux. The
   [releases](https://github.com/eddoursul/Lamina/releases) have the programs built for RTX 30, 40 and 50 GPUs.
@@ -70,27 +70,12 @@ The build downloads llama.cpp at the commit the engine is built against and chec
 and names what is missing. `build.bat portable` builds the programs for other PCs, as the releases are, and `cmake
 --install build --prefix <folder>` puts them into a folder of their own: [docs/SETUP.md](docs/SETUP.md#building).
 
-Setup, in the same clone, sets up one of the table's models: it downloads the model's files at pinned revisions,
-checks them, prepares them, and writes a config and a launcher, and it builds the programs too (`--no-build` takes
-those in `build` as they are):
-
-```
-setup.bat --model iq3_s          (Windows)
-./setup.sh --model iq3_s         (Linux)
-```
-
-`--model ud-q4_k_xl`, `--model qwen36-ud-q4_k_xl` and `--model qwen38-27b-ud-q6_k_m` set up the others; `--check` says
-what the PC has and what a model needs, without changing anything. Setup asks nothing and installs no system software:
-it names what is missing. A release's programs, extracted into `bin` in the clone, spare the build: `--no-build`
-([docs/SETUP.md](docs/SETUP.md#release-binaries)). Details: [docs/SETUP.md](docs/SETUP.md).
-
 ### The draft layer
 
 Qwen3.8-Flash-Next needs one thing no model file holds: Lamina's draft layer, one file of 0.8 GB,
 `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, in
-[eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP). Setup
-downloads it. Whoever installs Lamina another way, a person or an agent, from a release, with a config of their own or
-a model file setup does not know, should download it too, into the model's folder:
+[eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP). Whoever
+installs Lamina, a person or an agent, should download it into the model's folder:
 
 ```
 download-draft-layer.bat MODEL_FOLDER      (Windows)
@@ -99,7 +84,7 @@ download-draft-layer.bat MODEL_FOLDER      (Windows)
 
 The server takes the file from beside the model, or from beside the server, when the config's `args` name no
 `--mtp`; elsewhere name it there: `"--mtp", "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"` (a folder of the layer's
-earlier layout of four files, as earlier setups downloaded it, still works there too). The scripts check the
+earlier layout of four files, as earlier versions downloaded it, still works there too). The scripts check the
 file's SHA-256 and go on with a download that broke off. Without the layer the server still starts and says so in its
 window, with this command: the model then writes new text at roughly half to two thirds of its speed, and an edit
 that quotes its prompt loses under a tenth. Qwen3.6-35B-A3B and Qwen3.8-27B draft with their own files' layer and need
@@ -109,7 +94,7 @@ nothing more.
 
 ```
 lamina-server -m D:\Models\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf     (a model file)
-run-iq3_s.bat                    (setup's launcher; ./run-iq3_s.sh on Linux)
+lamina-server --config iq3_s.json                                                     (a config: --write-config)
 ```
 
 `-m` takes a model file the engine runs, a split one by any of its shards. The server builds its config from the
@@ -118,7 +103,7 @@ PC's GPUs and the files beside the model, and its window says what it took. `--c
 needs against what this PC has, and loads nothing. Every key of a config is an option too (`lamina-server --help`),
 whose value takes the place of the file's and the preset's (`--port 8090 --temperature 0.6`); an engine option there
 takes the place of the preset's (`--max-context 65536`); `--write-config FILE` writes the config for
-`lamina-server --config FILE`: [docs/SETUP.md](docs/SETUP.md#a-model-file-without-setup).
+`lamina-server --config FILE`: [docs/SETUP.md](docs/SETUP.md#a-model-file).
 
 The model loads in a minute or so. Then, on the preset's port (the window's `ready` line names it: 8081 for
 ISTA-DASLab's Flash-Next files, 8082 for the family's others, 8083 for Qwen3.6-35B-A3B, 8084 for Qwen3.8-27B):
@@ -135,14 +120,14 @@ How to connect clients, the config's keys, images, image generation, MCP tools a
 
 The server renders prompts with the chat template in the model's file. Lamina also carries
 [froggeric's fixed template for Qwen 3.5, 3.6 and 3.8](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
-(v22.5) in `data/chat-template-froggeric-v22.5.jinja`. To enable it, add this key to the model's config,
-`lamina-<model>.json`, and start the server again:
+(v22.5) in `data/chat-template-froggeric-v22.5.jinja`. To enable it, add this key to the model's config and start the
+server again (or give it `--chat-template-file` on the command line):
 
 ```json
 "chat_template_file": "data/chat-template-froggeric-v22.5.jinja"
 ```
 
-A relative path starts at the config's `cwd`. The server's log then says
+A relative path starts at the config's `cwd`, else at the folder the server starts in. The server's log then says
 `[lamina] chat template: ...data/chat-template-froggeric-v22.5.jinja`. Remove the key to go back to the model's own
 template. A conversation's history renders as it does under the model's template but for its system turn and the warnings
 below, and a cached conversation is read again once. It has been tested on Qwen3.8-Flash-Next, on both model files.
@@ -163,7 +148,8 @@ What it changes:
 
 ## Documentation
 
-- [docs/SETUP.md](docs/SETUP.md): setup, the configs, choosing the GPUs, Qwen3.6 and Qwen3.8-27B.
+- [docs/SETUP.md](docs/SETUP.md): the build, a model file, the release binaries, the configs, choosing the GPUs,
+  Qwen3.6 and Qwen3.8-27B.
 - [docs/USING.md](docs/USING.md): the server, its API and web app, clients, pictures, image generation, MCP tools.
 - [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md): the engine.
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): when something goes wrong.

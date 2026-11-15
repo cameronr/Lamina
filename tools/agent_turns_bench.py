@@ -2,7 +2,7 @@
 
     python tools/agent_turns_bench.py lamina-iq3_s.json base: hcq8:LAMINA_HC_Q8=2 [--rounds 2]
 
-The workload is five simulated coding-agent sessions over this repository's own files (README, the server, setup.py, the
+The workload is five simulated coding-agent sessions over this repository's own files (README, the server, the RAM probe, the
 expert cache, the hyper-connection kernels, the tokenizer): a system prompt, four tools, a task (three in English, two
 in French), then tool calls whose results are the real files, at most 2,000 lines per read as agents' read tools
 return them.  Every point right after a tool result is one turn the model continues - 23 turns from ~2.5K to ~100K
@@ -73,12 +73,12 @@ SESSIONS = [
       ("read_file", "src/core/expert_cache.cpp", "And its implementation."),
       ("grep", "adapt_every", "Searching for the adaptive swap logic."),
       ("read_file", "src/core/expert_source.cpp", "The dispatch that consults the cache is in expert_source.cpp.")]),
-    ("installer-fr",
-     "Dans l'installateur, la détection de la RAM disponible se trompe parfois sous Windows quand un autre programme "
+    ("ram-check-fr",
+     "Dans le serveur, la mesure de la RAM disponible se trompe parfois sous Windows quand un autre programme "
      "réserve beaucoup de mémoire. Trouve où elle est faite, corrige-la, ajoute un test et explique la correction en "
      "français.",
-     [("read_file", "setup.py", "Je commence par lire l'installateur."),
-      ("grep", "def .*ram", "Je cherche les fonctions qui mesurent la RAM."),
+     [("read_file", "src/platform/memory.cpp", "Je commence par lire la mesure de la RAM."),
+      ("grep", "available_ram", "Je cherche qui l'appelle."),
       ("read_file", "docs/SETUP.md", "Je vérifie ce que la documentation promet sur la RAM."),
       ("read_file", "README.md", "Le choix du modèle dépend de la RAM ; je lis cette page aussi.")]),
     ("cuda-kernel",

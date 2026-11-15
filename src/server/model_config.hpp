@@ -1,6 +1,5 @@
-// src/server/model_config.hpp - lamina-server -m: the run config built from a model's GGUF, the one setup wrote for
-// its models: the preset its header picks (examples/*.json, built in), with this PC's GPUs and the files beside the
-// model.  --write-config writes it; --check says what a model needs against what this PC has.
+// src/server/model_config.hpp - lamina-server -m: the run config built from a model's GGUF: the preset its header
+// picks (examples/*.json, built in), with this PC's GPUs and the files beside the model.  --write-config writes it; --check says what a model needs against what this PC has.
 #pragma once
 
 #include "config.hpp"
@@ -32,15 +31,15 @@ std::string preset_name(const std::string& arch, const std::string& quantized_by
 /// that preset's config; std::runtime_error when the build holds no such file
 json preset(const std::string& name);
 
-/// The GPU a model runs on, as setup chose it: of the cards of compute capability 8.0 or newer (of those `allowed`
-/// lists, when it lists any), the one with the most VRAM among those that drive no display, else among all of them,
-/// the lower number on a tie; -1 when there is none.  Its position in `gpus`.
+/// The GPU a model runs on: of the cards of compute capability 8.0 or newer (of those `allowed` lists, when it lists
+/// any), the one with the most VRAM among those that drive no display, else among all of them, the lower number on a
+/// tie; -1 when there is none.  Its position in `gpus`.
+int pick_main_gpu(const std::vector<GpuInfo>& gpus, const std::vector<int>& allowed);
 /// The image encoder's GPU when the vision section asks for one and names none: of the cards of compute capability
 /// 8.0 or newer besides the engine's main one (`main`, its nvidia-smi index, -1 unknown), the one with the least VRAM
 /// (where the encoder's ~1.3 GB matter least) among those that drive no display, else among all of them, the higher
 /// number on a tie; else the main card itself.  Its nvidia-smi index; -1 when there is none.
 int pick_vision_gpu(const std::vector<GpuInfo>& gpus, int main);
-int pick_main_gpu(const std::vector<GpuInfo>& gpus, const std::vector<int>& allowed);
 /// how a config names `g`: by its name when no other card has it, else by its UUID (a number moves when a card is added)
 std::string gpu_spec(const GpuInfo& g, const std::vector<GpuInfo>& gpus);
 
@@ -68,7 +67,7 @@ struct ModelConfig {
     std::vector<std::string> preset_keys;   ///< the preset's keys: a config written over an earlier one renews them
     std::vector<std::string> notes;   ///< "[lamina] ..." lines: the model and its preset, the GPU, the pictures, the log
 };
-/// The config setup wrote for `opts.model`: its preset's, the model's own paths in place of the preset's (--native, the
+/// The config for `opts.model`: its preset's, the model's own paths in place of the preset's (--native, the
 /// projector, the log, the learned profile), the main GPU pick_main_gpu() chooses, and none of the preset's files the
 /// server finds itself (the draft layer: resolve_draft_layer; the expert profile: the engine's built-in one).  Pictures
 /// are on with a projector (--mmproj, else the one projectors_beside() lists first) and lamina-vision beside the server.

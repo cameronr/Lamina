@@ -381,8 +381,8 @@ std::vector<std::string> engine_args(const json& cfg) {
             args.insert(args.end(), {"--vram-reserve-mib", "700"});
             note += " and --vram-reserve-mib 700";
         }
-        say("[lamina] the config has a \"vision\" section but no --vision in its args: " + note + " (run setup again with "
-            "--vision to write them)");
+        say("[lamina] the config has a \"vision\" section but no --vision in its args: " + note + " (write them in "
+            "its args)");
     }
     // #465 (opt-in): "parallel": N - up to N requests decode together in the engine's batch slots
     const json& n = jget(cfg, "parallel");

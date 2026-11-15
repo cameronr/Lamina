@@ -320,7 +320,7 @@ std::vector<std::string> write_config(const std::string& path, json cfg, const s
     std::vector<std::string> kept;
     std::error_code ec;
     try {
-        if (fs::exists(u8_path(path), ec)) {   // as setup run again: the earlier file's own keys stay
+        if (fs::exists(u8_path(path), ec)) {   // written again: the earlier file's own keys stay
             const json old = runconfig::load(path);
             for (auto it = old.begin(); it != old.end(); ++it)
                 if (!cfg.contains(it.key()) && std::find(renewed.begin(), renewed.end(), it.key()) == renewed.end()) {

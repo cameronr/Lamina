@@ -143,8 +143,8 @@ Prepared Service::prepare(json& messages, const json& tools, const json& kwargs,
         if (offline && std::any_of(pics.begin(), pics.end(), is_url))
             throw RequestError("offline mode cannot download an image URL; send a data: image instead");
         if (vision == nullptr)
-            throw RequestError("this server was started without the vision encoder (run setup again with --vision on), "
-                               "so it cannot read images");
+            throw RequestError("this server was started without the vision encoder (an image projector beside the model, or the "
+                               "config's vision section), so it cannot read images");
         const int32_t pad = tok.encode("<|image_pad|>", true)[0], start = tok.encode("<|vision_start|>", true)[0];
         // an image URL is downloaded first, outside the turn: under it, a slow server held every other request
         std::vector<std::pair<std::string, bool>> sources;
@@ -204,7 +204,7 @@ Prepared Service::prepare(json& messages, const json& tools, const json& kwargs,
                                " tokens) + max tokens (" + std::to_string(max_new) + ") exceeds the context (" +
                                std::to_string(ctx) + "); requests are never truncated. Send a smaller max_tokens (at "
                                "most " + std::to_string(std::max<int64_t>(0, room)) + " here), or add \"fit_max_tokens\": "
-                               "true to the model's lamina-<model>.json to shorten it to the room left (#545)");
+                               "true to the config to shorten it to the room left (#545)");
         }
         say("[lamina] max_tokens " + std::to_string(max_new) + " shortened to " + std::to_string(std::max<int64_t>(1, room)) +
             ": the prompt (" + std::to_string(ids.size()) + " tokens) leaves that much of the context (" + std::to_string(ctx) +
@@ -640,7 +640,7 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
             say(std::string(buf) + hit_msg);
             if (finish == "length" && (parser.state() == "reasoning" || parser.state() == "rcall"))
                 say("[lamina] the reply reached max tokens while still thinking, so it has no answer: a thinking budget "
-                    "(reasoning_budget_tokens, in the request or in lamina-<model>.json for every request) leaves room to answer");
+                    "(reasoning_budget_tokens, in the request or in the config for every request) leaves room to answer");
             if (std::getenv("LAMINA_DEBUG") != nullptr && !raw_ids.empty()) say("[lamina] raw: " + py_repr_value(json(tok.decode(raw_ids))));
         }
         st["busy"] = false;
@@ -1022,12 +1022,12 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
         } else if (looped) {
             char buf[256];
             std::snprintf(buf, sizeof buf, "[lamina] the thinking repeated the same passages (coverage=%.3f) at %lld tokens: "
-                          "ended as \"length\" (reasoning_loop_recovery: \"stop\" in lamina-<model>.json; remove it to turn "
+                          "ended as \"length\" (reasoning_loop_recovery: \"stop\" in the config; remove it to turn "
                           "this off)", repeat_coverage, (long long) n);
             say(buf);
         } else if (repeated) {
             say("[lamina] the reply repeated one token (" + py_repr_value(json(tok.decode({run_tok}))) + ") " + std::to_string(run_len) +
-                " times in a row: ended as \"length\" (repeat_stop_tokens in lamina-<model>.json; 0 turns this off). If a "
+                " times in a row: ended as \"length\" (repeat_stop_tokens in the config; 0 turns this off). If a "
                 "new request with a short prompt does the same, restart the server and report it (#606)");
         }
     } catch (...) {
