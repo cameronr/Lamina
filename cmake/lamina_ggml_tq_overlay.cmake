@@ -24,7 +24,13 @@ function(lamina_ggml_tq_overlay LLAMA OUT)
     endif()
   endforeach()
 
-  # ---- helpers: read a file with LF line ends; insert text before / after the single occurrence of an anchor ----------
+  # ---- helpers: read a file with LF line ends; insert text before / after the single occurrence of an anchor; write a
+  # file only when its text changes (a configure then leaves the MMQ instances that include it alone) -------------------
+  function(_tq_write PATH TEXT)   # a function: the text is a variable here, never read again as CMake code
+    file(WRITE "${PATH}.tmp" "${TEXT}")
+    file(COPY_FILE "${PATH}.tmp" "${PATH}" ONLY_IF_DIFFERENT)
+    file(REMOVE "${PATH}.tmp")
+  endfunction()
   macro(_tq_read VAR PATH)
     file(READ "${PATH}" ${VAR})
     string(REPLACE "\r\n" "\n" ${VAR} "${${VAR}}")
@@ -60,6 +66,9 @@ function(lamina_ggml_tq_overlay LLAMA OUT)
   file(GLOB _all_cu "${_cu}/*.cuh" "${_cu}/*.h")
   foreach(_f IN LISTS _all_cu)
     get_filename_component(_n "${_f}" NAME)
+    if(_n STREQUAL "mmq.cuh" OR _n STREQUAL "mmq-load-tiles.cuh" OR _n MATCHES "^mmq-config-.*\\.cuh$")
+      continue()   # written edited below
+    endif()
     configure_file("${_f}" "${OUT}/${_n}" COPYONLY)
   endforeach()
   configure_file("${_cu}/quantize.cu" "${OUT}/quantize.cu" COPYONLY)   # compiled from here: it includes mmq.cuh
@@ -69,7 +78,9 @@ function(lamina_ggml_tq_overlay LLAMA OUT)
   file(GLOB _all_inc "${_inc}/*.h")
   foreach(_f IN LISTS _all_inc)
     get_filename_component(_n "${_f}" NAME)
-    configure_file("${_f}" "${OUT}/include/${_n}" COPYONLY)
+    if(NOT _n STREQUAL "ggml.h")   # written edited below
+      configure_file("${_f}" "${OUT}/include/${_n}" COPYONLY)
+    endif()
   endforeach()
 
   # ---- ggml.h: the enumerators (values above GGML_TYPE_COUNT: ggml's own tables never see them) --------------------------
@@ -79,7 +90,7 @@ function(lamina_ggml_tq_overlay LLAMA OUT)
         GGML_TYPE_TQP6    = 148,
         GGML_TYPE_TQP7    = 149,
 ")
-  file(WRITE "${OUT}/include/ggml.h" "${_h}")
+  _tq_write("${OUT}/include/ggml.h" "${_h}")
 
   # ---- mmq.cuh: routing of the trellis types as IQ2_XS ----------------------------------------------------------------
   _tq_read(_m "${_cu}/mmq.cuh")
@@ -93,11 +104,11 @@ function(lamina_ggml_tq_overlay LLAMA OUT)
     "        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,\n                ggml_cuda_mmq_write_back_mma<type, J, fallback>);\n")
   _tq_edit(_m AFTER "extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);\n"
     "extern DECL_MMQ_CASE(GGML_TYPE_TQP5);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP7);\n")
-  file(WRITE "${OUT}/mmq.cuh" "${_m}")
+  _tq_write("${OUT}/mmq.cuh" "${_m}")
 
   # ---- mmq-load-tiles.cuh: the loader, at the end -------------------------------------------------------------------
   _tq_read(_l "${_cu}/mmq-load-tiles.cuh")
-  file(WRITE "${OUT}/mmq-load-tiles.cuh" "${_l}\n#include \"tq-mmq-tiles.cuh\"\n")
+  _tq_write("${OUT}/mmq-load-tiles.cuh" "${_l}\n#include \"tq-mmq-tiles.cuh\"\n")
   foreach(_n tq.cuh tq-mmq-tiles.cuh ggml-common-tq.h tq_lut_i8.cuh tq_states8.cuh)
     configure_file("${_tq}/${_n}" "${OUT}/${_n}" COPYONLY)
   endforeach()
@@ -119,13 +130,13 @@ function(lamina_ggml_tq_overlay LLAMA OUT)
       _tq_edit(_t AFTER "${_ln}" "${_add}")
     endforeach()
     string(REPLACE "<SEMI>" ";" _t "${_t}")
-    file(WRITE "${OUT}/${_cn}" "${_t}")
+    _tq_write("${OUT}/${_cn}" "${_t}")
   endforeach()
 
   # ---- template instances -------------------------------------------------------------------------------------------
   foreach(_ty tqp5 tqp6 tqp7)
     string(TOUPPER "${_ty}" _TY)
-    file(WRITE "${OUT}/template-instances/mmq-instance-${_ty}.cu"
+    _tq_write("${OUT}/template-instances/mmq-instance-${_ty}.cu"
          "// the trellis overlay (cmake/lamina_ggml_tq_overlay.cmake)\n\n#include \"../mmq.cuh\"\n\nDECL_MMQ_CASE(GGML_TYPE_${_TY});\n")
   endforeach()
 
