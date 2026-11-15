@@ -38,7 +38,7 @@ struct GpuInfo {
     int64_t memory_mib = 0;   ///< its VRAM
     int cc = 0;               ///< compute capability x 10 (86: 8.6), 0 when nvidia-smi does not say
     bool display = false;     ///< a display is active on it
-    std::string driver;       ///< the NVIDIA driver's version
+    std::string driver{};     ///< the NVIDIA driver's version
 };
 /// the NVIDIA cards as nvidia-smi lists them (empty without nvidia-smi)
 std::vector<GpuInfo> nvidia_gpus();
