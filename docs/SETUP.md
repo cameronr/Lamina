@@ -1,8 +1,53 @@
 # Setup
 
-What a PC needs: [the README](../README.md#what-you-need). This page covers what setup does, a model file run without
-it (`lamina-server -m`), the release binaries, the config, the GPUs, the engine options worth knowing,
-Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
+What a PC needs: [the README](../README.md#what-you-need). This page covers the build from the source, what setup
+does, a model file run without it (`lamina-server -m`), the release binaries, the config, the GPUs, the engine options
+worth knowing, Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
+
+## Building
+
+From a clone of this repository, with the CUDA toolkit 13.0 or newer and, on Windows, Visual Studio 2022's C++ tools
+(its free Build Tools with the workload "Desktop development with C++" do), on Linux GCC, CMake 3.24 or newer and Ninja
+(Ubuntu 22.04's CMake is 3.22: `pip install cmake` or Kitware's packages):
+
+```
+build.bat                        (Windows)
+./build.sh                       (Linux)
+```
+
+They build the preset `native` of `CMakePresets.json` into `build/`: `lamina-server`, `lamina` and the image encoder
+`lamina-vision`, on Windows with the CUDA runtime's DLLs beside them (on Linux they take the toolkit's), for this PC's
+CPU and its GPUs of the RTX 30 series and newer, as `nvidia-smi` names them at each build (after a card is added, build
+again). The programs run from there: `build\lamina-server -m MODEL.gguf` ([below](#a-model-file-without-setup)).
+`build.bat portable` (`./build.sh portable`) builds them for other PCs into `build-portable/`, as the releases are: RTX
+30, 40 and 50 GPUs (compute capability 8.6, 8.9 and 12.0, with PTX for newer ones), any x64 CPU with AVX2 or arm64 CPU
+with Armv8.2's dot product and FP16 instructions, the MSVC runtime linked in. CMake options after the preset's name go
+to its configure (`build.bat native -DLAMINA_BUILD_TESTS=ON`, `--fresh` for a new start of the build folder). The
+presets work with CMake alone too: `cmake --preset native`, `cmake --build --preset native` (on Windows in a Visual
+Studio developer prompt).
+
+- **llama.cpp**: the first configure downloads it at the commit the engine is built against, checks its SHA-256 and
+  unpacks it into `third_party/llama.cpp`, without llama.cpp's web app (`tools/ui`, whose deep paths pass Windows'
+  260-character limit). `-DLAMINA_GGML_DIR=<folder>` names another checkout.
+- **The tools**: `build.bat` finds Visual Studio 2022 (else 2019 or 2026) itself, or takes a developer prompt's, and
+  its CMake and Ninja unless the PATH has others; on Windows on Arm it compiles C and C++ with LLVM's clang-cl (Visual
+  Studio's "C++ Clang Compiler for Windows" or LLVM's own: ggml's CPU code for Arm does not build with MSVC). nvcc is
+  the one on the PATH, in `CUDA_PATH` or in `/usr/local/cuda`; `CUDACXX` names another, `CXX` the C++ compiler (on
+  Linux nvcc's host compiler too: `CXX=g++-14` when the GCC is newer than the toolkit takes).
+- **The checks**: a CUDA toolkit older than 13.0 stops the configure (engines built with CUDA 12.8 crashed in long
+  prompts on RTX 50 GPUs), as do 13.2.0 and 13.2.1 for RTX 50 GPUs (their nvcc compiled some of the kernels wrong: the
+  answers were garbage), and GPUs older than the RTX 30 series are left out.
+- **Jobs**: half the logical cores compile and link at once, so that the PC stays usable, fewer when the free RAM holds
+  fewer (1.5 GB a job: nvcc's largest files take up to 0.9 GB); `-DLAMINA_JOBS=N` sets another number. A build that
+  stops is tried once more: CUDA's ptxas now and then fails to read a file it has just written.
+- **What it builds**: the three programs. `-DLAMINA_BUILD_TESTS=ON` adds the tests (`ctest --test-dir build`), the
+  parity checks and the tools, which otherwise build by name (`cmake --build build --target verify_parity`);
+  `-DLAMINA_BUILD_VISION=OFF` leaves the image encoder out.
+
+`cmake --install build --prefix <folder>` puts the programs into a folder of their own, flat, as a release's two
+downloads extract: the programs, `download-draft-layer.bat` (`.sh` on Linux) and the licenses (the component
+`lamina`), and the CUDA runtime and cuBLAS the programs load, with NVIDIA's license (`cudart`; `--component` installs
+one). Installed on Linux, the programs load the libraries in their own folder.
 
 ## Setup
 
@@ -82,17 +127,18 @@ draft vocabulary, the 40,525 tokens it proposes from; `tools/mtp_rt.py --gguf <t
 <new file>` writes one over another (`data/draft_vocab_fr.bin`, `draft_vocab_cyrillic.bin`, `tools/draft_vocab.py`).
 
 **A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 5 MB instead of the CUDA build's
-~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone, with `third_party/llama.cpp` in place
-(setup's step 1; on Windows in a Visual Studio developer prompt):
+~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone (on Windows in a Visual Studio developer
+prompt; it downloads llama.cpp as the engine's build does when `third_party/llama.cpp` is not there):
 
 ```
-cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
+cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-vision --target lamina-vision
 ```
 
 Copy `build-vision/bin/lamina-vision` (`.exe`) beside `lamina-server`, over the one there, and keep `"gpu": false` in
-the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. Setup with
-`--no-build` keeps an encoder it finds beside the server; setup with a build replaces it with the CUDA one it builds.
+the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. The engine's
+build with `-DLAMINA_BUILD_VISION=OFF` leaves it there; setup with `--no-build` keeps an encoder it finds beside the
+server, setup with a build replaces it with the CUDA one it builds.
 
 On Windows on Arm the build takes LLVM's clang-cl for the C and C++ code (ggml's CPU code for Arm does not build with
 MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or LLVM's own install
@@ -175,9 +221,9 @@ does), and the config and the launcher it writes run the programs in `bin/`. The
 capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
 kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
 13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the
-runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a GH200's 9.0)
-and a native build for the PC's CPU need setup's build. The arm64 programs are built and their CPU tests run on each
-release, not yet run with a GPU.
+runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a
+GH200's 9.0) and a native build for the PC's CPU need a build from the source ([above](#building)). The arm64 programs
+are built and their CPU tests run on each release, not yet run with a GPU.
 
 The releases come from the GitHub workflow `.github/workflows/build.yml` at a `v*` tag; it also builds every push to
 `main` and every pull request, and runs the tests that need no GPU. Its steps are `.github/ci.py`'s, which runs on a PC
@@ -231,8 +277,8 @@ between them until its results come late: `--second-gpu-clocks` (below) locks th
 
 **Each GPU is checked** before the engine uses it: one older than the RTX 30 series (compute capability below 8.0), or
 one the programs have no kernels for, stops the start as the main GPU and is left out as a tier or a layer split's GPU,
-the log saying why. Setup builds for this PC's GPUs: after a card is added, run it again. The releases' programs run on
-the RTX 30, 40 and 50 series.
+the log saying why. A build from the source is for this PC's GPUs: after a card is added, build again. The releases'
+programs run on the RTX 30, 40 and 50 series.
 
 ## Engine options
 
@@ -326,9 +372,9 @@ is read again from the start), `/v1/choose` and the GPU tiers. The config's `par
 
 ## Docker
 
-The `Dockerfile` builds the engine and the image encoder with setup for RTX 30, 40 and 50 GPUs (`CUDA_ARCHITECTURES`
-narrows them). The container prepares a model in `/data` at its first start (later starts check the files) and serves
-it on port 8080 with an API key:
+The `Dockerfile` builds the engine and the image encoder with the portable preset for RTX 30, 40 and 50 GPUs
+(`CUDA_ARCHITECTURES` narrows them, `JOBS` sets the jobs at once). The container prepares a model in `/data` at its
+first start (later starts check the files) and serves it on port 8080 with an API key:
 
 ```
 docker build -t lamina .
@@ -341,6 +387,6 @@ RAM, hence `--ulimit memlock=-1`.
 
 ## Updating
 
-`setup --update --model <model>` pulls this clone, rebuilds what changed and keeps the config's own keys. A model's
-files stay where they are. With release binaries: check out the new release's tag, extract its archives into `bin/`
-over the old ones and run setup with `--no-build`.
+`setup --update --model <model>` pulls this clone, rebuilds what changed and keeps the config's own keys; without setup,
+`git pull` and the build again do the same for the programs. A model's files stay where they are. With release binaries:
+check out the new release's tag, extract its archives into `bin/` over the old ones and run setup with `--no-build`.

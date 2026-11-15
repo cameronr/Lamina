@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "release",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LAMINA_ENABLE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "native",
+      "inherits": "release",
+      "displayName": "This PC: its GPUs and its CPU",
+      "description": "The kernels for the GPUs nvidia-smi names (compute capability 8.0 or newer), ggml's CPU code for this CPU",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
+    },
+    {
+      "name": "portable",
+      "inherits": "release",
+      "displayName": "Other PCs: RTX 30, 40 and 50, any AVX2 CPU (the releases' build)",
+      "description": "The kernels for compute capability 8.6, 8.9 and 12.0 with its PTX for newer GPUs; x64 with AVX2 (the AVX-512 kernels chosen at run time), arm64 with Armv8.2's dotprod and fp16; the MSVC runtime linked in",
+      "binaryDir": "${sourceDir}/build-portable",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "86-real;89-real;120-real;120-virtual",
+        "LAMINA_PORTABLE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "native", "configurePreset": "native" },
+    { "name": "portable", "configurePreset": "portable" }
+  ]
+}

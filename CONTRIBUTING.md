@@ -32,12 +32,13 @@ the issue when there is one. For a large change or a new default, open an issue 
 - **Speed.** Before and after on the same PC and the same fixed text, several runs in both orders, with every changed
   setting named; the runs themselves, not only the best. Long prompts and long conversations come first: a gain on
   short texts alone does not decide a default.
-- **Tests.** The engine builds without warnings; the test suite builds with `-DLAMINA_BUILD_TESTS=ON` and runs with
-  `ctest`. The server's and the tools' tests run from the clone's folder: `python -m unittest discover -s tests/server`
-  (with `LAMINA_TEST_GGUF` naming a Flash-Next GGUF, its first shard: the server answers recorded requests on a mock
-  engine) and `python -m unittest discover -s tools -p "test_*.py"` (with `regex` installed). GitHub builds each
-  pull request for Windows and Linux on x64 and arm64 and runs the tests that need no GPU (`ctest -L cpu`) and the
-  tools' tests there (`.github/workflows/build.yml`); the GPU tests are for you to run.
+- **Tests.** The engine builds without warnings; the test suite builds with `build.bat native -DLAMINA_BUILD_TESTS=ON`
+  (`./build.sh native -DLAMINA_BUILD_TESTS=ON`) and runs with `ctest --test-dir build`. The server's and the tools'
+  tests run from the clone's folder: `python -m unittest discover -s tests/server` (with `LAMINA_TEST_GGUF` naming a
+  Flash-Next GGUF, its first shard: the server answers recorded requests on a mock engine) and `python -m unittest
+  discover -s tools -p "test_*.py"` (with `regex` installed). GitHub builds each pull request for Windows and Linux on
+  x64 and arm64 and runs the tests that need no GPU (`ctest -L cpu`) and the tools' tests there
+  (`.github/workflows/build.yml`); the GPU tests are for you to run.
 - **Docs** describe what is, not what changed: update the ones your change makes wrong.
 
 Report what you ran as passed, failed or not run, with the commands and the hardware. Never submit measurements,

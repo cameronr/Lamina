@@ -3,6 +3,40 @@
 The engine's log is the config's `log`, `lamina-<model>.log` in the clone's folder; the server writes to its window.
 `setup --check` says what the PC has and what a model needs.
 
+## Building
+
+**"Visual Studio's C++ tools are needed".** `build.bat` found no Visual Studio 2022 (nor 2019 or 2026) with the C++
+tools: install Visual Studio 2022 or its free Build Tools with the workload "Desktop development with C++", which has
+CMake and Ninja too, or run `build.bat` from a developer prompt of the one to use.
+
+**"CMake 3.24 or newer is needed", "Ninja is needed", or CMake's "CMake 3.24 or higher is required".** Install them:
+on Windows Visual Studio's "C++ CMake tools for Windows" (part of that workload) or cmake.org's; on Linux the
+distribution's `cmake` and `ninja-build` (Ubuntu 22.04's CMake is 3.22: `pip install cmake`).
+
+**"No CMAKE_CUDA_COMPILER could be found".** The CUDA toolkit is not installed, or its nvcc is neither on the PATH nor
+in `CUDA_PATH` or `/usr/local/cuda`: install the toolkit 13.0 or newer, or name its nvcc, `CUDACXX=<path to nvcc>`,
+and build with `--fresh` (`build.bat --fresh`), as the build folder keeps the first compiler it found.
+
+**"Lamina builds with the CUDA toolkit 13.0 or newer, and ... is 12.x".** Name a newer toolkit's nvcc with `CUDACXX`
+and build with `--fresh`.
+
+**"CUDA 13.2.0 or 13.2.1 compiles some of the engine's kernels wrong for RTX 50 GPUs".** The answers would be
+garbage: use CUDA 13.0, 13.1 or 13.2.2 and newer (`CUDACXX`, `--fresh`), or build for older GPUs only
+(`-DCMAKE_CUDA_ARCHITECTURES=86`).
+
+**"CMAKE_CUDA_ARCHITECTURES is native, and nvidia-smi names no NVIDIA GPU ...".** The NVIDIA driver is missing, or
+`nvidia-smi` is not on the PATH, or the GPUs are older than the RTX 30 series. For another PC's GPUs: `build.bat
+portable`, or name them (`-DCMAKE_CUDA_ARCHITECTURES=86;120`, quoted for `build.bat`).
+
+**Linux: the build stops at `unsupported GNU version`.** The GCC is newer than the CUDA toolkit accepts. Install an
+older one beside it (g++-14) and name it: `CXX=g++-14 ./build.sh --fresh` (nvcc then takes it too; `CUDAHOSTCXX`
+names nvcc's alone). For setup: `CXX=g++-14 ./setup.sh ...`.
+
+**"llama.cpp ...: the download failed".** The build fetches llama.cpp from GitHub at its first configure: check the
+network (an HTTPS proxy is taken from `https_proxy`) and build again. **"... holds a llama.cpp this build did not
+download"**: `third_party/llama.cpp` is a copy of another origin; move it away, or name it with
+`-DLAMINA_GGML_DIR=<folder>`.
+
 ## Setup
 
 **"missing for the build: ...".** Setup installs no system software: install what it names (the CUDA toolkit 13.0 or
@@ -16,10 +50,6 @@ compiler, `build-essential` on Debian and Ubuntu), then run setup again. `LAMINA
 **Setup warns about CUDA 13.2.0 or 13.2.1.** Their compiler builds some of the engine's kernels wrong for RTX 50 GPUs
 (sm_120): the answers are garbage. Use CUDA 13.0, 13.1 or 13.2.2 and newer; `LAMINA_NVCC` picks one installed beside
 it.
-
-**Linux: the build stops at `unsupported GNU version`.** The GCC is newer than the CUDA toolkit accepts. Install an
-older one beside it (g++-14) and name it: `CXX=g++-14 ./setup.sh ...` (`CC`, `CXX` and `CUDAHOSTCXX` name the build's
-compilers).
 
 **A download broke off.** Run setup again: it goes on from where it stopped.
 
@@ -91,9 +121,10 @@ roughly half to two thirds of its speed. Run the command the warning gives (`dow
 **"mtp: ... is not a draft layer this engine reads".** The file `--mtp` names is another GGUF (a model, a projector) or
 the draft layer of another format: download the layer again with the script.
 
-**"this build has no kernels for its compute capability, ...".** The engine was built for other GPUs: a card added
-after setup, or a release's programs on a card other than the RTX 30, 40 and 50 series. Run setup again: it builds for
-this PC's GPUs. As the main GPU, such a card stops the start; as a tier it is left out.
+**"this build has no kernels for its compute capability, ...".** The engine was built for other GPUs: a card added after
+the build, or a release's programs on a card other than the RTX 30, 40 and 50 series. Build again from the source
+(`build.bat`, `./build.sh`, or setup): the build is for this PC's GPUs. As the main GPU, such a card stops the start; as
+a tier it is left out.
 
 **"its compute capability is ..., and Lamina needs 8.0 or newer".** The card is older than the RTX 30 series: name
 another as `--main-gpu`.

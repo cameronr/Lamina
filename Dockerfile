@@ -1,11 +1,11 @@
 # Lamina in a container (Linux, NVIDIA GPUs of the RTX 30 series or newer, CUDA 13). The first stage builds the engine
-# and the image encoder with setup.py for the CUDA architectures below (docker build has no GPU to read them from); the
-# runtime stage starts with setup.py --no-build, which downloads and prepares the model in /data once and checks it on
-# later starts, then serves it on port 8080 with the API key the container is given.
+# and the image encoder with the portable preset (build.sh) for the CUDA architectures below (docker build has no GPU
+# to read them from); the runtime stage starts with setup.py --no-build, which downloads and prepares the model in
+# /data once and checks it on later starts, then serves it on port 8080 with the API key the container is given.
 #
 #   docker build -t lamina .                                                       (RTX 30, 40 and 50)
 #   docker build -t lamina --build-arg CUDA_ARCHITECTURES="86-real;86-virtual" .   (RTX 30 only: a faster build)
-#   docker build -t lamina --build-arg JOBS=2 .                                    (a VM with little RAM)
+#   docker build -t lamina --build-arg JOBS=2 .                                    (fewer build jobs at once)
 #   docker run --rm --gpus all --ulimit memlock=-1 -p 127.0.0.1:8081:8080 -v lamina-data:/data \
 #              -e MODEL=iq3_s -e API_KEY=<a long random key> lamina
 #
@@ -16,16 +16,16 @@
 ARG CUDA_VERSION=13.0.0
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
-ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates libssl-dev python3 python3-venv \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates cmake libssl-dev \
+    ninja-build && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/lamina
 COPY . .
 ARG CUDA_ARCHITECTURES="86-real;89-real;120-real;120-virtual"
-# compile jobs (default: half the CPU's threads); nvcc takes 1-2 GB of RAM a job
+# build jobs at once (default: half the CPU's threads, fewer when the build's free RAM holds fewer at 1.5 GB a job)
 ARG JOBS=
-RUN python3 -m venv .venv && \
-    CMAKE_BUILD_PARALLEL_LEVEL="$JOBS" .venv/bin/python setup.py --cuda-archs "$CUDA_ARCHITECTURES" --portable
+RUN sh build.sh portable -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" ${JOBS:+-DLAMINA_JOBS=$JOBS} && \
+    cmake --install build-portable --component lamina --prefix /opt/lamina/dist
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -35,7 +35,7 @@ WORKDIR /opt/lamina
 COPY . .
 RUN python3 -m venv .venv
 # (the image encoder beside the server, which takes it from its own folder)
-COPY --from=build /opt/lamina/build/lamina /opt/lamina/build/lamina-server /opt/lamina/build/lamina-vision build/
+COPY --from=build /opt/lamina/dist/lamina /opt/lamina/dist/lamina-server /opt/lamina/dist/lamina-vision build/
 VOLUME ["/data"]
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/lamina/docker/entrypoint.sh"]

@@ -43,9 +43,9 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
   and FP16 instructions, where the experts run on ggml's dot products (built and its CPU tests run, not yet run with a
   GPU). The CPU computes the experts no GPU holds, so its cores and the RAM's bandwidth set much of the speed.
 - **Windows 10 / 11 or Linux**, and Python 3.10 or newer for setup.
-- **To build:** the CUDA toolkit 13.0 or newer, Visual Studio 2022's C++ tools (Windows; on Arm also LLVM's clang-cl)
-  or GCC (Linux), and Git. The [releases](https://github.com/eddoursul/Lamina/releases) have the programs built for
-  RTX 30, 40 and 50 GPUs.
+- **To build:** the CUDA toolkit 13.0 or newer, and Visual Studio 2022's C++ tools on Windows (their CMake and Ninja
+  serve the build; on Arm also LLVM's clang-cl), or GCC, CMake 3.24 or newer and Ninja on Linux. The
+  [releases](https://github.com/eddoursul/Lamina/releases) have the programs built for RTX 30, 40 and 50 GPUs.
 
 ## Install
 
@@ -55,21 +55,33 @@ model's GGUF files into a folder of their own: one of the table's above (every s
 projector of its repository (an `mmproj-*.gguf`) for pictures and, for Qwen3.8-Flash-Next, Lamina's draft layer
 ([below](#the-draft-layer)). [Run](#run) then starts it.
 
-**The source:** from a clone, setup builds the programs and sets up one of the table's models:
+**The source:** from a clone, `build.bat` (Windows) or `./build.sh` (Linux) builds the programs for this PC's GPUs
+into `build`, where they run as a release's do ([Run](#run)):
 
 ```
 git clone https://github.com/eddoursul/Lamina
 cd Lamina
+build.bat                        (Windows)
+./build.sh                       (Linux)
+```
+
+The build downloads llama.cpp at the commit the engine is built against and checks it; it installs no system software
+and names what is missing. `build.bat portable` builds the programs for other PCs, as the releases are, and `cmake
+--install build --prefix <folder>` puts them into a folder of their own: [docs/SETUP.md](docs/SETUP.md#building).
+
+Setup, in the same clone, sets up one of the table's models: it downloads the model's files at pinned revisions,
+checks them, prepares them, and writes a config and a launcher, and it builds the programs too (`--no-build` takes
+those in `build` as they are):
+
+```
 setup.bat --model iq3_s          (Windows)
 ./setup.sh --model iq3_s         (Linux)
 ```
 
-Setup builds the engine and the image encoder for this PC's GPUs, downloads the model's files at pinned revisions and
-checks them, prepares them, and writes a config and a launcher. `--model ud-q4_k_xl`, `--model qwen36-ud-q4_k_xl` and
-`--model qwen38-27b-ud-q6_k_m` set up the others; `--check` says what the PC has and what a model needs, without
-changing anything. Setup asks nothing and installs no system software: it names what is missing. A release's programs,
-extracted into `bin` in the clone, spare the build: `--no-build` ([docs/SETUP.md](docs/SETUP.md#release-binaries)).
-Details: [docs/SETUP.md](docs/SETUP.md).
+`--model ud-q4_k_xl`, `--model qwen36-ud-q4_k_xl` and `--model qwen38-27b-ud-q6_k_m` set up the others; `--check` says
+what the PC has and what a model needs, without changing anything. Setup asks nothing and installs no system software:
+it names what is missing. A release's programs, extracted into `bin` in the clone, spare the build: `--no-build`
+([docs/SETUP.md](docs/SETUP.md#release-binaries)). Details: [docs/SETUP.md](docs/SETUP.md).
 
 ### The draft layer
 
@@ -172,7 +184,7 @@ cpp-httplib, nlohmann/json, stb_image: MIT). It builds on:
   Strata took from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen).
 - [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp) (MIT): the CPU and CUDA kernels it shares, the prompt
-  path's matrix products, the image encoder, the GGUF tools. Setup downloads it at a pinned commit.
+  path's matrix products, the image encoder, the GGUF tools. The build downloads it at a pinned commit.
 - The models: [Qwen](https://huggingface.co/Qwen)'s, under their licenses, in the quantizations of
   [ISTA-DASLab](https://huggingface.co/ISTA-DASLab) and [unsloth](https://huggingface.co/unsloth).
 - The draft layer, [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP):

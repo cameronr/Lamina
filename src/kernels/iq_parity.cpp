@@ -5,7 +5,7 @@
 // The fixtures are GENERATED (deterministic; TODO 24) - tools/iq_fixture.py writes each type's raw block
 // bytes and the gguf-py dequantized reference (Q2_0, this repository's type 42, is dequantized by
 // tools/gguf_writer.py's codec instead - gguf-py has no such type).  Dependencies: python3 with numpy and
-// the vendored gguf-py that setup downloads (the pinned llama.cpp zip; third_party/ is gitignored).
+// the vendored gguf-py the build downloads (third_party/llama.cpp at the pinned commit: cmake/lamina_llama.cmake).
 //
 // What is compared, and how: the dequant parity is a MEASURED relative error (sum|got-ref| / sum|ref|) -
 // bitwise equality is not claimed and not required; on the generated fixtures it measures 0.00e+00.  The

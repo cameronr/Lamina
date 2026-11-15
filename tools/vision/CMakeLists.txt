@@ -1,28 +1,39 @@
-# tools/vision - lamina-vision, the image encoder for Lamina's multimodal path (setup.py builds it).  Uses llama.cpp's
-# mtmd library at the same pinned commit as the engine's ggml.
+# tools/vision - lamina-vision, the image encoder for Lamina's multimodal path. Uses llama.cpp's mtmd library at the
+# same pinned commit as the engine's ggml (cmake/lamina_llama.cmake).
 #
-#   cmake -S tools/vision -B build-vision-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         -DLAMINA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native [-DLAMINA_PORTABLE=OFF]
-#   cmake --build build-vision-cuda --target lamina-vision
+# The engine's build (../../CMakeLists.txt) builds it as an external project, with CUDA for the engine's GPUs, into its
+# build folder beside lamina-server, which starts the lamina-vision in its own folder and no other. A CUDA build runs
+# either way, as the config's vision section says: without --gpu it hides the GPUs and runs on the CPU.
+# LAMINA_VISION_CUDA=OFF (the default here) builds one for the CPU alone, which refuses --gpu (src/docs/SETUP.md, A
+# CPU-only image encoder):
 #
-# lamina-server starts the lamina-vision in its own folder and no other: copy build-vision-cuda/bin's there (setup.py
-# and .github/ci.py do).  A CUDA build runs either way, as the config's vision section says: without --gpu it hides the
-# GPUs and runs on the CPU; LAMINA_VISION_CUDA=OFF (the default here) builds one for the CPU alone, which refuses --gpu
-# (src/docs/SETUP.md, A CPU-only image encoder).
+#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build-vision --target lamina-vision          (build-vision/bin/lamina-vision)
 #
+# Without LLAMA_DIR it takes the engine's third_party/llama.cpp, downloaded at the pinned commit when it is not there.
 # Portable (AVX2 baseline; arm64: Armv8.2 + dotprod + fp16) is the default, so an encoder built without extra flags
 # runs on any AVX2 PC: the 0.1.32 release's encoder was built native on an AVX-512 machine and stopped with an illegal
-# instruction elsewhere (#411 #412 #419).  setup.py builds it portable too (a native build on an AVX-512 CPU runs
-# without flash attention on the CPU, about half as fast), with CUDA for the PC's GPUs.  The option is kept in
-# CMakeCache.txt, so a build folder configured before this default still needs the flag (or a fresh folder).
+# instruction elsewhere (#411 #412 #419); a native build on an AVX-512 CPU also runs without flash attention on the
+# CPU, about half as fast. The option is kept in CMakeCache.txt, so a build folder configured before this default
+# still needs the flag (or a fresh folder).
 cmake_minimum_required(VERSION 3.21)
 project(lamina_vision C CXX)
 
-set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
+set(LLAMA_DIR "" CACHE PATH
+    "llama.cpp checkout (empty: the engine's third_party/llama.cpp at the pinned commit, downloaded when missing)")
+if(NOT LLAMA_DIR)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/lamina_llama.cmake)
+  lamina_llama_cpp(LLAMA_DIR)
+endif()
+set(LAMINA_VISION_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin" CACHE PATH "the folder lamina-vision is built into")
 option(LAMINA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
 option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static MSVC runtime" ON)
 if(LAMINA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+# cmake --install: flat, as a release lays its programs out (the engine's build installs it with them)
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "the folder cmake --install fills (--prefix names another)" FORCE)
 endif()
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -35,6 +46,7 @@ set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+set(GGML_CCACHE OFF CACHE BOOL "" FORCE)   # no launcher of ggml's choosing: CMAKE_<LANG>_COMPILER_LAUNCHER names one
 if(LAMINA_PORTABLE)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/lamina_ggml_portable.cmake)
   lamina_ggml_portable()   # AVX2 and nothing above it (arm64: Armv8.2 + dotprod + fp16), even when a -D asks for more
@@ -51,8 +63,14 @@ else()
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA ${LAMINA_VISION_CUDA} CACHE BOOL "" FORCE)
+# every compile and link in one job pool: half the logical cores (LAMINA_JOBS sets another number)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/lamina_jobs.cmake)
+lamina_job_pool()
 
+# llama.cpp's install rules are its libraries' and headers', none of the encoder's
+set(CMAKE_SKIP_INSTALL_RULES ON)
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
+set(CMAKE_SKIP_INSTALL_RULES OFF)
 
 add_executable(lamina-vision lamina_vision.cpp)
 if(MSVC)   # UTF-8 as its code page: image and model paths outside the ANSI code page (../../cmake/utf8.manifest)
@@ -62,11 +80,12 @@ target_link_libraries(lamina-vision PRIVATE mtmd llama)
 target_compile_features(lamina-vision PRIVATE cxx_std_17)
 # a build without CUDA refuses --gpu (lamina_vision.cpp)
 target_compile_definitions(lamina-vision PRIVATE LAMINA_VISION_CUDA=$<BOOL:${LAMINA_VISION_CUDA}>)
-install(TARGETS lamina-vision RUNTIME DESTINATION bin COMPONENT lamina)
-set_target_properties(lamina-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+install(TARGETS lamina-vision RUNTIME DESTINATION . COMPONENT lamina)
+set_target_properties(lamina-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${LAMINA_VISION_OUTPUT_DIR})
 if(UNIX AND NOT APPLE)
-  # the libraries it needs are the ones in its own folder (a component folder is relocatable): RUNPATH $ORIGIN
-  set_target_properties(lamina-vision PROPERTIES BUILD_WITH_INSTALL_RPATH ON INSTALL_RPATH "$ORIGIN")
+  # installed, it loads the libraries in its own folder (a release's folder is relocatable), in the build folder the
+  # toolkit's; RUNPATH, so LD_LIBRARY_PATH can name others
+  set_target_properties(lamina-vision PROPERTIES INSTALL_RPATH "$ORIGIN")
   target_link_options(lamina-vision PRIVATE -Wl,--enable-new-dtags)
 endif()
 
