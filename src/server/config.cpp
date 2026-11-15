@@ -248,7 +248,7 @@ std::vector<GpuInfo> nvidia_gpus() {
             const size_t dot = f[5].find('.');   // "8.6"; "[N/A]" where the driver does not say
             if (dot != std::string::npos && std::isdigit((unsigned char) f[5][0]))
                 g.cc = std::atoi(f[5].c_str()) * 10 + std::atoi(f[5].c_str() + dot + 1);
-            g.display = lower(f[6]) == "enabled" || core::gpu_in_desktop_use(f[2]);   // the flag alone reads off
+            g.display = lower(f[6]) == "enabled" || core::gpu_in_desktop_use(f[2]);   // off while a monitor sleeps
             g.driver = f[7];
             out.push_back(std::move(g));
         }

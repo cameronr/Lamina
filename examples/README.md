@@ -12,7 +12,10 @@ which takes the model file, the GPU, the draft layer, the projector and the file
 - `qwen38-27b-ud-q6_k_m.json`: Qwen3.8-27B, unsloth's UD-Q6_K_M, on the same path, its layers split over the fewest
   GPUs that hold it at the full 262,144 cells, K and V in q8_0 (~36 GB of VRAM: a 24 GB and a 16 GB GPU).
 
-`lamina-server -m MODEL.gguf --write-config FILE` writes one with the PC's own files and GPUs. Their engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's keys: [USING.md](../docs/USING.md#the-config).
+`lamina-server -m MODEL.gguf --write-config FILE` writes one with the PC's own files and GPUs. `run-<model>.bat.example`
+is a launcher for each: copied to `run-<model>.bat`, it starts the example from the clone's folder, the model's files
+where its paths say (`../Lamina-data`). Their engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's
+keys: [USING.md](../docs/USING.md#the-config).
 
 ## The development PC's own options
 
