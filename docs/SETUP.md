@@ -163,9 +163,14 @@ The server builds the config setup would write for the file and says in its wind
 - **Flash-Next's draft layer**, `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, beside the model, else beside the server
   ([the README](../README.md#the-draft-layer)).
 - **Pictures**: an image projector made for the model beside it (an `mmproj*.gguf` whose width is the model's; of
-  several the smallest, as the CPU encodes a Q8_0 one sooner than an F16 one), read by the `lamina-vision` beside the
-  server on the CPU's logical cores. `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
-  projector or the encoder the window says why there are none.
+  several the smallest), read by the `lamina-vision` beside the server on the CPU's logical cores, or with
+  `--vision-gpu --vision-cuda-device <UUID>` on that GPU (`nvidia-smi -L` lists the UUIDs; ~1.3 GB of its VRAM).
+  `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a projector or the encoder the window
+  says why there are none. For Qwen3.8-Flash-Next on the CPU, download Lamina's Q8_0 projector into the model's folder:
+  `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
+  [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) beside the
+  draft layer. The CPU encodes a picture with it in ~20% less time than with the BF16 one and 280 MiB less RAM, with
+  the same answers.
 - **The expert profile**, Qwen3.8-Flash-Next's, built into the programs (`--expert-profile builtin`, the engine's
   default under `--serve`).
 - **What a run writes**, beside the server: the engine's log (`<model>.log`) and what the run learned about the
