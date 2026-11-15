@@ -783,13 +783,17 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
                  "Embedding the web app")
     lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/presets.cpp ${CMAKE_CURRENT_SOURCE_DIR}/examples *.json preset_file
                  "Embedding the presets")
-    add_library(lamina_server_core STATIC src/server/api.cpp src/server/config.cpp src/server/engine.cpp
-                src/server/engine_batch.cpp src/server/http_client.cpp src/server/http_server.cpp src/server/images.cpp
-                src/server/keepawake.cpp src/server/mcp.cpp src/server/model_config.cpp src/server/net.cpp
-                src/server/params.cpp src/server/process.cpp src/server/prometheus.cpp src/server/replicas.cpp src/server/responses.cpp
+    # --bench's agent session: the clone's README and docs as the Python benchmark read them, frozen
+    lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/bench_files.cpp ${CMAKE_CURRENT_SOURCE_DIR}/data bench-agent-files.json
+                 bench_file "Embedding the benchmark's texts")
+    add_library(lamina_server_core STATIC src/server/api.cpp src/server/bench.cpp src/server/config.cpp
+                src/server/engine.cpp src/server/engine_batch.cpp src/server/http_client.cpp src/server/http_server.cpp
+                src/server/images.cpp src/server/keepawake.cpp src/server/mcp.cpp src/server/model_config.cpp
+                src/server/net.cpp src/server/params.cpp src/server/process.cpp src/server/prometheus.cpp
+                src/server/replicas.cpp src/server/responses.cpp
                 src/server/runconfig.cpp src/server/service.cpp src/server/service_run.cpp src/server/structured.cpp
                 src/server/telemetry.cpp src/server/vision.cpp ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp
-                ${CMAKE_CURRENT_BINARY_DIR}/presets.cpp)
+                ${CMAKE_CURRENT_BINARY_DIR}/presets.cpp ${CMAKE_CURRENT_BINARY_DIR}/bench_files.cpp)
     target_include_directories(lamina_server_core PUBLIC src/server ${_lamina_llama_root}/vendor
                                ${_lamina_llama_root}/vendor/cpp-httplib)
     target_link_libraries(lamina_server_core PUBLIC lamina_text cpp-httplib vendor-hash lamina_program lamina_warnings)
@@ -809,6 +813,10 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
     add_executable(params_test tests/server/params_test.cpp)
     target_link_libraries(params_test PRIVATE lamina_server_core)
     add_test(NAME params_test COMMAND params_test)
+    # --bench against a scripted server of its own: the suite, the report, the redaction, the comparison (CPU only)
+    add_executable(bench_test tests/server/bench_test.cpp)
+    target_link_libraries(bench_test PRIVATE lamina_server_core)
+    add_test(NAME bench_test COMMAND bench_test)
     install(TARGETS lamina lamina-server RUNTIME DESTINATION . COMPONENT lamina)
     if(WIN32)
       install(PROGRAMS download-draft-layer.bat DESTINATION . COMPONENT lamina)
@@ -915,7 +923,7 @@ if(LAMINA_BUILD_TESTS)
   foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
              q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
              conversation_cache_test control_vector_test deterministic_adapt_help platform_memory_test
-             ple_reader_selftest model_config_test params_test)
+             ple_reader_selftest model_config_test params_test bench_test)
     if(TEST ${_t})
       set_tests_properties(${_t} PROPERTIES LABELS cpu)
     endif()

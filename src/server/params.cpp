@@ -1,8 +1,10 @@
 // src/server/params.cpp - lamina-server's settings table and command line (params.hpp).
 #include "params.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <iterator>
 #include <stdexcept>
 
 namespace lamina {
@@ -348,6 +350,48 @@ CommandLine parse_command_line(int argc, char** argv) {
             cl.check = true;
             continue;
         }
+        static const char* const bench_flags[] = {"--bench",       "--bench-url",   "--bench-runs", "--bench-clients",
+                                                  "--bench-long",  "--bench-think", "--bench-out",  "--bench-compare"};
+        if (std::find(std::begin(bench_flags), std::end(bench_flags), o) != std::end(bench_flags)) {
+            // the benchmark's (src/server/bench.hpp): command-line options, no config keys
+            auto whole = [&](int lo, int hi) {
+                const std::string v = value();
+                try {
+                    size_t used = 0;
+                    const long long n = std::stoll(v, &used);
+                    if (used == v.size() && n >= lo && n <= hi) return (int) n;
+                } catch (const std::exception&) {
+                }
+                bad(o, "expected a whole number in " + std::to_string(lo) + ".." + std::to_string(hi) + ", not '" + v + "'");
+            };
+            auto absolute = [](const std::string& p) { return u8_str(std::filesystem::absolute(u8_path(p)).lexically_normal()); };
+            if (o == "--bench" || o == "--bench-long" || o == "--bench-think") {
+                if (inline_value) bad(o, "takes no value");
+                (o == "--bench" ? cl.bench : o == "--bench-long" ? cl.bench_long : cl.bench_think) = true;
+                cl.bench_options = cl.bench_options || o != "--bench";
+                continue;
+            }
+            if (o == "--bench-url") {
+                cl.bench_url = value();
+                continue;
+            }
+            if (o == "--bench-runs" || o == "--bench-clients") {
+                (o == "--bench-runs" ? cl.bench_runs : cl.bench_clients) = o == "--bench-runs" ? whole(1, 100) : whole(0, 256);
+                cl.bench_options = true;
+                continue;
+            }
+            if (o == "--bench-out") {
+                cl.bench_out = absolute(value());
+                cl.bench_options = true;
+                continue;
+            }
+            if (o == "--bench-compare") {   // OLD, and NEW when the next word is no option
+                cl.bench_compare.push_back(absolute(value()));
+                if (!inline_value && i + 1 < argc && !starts_with(argv[i + 1], "--")) cl.bench_compare.push_back(absolute(argv[++i]));
+                if (cl.bench_compare.size() > 2) bad(o, "takes one report (OLD) or two (OLD NEW)");
+                continue;
+            }
+        }
         bool negated = false;
         if (const Param* p = find_param(o, &negated)) {
             if (p->kind == K::Off) {
@@ -431,6 +475,18 @@ std::string params_help() {
                                      "kept as FILE.bak, and its keys outside the preset stay"},
              {"--check", "say what this PC has and, for the model, what it needs, how it would run and whether it "
                          "starts (exit code 1: it would not); nothing is loaded"},
+             {"--bench", "measure the model the way it is used: load it, send a fixed suite through this server's own "
+                         "API on a port of its own (short questions, 4K and 16K prompts, a coding agent's session; 3-10 "
+                         "minutes), write a report to share into bench-results beside the program, and stop"},
+             {"--bench-url URL", "the same against a Lamina server that runs (http://127.0.0.1:8081): nothing is "
+                                 "loaded here"},
+             {"--bench-runs N", "runs per test (default 3)"},
+             {"--bench-clients N", "also N requests at once (the server's --parallel slots run them together)"},
+             {"--bench-long", "also a prompt of ~32K tokens"},
+             {"--bench-think", "thinking on (the suite turns it off, so the answers are short and comparable)"},
+             {"--bench-out DIR", "where the report's folder goes (default: bench-results beside the program)"},
+             {"--bench-compare OLD [NEW]", "an earlier report (its folder or results.json) beside this run's; with "
+                                           "NEW and no --bench, two reports side by side"},
              {"-h, --help", "this text"}}) {
         std::string l = std::string("  ") + left;
         l += std::string(l.size() < kCol ? kCol - l.size() : 1, ' ');

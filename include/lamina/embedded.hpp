@@ -17,5 +17,7 @@ const EmbeddedFile* web_asset(std::string_view path);
 const EmbeddedFile* preset_file(std::string_view path);
 /// data/expert-profile.bin, Qwen3.8-Flash-Next's built-in expert profile (lamina/core/expert_cache.hpp)
 const EmbeddedFile* profile_file(std::string_view path);
+/// data/bench-agent-files.json, the texts of lamina-server --bench's agent session (src/server/bench.hpp)
+const EmbeddedFile* bench_file(std::string_view path);
 
 }  // namespace lamina

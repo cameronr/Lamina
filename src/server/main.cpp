@@ -4,6 +4,8 @@
 //   lamina-server -m MODEL.gguf                      a model file, its config built from the preset for it
 //   lamina-server --config lamina-<model>.json       the model a run config names
 //   lamina-server --engine mock --tokenizer <gguf>   a scripted engine (the tests')
+//   lamina-server -m MODEL.gguf --bench              the model measured through this server's API (bench.hpp)
+#include "bench.hpp"
 #include "config.hpp"
 #include "engine.hpp"
 #include "frontend.hpp"
@@ -122,6 +124,20 @@ long self_pid() {
     return (long) getpid();
 #endif
 }
+
+/// a file removed when it goes out of scope, however the run ends (--bench's copy of the expert profile, which the
+/// engine saves into at its close: declared before the engine, so removed after it)
+struct RemovedAtEnd {
+    std::string path;
+    RemovedAtEnd() = default;
+    RemovedAtEnd(const RemovedAtEnd&) = delete;
+    RemovedAtEnd& operator=(const RemovedAtEnd&) = delete;
+    ~RemovedAtEnd() {
+        if (path.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove(u8_path(path), ec);
+    }
+};
 
 std::string join(const std::vector<std::string>& v, const char* sep) {
     std::string out;
@@ -268,6 +284,28 @@ int run(int argc, char** argv) {
         return 0;
     }
     if (!cl.write_config.empty() && cl.check) usage_error("--write-config or --check: not both");
+    const bool attached = !cl.bench_url.empty();   // --bench-url: a server that runs, measured from here
+    if (cl.bench_compare.size() == 2) {            // two reports side by side, nothing run
+        if (cl.bench || attached || cl.bench_options) usage_error("--bench-compare OLD NEW compares two reports: no --bench with it");
+        return bench::compare_only(cl.bench_compare[0], cl.bench_compare[1]);
+    }
+    if (cl.bench && attached) usage_error("--bench or --bench-url: not both");
+    if ((cl.bench_options || !cl.bench_compare.empty()) && !cl.bench && !attached)
+        usage_error("the --bench-* options go with --bench (or --bench-url)");
+    if ((cl.bench || attached) && (cl.check || !cl.write_config.empty()))
+        usage_error("--bench with --check or --write-config: not together");
+    bench::Options bench_opts;
+    bench_opts.runs = cl.bench_runs;
+    bench_opts.clients = cl.bench_clients;
+    bench_opts.long_prompt = cl.bench_long;
+    bench_opts.think = cl.bench_think;
+    bench_opts.out = cl.bench_out;
+    bench_opts.compare = cl.bench_compare.empty() ? "" : cl.bench_compare[0];
+    bench_opts.command = attached ? "lamina-server --bench-url " + cl.bench_url : "lamina-server --bench";
+    if (cl.bench_clients > 0) bench_opts.command += " --bench-clients " + std::to_string(cl.bench_clients);
+    if (cl.bench_long) bench_opts.command += " --bench-long";
+    if (cl.bench_think) bench_opts.command += " --bench-think";
+    if (cl.bench_runs != 3) bench_opts.command += " --bench-runs " + std::to_string(cl.bench_runs);
     for (const EngineOption& eo : cl.engine) {   // the ones the server sets itself
         if (eo[0] == "--native") usage_error("--native: the model is -m MODEL.gguf, or the config's");
         if (eo[0] == "--serve") usage_error("--serve: the server runs the engine in serve mode itself");
@@ -276,6 +314,16 @@ int run(int argc, char** argv) {
                         "its \"vision\" section)");
     }
     install_stop_handlers();
+    if (attached) {   // nothing is loaded here: the client alone
+        if (!cl.config.empty() || cl.settings.contains("model") || !cl.engine.empty())
+            usage_error("--bench-url measures a server that runs: no -m, --config or engine options with it");
+        std::string url(rstrip_chars(cl.bench_url, "/"));
+        const json given = cl.settings.contains("api_key") ? cl.settings["api_key"] : json(nullptr);
+        const char* env_key = std::getenv("LAMINA_API_KEY");
+        const std::vector<std::string> keys = key_list(truthy(given) ? given : json(env_key != nullptr ? env_key : ""));
+        return bench::run({url, keys.empty() ? "" : keys[0]}, json(nullptr), bench_opts, "", 0,
+                          [] { return g_stops.load() > 0; });
+    }
     if (!cl.config.empty()) cl.config = u8_str(std::filesystem::absolute(u8_path(cl.config)));   // before the change to its cwd
     json file_cfg = json::object();
     try {
@@ -371,6 +419,29 @@ int run(int argc, char** argv) {
         return 0;
     }
     if (cl.check) return check_report(cl.config.empty() && model.empty() ? nullptr : &cfg, gpus, preset) ? 0 : 1;
+    // --bench: the config as the report shows it, then this run's own server: this PC only, on a port of its own (not
+    // the one the user's clients use), loaded at once and kept loaded, the expert profile saved into a copy
+    json bench_cfg;
+    RemovedAtEnd bench_scratch;
+    uint64_t bench_log_from = 0;
+    if (cl.bench) {
+        bench_cfg = cfg;
+        const int64_t listed = jget(cfg, "port").is_number_integer() ? cfg["port"].get<int64_t>() : 8095;
+        if (listed > 0 && bench::lamina_answers("http://127.0.0.1:" + std::to_string(listed))) {
+            say_err("[lamina] a Lamina server answers on port " + std::to_string(listed) + ": the benchmark needs the GPUs "
+                    "to itself. Stop that server, or measure it as it runs:  lamina-server --bench-url http://127.0.0.1:" +
+                    std::to_string(listed));
+            return 2;
+        }
+        cfg["host"] = "127.0.0.1";
+        if (!cl.settings.contains("port")) cfg["port"] = 0;
+        cfg["lazy_load"] = false;
+        cfg["idle_unload_s"] = 0;
+        cfg["open_browser"] = false;
+        cfg.erase("ready_file");
+        bench_scratch.path = u8_str(u8_path(temp_dir()) / ("lamina-bench-" + std::to_string(self_pid()) + ".profile.bin"));
+        cfg = bench::without_profile_save(cfg, bench_scratch.path);
+    }
     // the config's relative paths are its cwd's (itself the start directory's), some read before the change to it
     const std::string cfg_cwd = jstr(cfg, "cwd");
     const std::filesystem::path cfg_dir = std::filesystem::absolute(u8_path(cfg_cwd.empty() ? "." : cfg_cwd));
@@ -479,6 +550,11 @@ int run(int argc, char** argv) {
         if (!mock) {
             groups = gpu_groups(cfg);   // replicas: engines of their own, each a child with its cards and its log
             const std::string log = jstr(cfg, "log");
+            if (cl.bench && !log.empty()) {   // the report's excerpt: this run's part of the log
+                std::error_code ec;
+                const auto size = std::filesystem::file_size(u8_path(log), ec);
+                bench_log_from = ec ? 0 : (uint64_t) size;
+            }
             if (groups.empty()) {
                 apply_engine_env(cfg, offline);   // the engine runs in this process: its environment is this one
                 if (!log.empty()) redirect_stderr(log);   // the engine's messages go to its log; the server's stay here
@@ -738,7 +814,8 @@ int run(int argc, char** argv) {
     say("ready: http://" + here + ":" + std::to_string(bound) + "/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
         "context " + std::to_string(engine->max_context()) + " tokens" + (vision != nullptr ? ", images on" : "") +
         (truthy(svc.api_key) ? ", API key required" : "") + ")");
-    say("       open http://" + here + ":" + std::to_string(bound) + "/ in a browser to chat; close this window to stop the model");
+    if (!cl.bench)
+        say("       open http://" + here + ":" + std::to_string(bound) + "/ in a browser to chat; close this window to stop the model");
     if (!loopback) {   // issue #26: reachable from other devices - at which address, and what can still block it
         const std::vector<std::string> ips = lan_addresses();
         for (const auto& ip : ips)
@@ -773,7 +850,14 @@ int run(int argc, char** argv) {
             return 6;
         }
     }
-    while (g_stops.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    int bench_rc = 0;
+    if (cl.bench) {   // the suite against this server, then the stop as after Ctrl+C
+        const std::vector<std::string> keys = key_list(svc.api_key);
+        bench_rc = bench::run({"http://127.0.0.1:" + std::to_string(bound), keys.empty() ? "" : keys[0]}, bench_cfg,
+                              bench_opts, jstr(cfg, "log"), bench_log_from, [] { return g_stops.load() > 0; });
+    } else {
+        while (g_stops.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
     say("\n[lamina] stopping (Ctrl+C again to end the engine at once) ...");
     bool drained = true;
     if (shutdown_timeout) {
@@ -813,6 +897,7 @@ int run(int argc, char** argv) {
     }
     g_finished = true;
     say("[lamina] stopped");
+    if (bench_rc != 0) return bench_rc;
     return drained ? 0 : 8;
 }
 

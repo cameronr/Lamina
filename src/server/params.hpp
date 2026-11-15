@@ -46,6 +46,16 @@ struct CommandLine {
     std::string config;                  ///< --config
     std::string write_config;            ///< --write-config
     bool check = false, help = false;
+    // --bench (src/server/bench.hpp): the suite against this server, or a running one (--bench-url)
+    bool bench = false;
+    std::string bench_url;               ///< --bench-url
+    int bench_runs = 3;                  ///< --bench-runs
+    int bench_clients = 0;               ///< --bench-clients
+    bool bench_long = false;             ///< --bench-long
+    bool bench_think = false;            ///< --bench-think
+    std::string bench_out;               ///< --bench-out (made absolute)
+    std::vector<std::string> bench_compare;   ///< --bench-compare OLD [NEW] (made absolute)
+    bool bench_options = false;          ///< any --bench-* option but --bench-url and --bench-compare OLD NEW
 };
 /// argv into a CommandLine.  std::invalid_argument naming the option for a value its kind does not take, a missing
 /// value, or a word that is no option.

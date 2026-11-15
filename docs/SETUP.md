@@ -198,6 +198,18 @@ the GPUs it runs on, the RAM its experts take, the draft layer, the pictures, th
 then whether it would start; it loads nothing and exits with 1 when the model would not start (no usable GPU, too
 little RAM, a file the engine does not read, a missing encoder or projector).
 
+`--bench` measures the model the way it is used and writes a report to share: `lamina-server -m MODEL.gguf --bench`
+(or `--config FILE --bench`) loads it on a port of its own, sends a fixed suite through the server's API, three runs of
+each test, and stops: three short questions (decode speed, time to the first token), fresh prompts of ~4K and ~16K
+tokens (prompt speed), and a coding agent's session of six turns with four tools (what the conversation cache
+reused), 3-10 minutes after loading. Speeds are the engine's own timings, first-token times the client's clock;
+thinking is off. The report goes into `bench-results/<date>-community-<GPU>-<model>/` beside the program:
+`README.md`, `results.json` with every request, and the engine's log lines, with home folders, user and host names,
+private addresses and API keys replaced. `--bench-clients N` adds N requests at once, `--bench-long` a ~32K prompt,
+`--bench-compare OLD` puts an earlier report beside this one (`--bench-compare OLD NEW`: two reports, nothing run),
+and `--bench-url http://127.0.0.1:8081` measures a server that runs instead. A Lamina server on the config's port
+stops it before anything loads: the two would share the GPUs.
+
 ## Release binaries
 
 Each [release](https://github.com/eddoursul/Lamina/releases) has the programs built for Windows and Linux, on x64 and

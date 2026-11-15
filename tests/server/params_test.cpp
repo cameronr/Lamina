@@ -114,9 +114,29 @@ int main() {
                                  {"sampling", json::object()}, {"images", json::object()}, {"portt", 2}, {"backend", "x"}})
            == std::vector<std::string>{"portt", "backend"}));
 
+    // the benchmark's options: commands, not keys; the engine keeps its own --bench-* (the qwen35 path's --bench-pp)
+    {
+        const lamina::CommandLine b = parse({"--bench", "--bench-runs", "2", "--bench-clients=4", "--bench-long", "--bench-think",
+                                             "--bench-out", "out", "--bench-compare", "old", "--bench-pp", "512"});
+        CHECK(b.bench && b.bench_runs == 2 && b.bench_clients == 4 && b.bench_long && b.bench_think && b.bench_options);
+        CHECK(std::filesystem::path(b.bench_out).is_absolute() && b.bench_compare.size() == 1);
+        CHECK(b.engine.size() == 1 && b.engine[0] == (lamina::EngineOption{"--bench-pp", "512"}) && b.settings.empty());
+        const lamina::CommandLine two = parse({"--bench-compare", "a", "b"});
+        CHECK(two.bench_compare.size() == 2 && !two.bench && !two.bench_options);
+        const lamina::CommandLine url = parse({"--bench-url", "http://127.0.0.1:8081"});
+        CHECK(url.bench_url == "http://127.0.0.1:8081" && !url.bench_options);
+        CHECK(refused({"--bench-runs", "0"}));
+        CHECK(refused({"--bench-runs", "two"}));
+        CHECK(refused({"--bench=1"}));
+        CHECK(refused({"--bench-compare", "a", "b", "--bench-compare", "c"}));
+    }
+
     const std::string help = lamina::params_help();
     for (const std::string& f : flags) CHECK(help.find(f) != std::string::npos);
     for (const std::string& k : keys) CHECK(help.find("[" + k + "]") != std::string::npos);
+    for (const char* f : {"--bench ", "--bench-url", "--bench-runs", "--bench-clients", "--bench-long", "--bench-think",
+                          "--bench-out", "--bench-compare"})
+        CHECK(help.find(f) != std::string::npos);
 
     if (fails == 0) std::printf("params_test: ok (%zu options)\n", keys.size());
     return fails == 0 ? 0 : 1;

@@ -156,8 +156,9 @@ no display as the main one) and check `nvidia-smi` for other processes on it.
 **It is slower than [COMPARISON.md](COMPARISON.md).** Those are the development PC's numbers: three GPUs holding most
 experts, a 3090's VRAM bandwidth, 8 cores and DDR5-5600 for the rest. Fewer or smaller GPUs leave more experts to the
 CPU, and the RAM's bandwidth sets its speed: run the RAM at its rated speed (EXPO or XMP), in both channels.
-`BENCH.bat` (`./bench.sh`) measures an install the way it is used, through the API, and writes a report without
-personal details, to compare after a change or to attach to an issue.
+`lamina-server -m MODEL.gguf --bench` measures an install the way it is used, through the API, and writes a report
+without personal details, to compare after a change or to attach to an issue
+([SETUP.md](SETUP.md#a-model-file-without-setup)).
 
 **Answers turn into nonsense, or the PC crashes under load.** Check the RAM first: an overclock that passes everyday
 use can flip bits when the CPU and the GPUs' copies read it at once, which on the development PC (DDR5-6000 XMP with
