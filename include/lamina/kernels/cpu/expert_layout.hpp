@@ -48,6 +48,10 @@ bool cpu_avx1_ok();
 int cpu_isa_cap();
 /// The experimental older-CPU build this engine is ("avx", "sse4.2"), or "" for the normal build (AVX2 floor).
 const char* isa_floor_build();
+/// What this build needs of the CPU and this one (with its OS) lacks: "AVX2 (with FMA and F16C)", or an older-CPU
+/// build's "AVX" or "SSE4.2"; nullptr when it has it all, and on arm64. The CPU's own answer: LAMINA_FORCE_ISA does
+/// not cap it. The programs ask it before anything else of theirs runs (src/platform/cpu_floor.cpp).
+const char* cpu_floor_missing();
 /// LAMINA_IQ256_GATHER, the AVX-2 i-quant kernels' gathered grid decode (iq_avx2.cpp): -1 unset (auto, see
 /// cpu_gather_fast_here), 0 the scalar decode on every core, 1 the gathered one on every core.
 int iq256_gather_setting();

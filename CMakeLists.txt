@@ -319,7 +319,8 @@ if(LAMINA_ENABLE_CUDA)
   add_library(lamina_program STATIC src/program/generate.cpp)
   target_include_directories(lamina_program PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(lamina_program PUBLIC lamina_engine lamina_prefill lamina_spec lamina_serve_io CUDA::cudart)
-  add_executable(lamina src/program/main.cpp)
+  # src/platform/cpu_floor.cpp: the CPU check before anything else of the program runs
+  add_executable(lamina src/program/main.cpp src/platform/cpu_floor.cpp)
   target_link_libraries(lamina PRIVATE lamina_program)
   # the hyper-connection read's fused up projection + mix against cuBLAS + gr_mix_r at every sub-chunk size (--bench)
   add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cu)
@@ -589,6 +590,11 @@ if(LAMINA_NATIVE_EXPERTS)
     target_compile_definitions(ple_reader_test PRIVATE LAMINA_NATIVE_EXPERTS=1)
   endif()
   if(LAMINA_CPU_X86)
+    # the programs' CPU check at their start (src/platform/cpu_floor.cpp): this CPU meets the build's floor, and
+    # LAMINA_FORCE_ISA, which caps the engine's own probes, leaves it alone
+    add_executable(cpu_floor_test tests/core/cpu_floor_test.cpp)
+    target_link_libraries(cpu_floor_test PRIVATE lamina_kernels_cpu)
+    add_test(NAME cpu_floor_test COMMAND cpu_floor_test)
     # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp; with AVX-VNNI where the CPU has it) bit for bit
     # against each other at 1..8 tokens and against ggml-cpu's dot, on random blocks; --bench: ms per expert on one
     # thread, the weights streamed from DRAM
@@ -815,7 +821,7 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
       find_package(Threads REQUIRED)
       target_link_libraries(lamina_server_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
     endif()
-    add_executable(lamina-server src/server/main.cpp)
+    add_executable(lamina-server src/server/main.cpp src/platform/cpu_floor.cpp)
     target_link_libraries(lamina-server PRIVATE lamina_server_core)
     # -m's config pieces: the presets, the main GPU, the command line's engine options, projectors (CPU only)
     add_executable(model_config_test tests/server/model_config_test.cpp)
@@ -938,7 +944,7 @@ if(LAMINA_BUILD_TESTS)
   foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
              q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
              conversation_cache_test control_vector_test deterministic_adapt_help platform_memory_test
-             ple_reader_selftest model_config_test params_test bench_test)
+             ple_reader_selftest model_config_test params_test bench_test cpu_floor_test)
     if(TEST ${_t})
       set_tests_properties(${_t} PROPERTIES LABELS cpu)
     endif()

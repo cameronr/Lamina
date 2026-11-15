@@ -335,7 +335,8 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
     const bool avx512 = kernels::cpu::cpu_avx512_ok(), avx2 = kernels::cpu::cpu_avx2_ok();
     say(std::string("CPU: ") + (avx512 ? "AVX-512" : avx2 ? "AVX2 (no AVX-512)" : "no AVX2") + ", " +
         std::to_string(cores) + " logical cores");
-    if (!avx2) stops.push_back("the CPU has no AVX2, which the engine's CPU kernels need");
+    if (const char* missing = kernels::cpu::cpu_floor_missing())   // the start refuses before this (cpu_floor.cpp)
+        stops.push_back(std::string("the CPU has no ") + missing + ", which the engine's CPU kernels need");
 #endif
     uint64_t total = 0, avail = 0;
     if (platform::total_ram(total) && platform::available_ram(avail))
