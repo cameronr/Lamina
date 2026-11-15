@@ -2,7 +2,7 @@
 
 What a PC needs: [the README](../README.md#what-you-need). This page covers the build from the source, what setup
 does, a model file run without it (`lamina-server -m`), the release binaries, the config, the GPUs, the engine options
-worth knowing, Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
+worth knowing, and Qwen3.6-35B-A3B and Qwen3.8-27B.
 
 ## Building
 
@@ -81,7 +81,7 @@ Without `--model`, setup builds the engine only.
 | `--update` | `git pull` this clone first |
 | `--no-build` | use the programs as they are: a release's in `bin/` ([Release binaries](#release-binaries)), else those already built |
 | `--cuda-archs A` | the CUDA architectures to build for, e.g. `86;120` (default: this PC's GPUs) |
-| `--portable` | build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the releases and the Docker image are |
+| `--portable` | build the engine for other PCs (any AVX2 CPU; arm64: Armv8.2 with dotprod and fp16), as the releases are |
 
 Setup asks nothing, installs no system software (it names what is missing) and moves or deletes no file. A step whose
 result is already there is skipped, so setup runs again after an interruption or for another model:
@@ -387,21 +387,6 @@ VRAM (on the development PC the 5070 Ti first with 26 layers, then the 3090 with
 
 Not on this path yet: the prompt cache's checkpoints (a follow-up turn whose history differs from what the engine holds
 is read again from the start), `/v1/choose` and the GPU tiers. The config's `parallel` (batch slots) runs on one GPU.
-
-## Docker
-
-The `Dockerfile` builds the engine and the image encoder with the portable preset for RTX 30, 40 and 50 GPUs
-(`CUDA_ARCHITECTURES` narrows them, `JOBS` sets the jobs at once). The container prepares a model in `/data` at its
-first start (later starts check the files) and serves it on port 8080 with an API key:
-
-```
-docker build -t lamina .
-docker run --rm --gpus all --ulimit memlock=-1 -p 127.0.0.1:8081:8080 -v lamina-data:/data \
-           -e MODEL=iq3_s -e API_KEY=<a long random key> lamina
-```
-
-`VISION` (on, off, gpu), `CONTEXT` and `MAIN_GPU` pass the setup options of those names. The engine pins the experts in
-RAM, hence `--ulimit memlock=-1`.
 
 ## Updating
 

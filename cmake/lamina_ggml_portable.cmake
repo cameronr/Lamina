@@ -1,5 +1,5 @@
 # lamina_ggml_portable(): ggml-cpu built for any CPU of the build's architecture rather than this machine's (the
-# release binaries, the Docker image, setup's --portable): x86-64 with AVX2 and nothing above it (a 9900K or a Zen 3
+# release binaries, setup's --portable): x86-64 with AVX2 and nothing above it (a 9900K or a Zen 3
 # has neither AVX-512 nor AVX-VNNI), arm64 with Armv8.2's dot product and FP16 instructions (Ampere Altra, Grace,
 # GB10, Snapdragon X).  The engine (CMakeLists.txt) and the image encoder (tools/vision) both take it.
 function(lamina_ggml_portable)

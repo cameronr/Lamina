@@ -36,7 +36,7 @@ else()
   message(FATAL_ERROR "Lamina builds for x86-64 and arm64 CPUs, not '${CMAKE_SYSTEM_PROCESSOR}'")
 endif()
 
-# A build for other PCs (the release binaries, the Docker image): ggml's CPU backend for any AVX2 CPU (arm64: any
+# A build for other PCs (the release binaries): ggml's CPU backend for any AVX2 CPU (arm64: any
 # Armv8.2 CPU with the dot product and FP16 instructions) instead of this machine's (the engine's own AVX-512 kernels
 # are per-file and chosen at run time either way), and the C++ runtime linked in: on Windows the MSVC runtime, so no
 # Visual C++ redistributable is needed; on Linux GCC's libstdc++ and libgcc, so the programs run where the system's

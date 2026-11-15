@@ -136,6 +136,11 @@ older than the CUDA runtime the programs come with: install a driver for CUDA 13
 need glibc 2.34 and OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9 and newer systems have them (OpenSSL 3 is the
 `libssl3` or `openssl-libs` package); an older system cannot run them.
 
+**Linux: "mlock failed (raise ulimit -l)".** The engine locks the experts it keeps in RAM without pinning them, so
+that the system does not page them out, and the locked-memory limit (`ulimit -l`) is below what they take: they stay
+pageable. Raise it for the server: `memlock` in `/etc/security/limits.conf`, `LimitMEMLOCK=infinity` in a systemd
+unit, `--ulimit memlock=-1` for a container.
+
 **"Windows blocked ... Smart App Control".** Smart App Control on Windows 11 refuses programs that are not signed, and
 the engine and the image encoder are built on this PC. Turn it off (Windows Security > App & browser control > Smart
 App Control settings), or, if only the image encoder is blocked, run setup with `--vision off`.

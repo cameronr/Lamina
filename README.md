@@ -163,7 +163,7 @@ What it changes:
 
 ## Documentation
 
-- [docs/SETUP.md](docs/SETUP.md): setup, the configs, choosing the GPUs, Qwen3.6 and Qwen3.8-27B, Docker.
+- [docs/SETUP.md](docs/SETUP.md): setup, the configs, choosing the GPUs, Qwen3.6 and Qwen3.8-27B.
 - [docs/USING.md](docs/USING.md): the server, its API and web app, clients, pictures, image generation, MCP tools.
 - [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md): the engine.
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): when something goes wrong.
