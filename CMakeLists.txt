@@ -6,7 +6,8 @@
 # CPU, in build/) and `portable` (the releases': RTX 30, 40 and 50, any AVX2 CPU, in build-portable/); build.bat and
 # build.sh run one. The programs run from the build folder; `cmake --install <build> --prefix <folder>` puts them,
 # with the CUDA runtime, into a folder of their own as a release lays them out.
-cmake_minimum_required(VERSION 3.24)
+# CMake 3.22 (Ubuntu 22.04's) or newer, with 3.24's policies where CMake has them
+cmake_minimum_required(VERSION 3.22...3.24)
 project(lamina VERSION 0.1.43.1 LANGUAGES CXX)
 add_compile_definitions(LAMINA_VERSION="${PROJECT_VERSION}")
 
@@ -37,11 +38,16 @@ endif()
 
 # A build for other PCs (the release binaries, the Docker image): ggml's CPU backend for any AVX2 CPU (arm64: any
 # Armv8.2 CPU with the dot product and FP16 instructions) instead of this machine's (the engine's own AVX-512 kernels
-# are per-file and chosen at run time either way), and the MSVC runtime linked in, so no Visual C++ redistributable is
-# needed.
-option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static MSVC runtime" OFF)
+# are per-file and chosen at run time either way), and the C++ runtime linked in: on Windows the MSVC runtime, so no
+# Visual C++ redistributable is needed; on Linux GCC's libstdc++ and libgcc, so the programs run where the system's
+# libstdc++ is older than the build machine's (RHEL 9's and its rebuilds' are GCC 11's).
+option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static C++ runtime" OFF)
 if(LAMINA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+elseif(LAMINA_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The CUDA runtime loads the system's libstdc++ beside it: the archives' symbols (libstdc++'s among them) stay
+  # unexported, so its calls and the system library's own stay there instead of binding to the programs' copy
+  add_link_options(-static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -107,6 +113,12 @@ if(LAMINA_ENABLE_CUDA)
     message(FATAL_ERROR "Lamina builds with the CUDA toolkit 13.0 or newer, and ${CMAKE_CUDA_COMPILER} is "
                         "${CMAKE_CUDA_COMPILER_VERSION}. Name another nvcc with CUDACXX or -DCMAKE_CUDA_COMPILER, in a "
                         "fresh build folder (cmake --fresh).")
+  endif()
+  # The .cu files are C++20 too (CUDA_STANDARD falls back to CXX_STANDARD), and CMake learnt nvcc's flag for it in
+  # 3.25.2: what that release sets, for the older ones (Ubuntu 22.04's 3.22, Debian 12's 3.25.1)
+  if(CMAKE_VERSION VERSION_LESS 3.25.2 AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "-std=c++20")
+    set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "-std=c++20")
   endif()
   set(_lamina_newest 0)
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
@@ -891,7 +903,10 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
           -DLAMINA_PORTABLE:BOOL=ON
           -DLAMINA_VISION_OUTPUT_DIR:PATH=${CMAKE_BINARY_DIR}
           -DLAMINA_JOBS:STRING=${LAMINA_JOBS_USED}
-          -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES})
+          -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
+          # the engine's toolkit: ggml-cuda looks for one before CUDA is enabled, where FindCUDAToolkit takes neither
+          # CUDACXX nor CMAKE_CUDA_COMPILER (only the PATH, CUDA_PATH and /usr/local/cuda)
+          -DCUDAToolkit_ROOT:PATH=${_lamina_cuda_root})
       foreach(_v CMAKE_C_COMPILER CMAKE_CXX_COMPILER CMAKE_CUDA_COMPILER CMAKE_CUDA_HOST_COMPILER
                  CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER CMAKE_CUDA_COMPILER_LAUNCHER)
         if(${_v})

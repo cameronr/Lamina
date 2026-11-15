@@ -3,7 +3,7 @@
 # build/) or portable (the releases' build for other PCs, into build-portable/). lamina-server, lamina and
 # lamina-vision run from there.
 #   ./build.sh [native|portable] [CMake options, e.g. -DLAMINA_BUILD_TESTS=ON]
-# It needs CMake 3.24 or newer, Ninja, a C++ compiler and the CUDA toolkit 13.0 or newer (the nvcc on the PATH or in
+# It needs CMake 3.22 or newer, Ninja, GCC 11 or newer and the CUDA toolkit 13.0 or newer (the nvcc on the PATH or in
 # /usr/local/cuda; CUDACXX names another; CXX=g++-14 a compiler, for nvcc too).
 cd "$(dirname "$0")" || exit 1
 preset=native

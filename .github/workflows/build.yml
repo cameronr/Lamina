@@ -30,7 +30,7 @@ jobs:
         include:
           - { os: win, cpu: x64, runner: windows-2022 }
           - { os: win, cpu: arm64, runner: windows-11-arm }
-          # Ubuntu 22.04: the Linux programs run on glibc 2.35 and newer
+          # Ubuntu 22.04: the Linux programs need glibc 2.34 at most (ci.py package checks it)
           - { os: linux, cpu: x64, runner: ubuntu-22.04 }
           - { os: linux, cpu: arm64, runner: ubuntu-22.04-arm }
     env:

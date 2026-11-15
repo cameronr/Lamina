@@ -9,9 +9,9 @@ The engine's log is the config's `log`, `lamina-<model>.log` in the clone's fold
 tools: install Visual Studio 2022 or its free Build Tools with the workload "Desktop development with C++", which has
 CMake and Ninja too, or run `build.bat` from a developer prompt of the one to use.
 
-**"CMake 3.24 or newer is needed", "Ninja is needed", or CMake's "CMake 3.24 or higher is required".** Install them:
+**"CMake 3.22 or newer is needed", "Ninja is needed", or CMake's "CMake 3.22 or higher is required".** Install them:
 on Windows Visual Studio's "C++ CMake tools for Windows" (part of that workload) or cmake.org's; on Linux the
-distribution's `cmake` and `ninja-build` (Ubuntu 22.04's CMake is 3.22: `pip install cmake`).
+distribution's `cmake` and `ninja-build`.
 
 **"No CMAKE_CUDA_COMPILER could be found".** The CUDA toolkit is not installed, or its nvcc is neither on the PATH nor
 in `CUDA_PATH` or `/usr/local/cuda`: install the toolkit 13.0 or newer, or name its nvcc, `CUDACXX=<path to nvcc>`,
@@ -131,6 +131,10 @@ another as `--main-gpu`.
 
 **"no CUDA device is visible (CUDA driver version is insufficient for CUDA runtime version)".** The NVIDIA driver is
 older than the CUDA runtime the programs come with: install a driver for CUDA 13 or newer.
+
+**Linux: "version `GLIBC_2.34' not found", or "libssl.so.3: cannot open shared object file".** A release's programs
+need glibc 2.34 and OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9 and newer systems have them (OpenSSL 3 is the
+`libssl3` or `openssl-libs` package); an older system cannot run them.
 
 **"Windows blocked ... Smart App Control".** Smart App Control on Windows 11 refuses programs that are not signed, and
 the engine and the image encoder are built on this PC. Turn it off (Windows Security > App & browser control > Smart

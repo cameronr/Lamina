@@ -7,8 +7,8 @@ worth knowing, Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
 ## Building
 
 From a clone of this repository, with the CUDA toolkit 13.0 or newer and, on Windows, Visual Studio 2022's C++ tools
-(its free Build Tools with the workload "Desktop development with C++" do), on Linux GCC, CMake 3.24 or newer and Ninja
-(Ubuntu 22.04's CMake is 3.22: `pip install cmake` or Kitware's packages):
+(its free Build Tools with the workload "Desktop development with C++" do), on Linux GCC 11 or newer, CMake 3.22 or
+newer and Ninja (Ubuntu 22.04's own packages do):
 
 ```
 build.bat                        (Windows)
@@ -237,7 +237,8 @@ Setup then needs neither the CUDA toolkit nor a compiler, nor llama.cpp or a Pyt
 does), and the config and the launcher it writes run the programs in `bin/`. The programs are built for RTX 30, 40 and 50 GPUs (compute
 capability 8.6, 8.9 and 12.x, the GB10's among them, with PTX for newer ones), any x64 CPU with AVX2 (the AVX-512
 kernels where the CPU has them) or arm64 CPU with Armv8.2's dot product and FP16 instructions, and a driver for CUDA
-13; the Linux ones for Ubuntu 22.04, Debian 12 or newer (glibc 2.34, GCC 12's libstdc++, OpenSSL 3), and without the
+13; the Linux ones for glibc 2.34 and OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9 (and Rocky Linux, AlmaLinux),
+Amazon Linux 2023, openSUSE Leap 15.6 and newer systems have them (the C++ runtime is linked in), and without the
 runtime archive they take the CUDA 13 libraries of the system (`LD_LIBRARY_PATH`). Other GPUs (an A100's 8.0, a
 GH200's 9.0) and a native build for the PC's CPU need a build from the source ([above](#building)). The arm64 programs
 are built and their CPU tests run on each release, not yet run with a GPU.

@@ -42,9 +42,10 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
 - **A 64-bit x86 CPU with AVX2** (AVX-512 is used when it is there), or a 64-bit Arm CPU with Armv8.2's dot product
   and FP16 instructions, where the experts run on ggml's dot products (built and its CPU tests run, not yet run with a
   GPU). The CPU computes the experts no GPU holds, so its cores and the RAM's bandwidth set much of the speed.
-- **Windows 10 / 11 or Linux**, and Python 3.10 or newer for setup.
+- **Windows 10 / 11 or Linux** (a release's programs: glibc 2.34 and OpenSSL 3, as Ubuntu 22.04, Debian 12, RHEL 9
+  and newer have them), and Python 3.10 or newer for setup.
 - **To build:** the CUDA toolkit 13.0 or newer, and Visual Studio 2022's C++ tools on Windows (their CMake and Ninja
-  serve the build; on Arm also LLVM's clang-cl), or GCC, CMake 3.24 or newer and Ninja on Linux. The
+  serve the build; on Arm also LLVM's clang-cl), or GCC 11, CMake 3.22 and Ninja or newer on Linux. The
   [releases](https://github.com/eddoursul/Lamina/releases) have the programs built for RTX 30, 40 and 50 GPUs.
 
 ## Install

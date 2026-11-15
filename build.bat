@@ -40,7 +40,7 @@ set "CC=clang-cl"
 set "CXX=clang-cl"
 :compilers
 
-where cmake >nul 2>nul || (echo CMake 3.24 or newer is needed: Visual Studio's "C++ CMake tools for Windows" has it, or cmake.org & exit /b 1)
+where cmake >nul 2>nul || (echo CMake 3.22 or newer is needed: Visual Studio's "C++ CMake tools for Windows" has it, or cmake.org & exit /b 1)
 where ninja >nul 2>nul || (echo Ninja is needed: Visual Studio's "C++ CMake tools for Windows" has it, or ninja-build.org & exit /b 1)
 cmake --preset %PRESET% %ARGS% || exit /b 1
 cmake --build --preset %PRESET% && goto done

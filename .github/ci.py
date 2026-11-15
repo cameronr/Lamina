@@ -12,7 +12,8 @@ GPU, and the release archives from cmake --install.
                                                  programs, the script that downloads Flash-Next's draft layer and the
                                                  licenses (cmake --install's component lamina), and
                                                  dist/cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>.zip: the CUDA runtime and
-                                                 cuBLAS (component cudart); both flat, for one folder
+                                                 cuBLAS (component cudart); both flat, for one folder. On Linux the
+                                                 programs' libraries are checked first (GLIBC_MAX, SYSTEM_LIBS)
 """
 from __future__ import annotations
 
@@ -43,9 +44,16 @@ REDIST_URL = "https://developer.download.nvidia.com/compute/cuda/redist"
 COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cccl")
 SKIP = {"libcublas_static.a", "libcublasLt_static.a"}   # ~1 GB the engine does not link
 # What each archive holds (cmake --install's components): checked before it is written
-PROGRAMS = [f"lamina-server{EXE}", f"lamina{EXE}", f"lamina-vision{EXE}",
-            "download-draft-layer.bat" if WIN else "download-draft-layer.sh", "LICENSE", "LICENSE-llama.cpp",
-            "LICENSE-cpp-httplib", "LICENSE-jsonhpp", "LICENSE-Outfit"]
+EXECUTABLES = [f"lamina-server{EXE}", f"lamina{EXE}", f"lamina-vision{EXE}"]
+PROGRAMS = [*EXECUTABLES, "download-draft-layer.bat" if WIN else "download-draft-layer.sh", "LICENSE",
+            "LICENSE-llama.cpp", "LICENSE-cpp-httplib", "LICENSE-jsonhpp", "LICENSE-Outfit"]
+# What the Linux programs may take from the system (docs/SETUP.md, Release binaries): glibc 2.34 at most (Ubuntu
+# 22.04, Debian 12, RHEL 9, Amazon Linux 2023), OpenSSL 3 and the NVIDIA driver's libcuda.so.1 (the image encoder's
+# ggml-cuda links it); the C++ runtime is linked in (the portable preset) and the CUDA runtime is the archive's,
+# beside them (RUNPATH $ORIGIN)
+GLIBC_MAX = (2, 34)
+SYSTEM_LIBS = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "ld-linux-x86-64.so.2",
+               "ld-linux-aarch64.so.1", "libssl.so.3", "libcrypto.so.3", "libcuda.so.1"}
 
 
 def say(msg=""):
@@ -221,6 +229,52 @@ def write_archive(base: Path, folder: Path) -> Path:
     return out
 
 
+def readelf(*args: str) -> str:
+    r = subprocess.run([tool("readelf"), "-W", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"readelf {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def check_linux_floor(folder: Path, runtime: list[str]):
+    """The programs in `folder` against SYSTEM_LIBS, GLIBC_MAX and RUNPATH $ORIGIN, and the C++ runtime they link in
+    unexported (the CUDA runtime's libstdc++ would bind to it), as readelf reads them."""
+    problems, libs, newest = [], set(), (0, 0)
+    for name in EXECUTABLES:
+        exe = str(folder / name)
+        # the runtime's own definitions (GLOBAL, UNIQUE); a template the program instantiates is WEAK, exported where
+        # a library calls it (C++20 code instantiates std::string itself), as in any C++ program
+        leaked = []
+        for line in readelf("--dyn-syms", exe).splitlines():   # Num: Value Size Type Bind Vis Ndx Name
+            f = line.split()
+            if (len(f) >= 8 and f[6] != "UND" and f[4] != "WEAK"
+                    and re.match(r"_ZN?K?St|__cxa_|__gxx_|_Unwind_", f[7])):
+                leaked.append(f[7])
+        if leaked:
+            problems.append(f"{name} exports {len(leaked)} symbols of the C++ runtime it links in ({leaked[0]}, ...)")
+        dynamic = readelf("-d", exe)
+        for lib in re.findall(r"\(NEEDED\)\s+Shared library: \[(.+?)\]", dynamic):
+            libs.add(lib)
+            if lib not in SYSTEM_LIBS and lib not in runtime:
+                problems.append(f"{name} needs {lib}")
+        paths = re.findall(r"\((?:RUNPATH|RPATH)\)\s+Library r(?:un)?path: \[(.*?)\]", dynamic)
+        if paths != ["$ORIGIN"]:
+            problems.append(f"{name}'s RUNPATH is {', '.join(paths) or 'not set'}, not $ORIGIN")
+        lib = "?"
+        for line in readelf("-V", exe).splitlines():   # the version needs: "File: libc.so.6", "Name: GLIBC_2.34"
+            if m := re.search(r"File: (\S+)", line):
+                lib = m.group(1)
+            elif m := re.search(r"Name: GLIBC_(\d+)\.(\d+)", line):
+                v = (int(m.group(1)), int(m.group(2)))
+                newest = max(newest, v)
+                if v > GLIBC_MAX:
+                    problems.append(f"{name} needs GLIBC_{v[0]}.{v[1]} ({lib})")
+    if problems:
+        fail("the Linux programs need more than the systems they are for (GLIBC_MAX, SYSTEM_LIBS): "
+             + "; ".join(sorted(set(problems))))
+    say(f"  ok: the programs need glibc {newest[0]}.{newest[1]} and " + ", ".join(sorted(libs)))
+
+
 def package(version: str):
     cache = (BUILD / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
     nvcc = re.search(r"^CMAKE_CUDA_COMPILER:\w+=(.+)$", cache, re.MULTILINE)
@@ -240,6 +294,8 @@ def package(version: str):
         missing = [n for n in names if not (stage / component / n).is_file()]
         if missing:
             fail(f"cmake --install's component {component} lacks " + ", ".join(missing))
+    if not WIN:
+        check_linux_floor(stage / "lamina", runtime)
     dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
     write_archive(dist / f"lamina-{version}-bin-{name}", stage / "lamina")
