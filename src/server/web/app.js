@@ -453,30 +453,48 @@ function renderMcp() {
 }
 
 // ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
-// A few documented keys of the run config (lamina-<model>.json), for every client, from the next start on.  The
-// server lists them, checks every value and keeps every other key of the file as it is.
-let cfgKeys = [];
+// A few documented keys, for every client: the values this session runs with.  Apply changes them for the session at
+// once; a start-up setting (read when the server starts) waits for the next start, once Save configuration (shown when
+// the session has a config file) has written it into the file, and is disabled in a session that cannot keep it.
+// The server checks every value and keeps every other key of the file as it is.
+let cfgKeys = [], cfgFile = null;
+function startupTitle(k) {
+  if (k.savable) return "read when the server starts: Save configuration keeps a change for the next start";
+  if (cfgFile && k.engine_option)
+    return "an engine option, read when the server starts: a config without \"args\" holds none, so the command line sets it";
+  return "read when the server starts: in this session, the command line sets it";
+}
 async function loadConfig() {
   let r;
   try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
-  if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
+  if (!r.ok) { $("cfg-card").hidden = true; return; }       // an older server, or no key yet
   const c = await r.json();
   cfgKeys = c.keys || [];
-  $("cfg-file").textContent = c.file || "";
+  cfgFile = c.file || null;
+  $("cfg-file").textContent = cfgFile || "no config file";
+  $("cfg-note").textContent = c.note || "";
+  $("cfg-save-row").hidden = !cfgFile;                      // without a config file, changes last for the session
+  const tags = (k) => [k.command_line && ["set on the command line", "the command line gives it at every start", ""],
+                       !k.live && ["at start-up", startupTitle(k), ""],
+                       k.pending && ["changed: at the next start", "the server runs with the value it started with", " cfg-tag--warn"],
+                       k.unsaved && ["unsaved", "not the value the config file gives: Save configuration writes it", " cfg-tag--warn"]]
+    .filter(Boolean).map(([t, title, cls]) => `<span class="cfg-tag${cls}" title="${esc(title)}">${esc(t)}</span>`).join("");
   $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
-    const id = `cfg-${i}`, v = k.value;
+    const id = `cfg-${i}`, v = k.value, off = !k.live && !k.savable ? " disabled" : "";
     let input;
     if (k.kind === "bool" || k.kind === "enum") {
       const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
       const cur = v == null ? "" : String(v);
-      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
+      input = `<select class="st-input" id="${id}"${off}><option value=""${cur === "" ? " selected" : ""}>default</option>` +
         opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
     } else {
       const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
-      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
+      input = `<input class="st-input" id="${id}"${off} ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
         `value="${esc(text)}" placeholder="default" autocomplete="off">`;
     }
-    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+    const t = tags(k);
+    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code>` +
+      (t ? `<span class="cfg-tags">${t}</span>` : "") + `</label>${input}`;
   }).join("");
   $("cfg-card").hidden = false;
 }
@@ -487,25 +505,46 @@ function configValue(k, el) {
   if (k.kind === "number") return Number(s);
   return s;                                         // enum, or names (the server splits them at commas)
 }
-$("cfg-save").addEventListener("click", async () => {
+function configChanges() {
   const set = {};
   cfgKeys.forEach((k, i) => {
     const v = configValue(k, $(`cfg-${i}`));
     const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
     if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
   });
-  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  return set;
+}
+async function postConfig(body, failed) {
   try {
-    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
+    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const b = await r.json();
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
-    $("cfg-msg").textContent = b.changed.length
-      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
-    loadConfig();
+    await loadConfig();
+    return b;
   } catch (e) {
     $("cfg-msg").textContent = "";
-    toast("error", "Not saved", String(e.message || e), 6000);
+    toast("error", failed, String(e.message || e), 6000);
+    return null;
   }
+}
+$("cfg-reset").addEventListener("click", () => { $("cfg-msg").textContent = ""; loadConfig(); });
+$("cfg-apply").addEventListener("click", async () => {
+  const set = configChanges();
+  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  const b = await postConfig({set}, "Not applied");
+  if (!b) return;
+  if (!b.changed.length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  const now = b.changed.filter((k) => !b.at_start.includes(k));
+  $("cfg-msg").textContent = [now.length && `Applied for this session: ${now.join(", ")}.`,
+    b.at_start.length && `For the next start, once saved: ${b.at_start.join(", ")}.`,
+    cfgFile && "Save configuration keeps the changes in the config file."].filter(Boolean).join(" ");
+});
+$("cfg-save").addEventListener("click", async () => {
+  const b = await postConfig({set: configChanges(), save: true}, "Not saved");
+  if (!b) return;
+  $("cfg-msg").textContent = (b.backup ? `Saved this session's settings to ${b.file} (the earlier file: ${b.backup}).`
+                                       : `${b.file} already holds this session's settings.`) +
+    (b.skipped.length ? ` Not ${b.skipped.join(", ")}: a config without "args" holds no engine option.` : "");
 });
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)

@@ -53,19 +53,23 @@ public:
             std::shared_ptr<Vision> vision = nullptr, json sampling_defaults = json::object(), bool fit_max_tokens = true);
     ~Service();
 
-    // ---- configuration (main sets these)
-    std::vector<std::string> aliases;
+    // ---- configuration (main sets these; the Settings view's keys may change while requests run: apply_setting)
     bool answer_room = true, reasoning_close_retry = false, literal_markers = true, codex_compaction_cache = false,
          codex_thread_titles = false;
     int64_t short_opening_tokens = 0;
-    bool effort_end = false, api_monitor = false, offline = false, anthropic_think_unasked = true;
-    bool tool_call_recovery = false, fit_max_tokens = true, before_load_strict = false, before_load_ignore_failure = false;
+    bool effort_end = false, offline = false;
+    std::atomic<bool> api_monitor{false}, anthropic_think_unasked{true}, fit_max_tokens{true};
+    bool tool_call_recovery = false, before_load_strict = false, before_load_ignore_failure = false;
     std::string reasoning_loop_recovery;   ///< "", "stop" or "recover"
-    json reasoning_budget_tokens = 0;      ///< the config's default thinking budget (0: none)
     int64_t repeat_stop_tokens = 256;
     std::string model_arch;                ///< the family ("qwen4exp", "qwen35moe", "qwen35"): the model card's sampling
-    json sampling_defaults = json::object();
     std::string shared_path, config_path, config_effort;
+    /// #564: the run's settings as the Settings view shows them: the merged config as it started (started_config),
+    /// as this session has it now (live_config: POST /config's changes), the preset under the file, the keys the
+    /// command line set; under config_mu
+    json live_config = json::object(), started_config = json::object();
+    json preset_config = json::object();   ///< the preset the config file's settings went over (empty: none)
+    std::set<std::string> command_line_keys;
     std::vector<std::string> cors_origins, trusted_origins, allowed_hosts;
     json api_key = "";                     ///< a key ("k1,k2": several) or a list of keys; "" none
     int64_t requested_slots = 0;           ///< the slots the config asked for (0: what the engine has)
@@ -75,7 +79,8 @@ public:
     std::set<std::string> hosted_tools_noted;   ///< /v1/responses' hosted tools said once each
     static constexpr double kUnloadWaitS = 300.0;   ///< POST /unload?wait=1 waits this long for the running turn
     std::set<std::string> host_names;
-    double idle_unload_s = 0, before_load_timeout_s = 120, vram_free_wait_s = 15;
+    std::atomic<double> idle_unload_s{0};
+    double before_load_timeout_s = 120, vram_free_wait_s = 15;
     int64_t min_free_vram_mib = 0;
     json before_load;                      ///< a command: a string (shell) or a list
     std::optional<int64_t> max_queue;
@@ -126,10 +131,18 @@ public:
     int64_t wait_for_drain(double timeout_s);
     int64_t cancel_owned_requests();
     void set_aliases(const json& value);
+    std::vector<std::string> aliases_now() const;
     std::vector<std::string> model_names() const;
     std::string model_for(const json& req) const;
     int64_t reported_ctx();
     std::optional<int64_t> reasoning_budget(const json& req) const;
+    /// the config's default thinking budget (0: none)
+    void set_reasoning_budget_tokens(json v);
+    /// the config's "sampling" block, a copy
+    json sampling_defaults_now() const;
+    /// a Settings view key (runconfig::kEditable, one that applies while the server runs) set to `value` (null: its
+    /// default) for the requests from now on
+    void apply_setting(const std::string& key, const json& value);
     std::optional<int64_t> free_vram_mib();
     void ensure_loaded();
     void load();
@@ -196,6 +209,10 @@ private:
     std::atomic<bool> stopping_{false};
     mutable std::mutex shared_mu_;
     json shared_ = json::object();
+    mutable std::mutex live_mu_;   ///< the three below: the Settings view changes them while requests read them
+    std::vector<std::string> aliases_;
+    json reasoning_budget_tokens_ = 0;
+    json sampling_defaults_ = json::object();
 };
 
 // ---- helpers (module functions of serve/server.py)

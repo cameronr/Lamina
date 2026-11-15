@@ -149,7 +149,9 @@ public:
         std::lock_guard<std::mutex> lk(info_mu_);
         info_ = std::move(v);
     }
-    double silence_s = 300.0;              ///< the config's engine_silence_s (0: wait for ever)
+    std::atomic<double> silence_s{300.0};  ///< the config's engine_silence_s (0: wait for ever)
+    /// the Settings view's engine_silence_s, for the requests from now on (the replicas pass it to their engines)
+    virtual void set_silence_s(double s) { silence_s = s; }
     std::string model_path;
     bool can_stop = true;
 

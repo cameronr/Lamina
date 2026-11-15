@@ -137,8 +137,8 @@ does not take ("unknown argument: ...", a value out of range); `--native`, `--se
 set.
 
 `--write-config FILE` writes the config the command line runs to FILE (the preset's, the config file's and the command
-line's settings in one) and stops; `lamina-server --config FILE` then runs it,
-and the web app's Settings view changes it (a server started with `-m` has no file for that view). The log and the
+line's settings in one) and stops; `lamina-server --config FILE` then runs it, and the web app's Model settings card
+saves into it (a server started with `-m` alone has no file: the card's changes last until it stops). The log and the
 learned profile then go beside FILE. An earlier FILE is kept as `FILE.bak`, and its keys outside the preset (an
 `api_key`, an `images` section) carry over.
 

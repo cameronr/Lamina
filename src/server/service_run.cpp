@@ -414,7 +414,8 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
     // the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
     // apps; the request's own fields win over all of them (a scored one, /v1/choose, reads the model's own logits)
     json defaults = model_card_sampling(model_arch, thinking);
-    for (auto it = sampling_defaults.begin(); it != sampling_defaults.end(); ++it) defaults[it.key()] = it.value();
+    const json config_defaults = sampling_defaults_now();
+    for (auto it = config_defaults.begin(); it != config_defaults.end(); ++it) defaults[it.key()] = it.value();
     const json shared = this->shared();
     for (auto it = shared.begin(); it != shared.end(); ++it) defaults[it.key()] = it.value();
     if (!defaults.empty() && !truthy(jget(sampling, "score"))) {

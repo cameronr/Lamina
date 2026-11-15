@@ -11,8 +11,8 @@ expert profile, and the server.
 
 `http://127.0.0.1:8081/`: **Chat** (with pictures, the thinking level, MCP tools, chats kept in the browser),
 **Monitor** (what the engine is doing, the last requests, the GPUs, CPU and RAM) and **About** (the addresses to give
-clients, the settings). Its **Model settings** card changes a few keys of the config ([below](#the-config)) from the next start on;
-only the page itself can save them.
+clients, the settings). Its **Model settings** card changes a few settings for the running server and writes them into
+its config file ([below](#the-config)); only the page itself can change them.
 
 ## The API
 
@@ -341,6 +341,18 @@ alone: `--config`, `--write-config`, `--check` and `--help`.
 | `max_queue`, `queue_timeout`, `shutdown_timeout`, `offline`, `ready_file`, `mcp_config` | the calls that may wait and for how long; the time running requests get at a stop; no network sources; an instance record for a supervisor; MCP servers from a file |
 | `model`, `vision`, `model_name`, `arch`, `log`, `cwd`, `env`, `lib_dirs`, `gpu`, `replica_cpus`, `replica_load_tokens` | the model and its pictures, its name in the API, the engine's log, folder, environment and GPUs, the replicas' CPUs and routing ([SETUP.md](SETUP.md#the-config)) |
 
-The web app's Model settings card changes `sampling`, `reasoning_budget_tokens`, `fit_max_tokens`,
-`anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`,
-`open_browser` and the engine's `--vram-reserve-mib`, and keeps the earlier file as `<config>.bak`.
+The web app's Model settings card shows the values the server runs with (the command line's over the config file's
+over the preset's, each set on the command line marked so) of `sampling` (`temperature`, `top_p`, `top_k`, `min_p`),
+`reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
+`lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and the engine's `--vram-reserve-mib`.
+
+- **Apply** changes them for the running server, at once. `effort_position`, `lazy_load`, `open_browser` and
+  `--vram-reserve-mib` are read when the server starts (marked *at start-up*): a change to them waits for the next
+  start, once saved.
+- **Save configuration**, there when the server was started with `--config`, writes into that file the values that
+  are not what it gives (the earlier file kept as `<config>.bak`) and leaves its other keys as they are. In a config
+  that names a model and has no `"args"`, a value equal to the preset's takes the key out of the file, an empty one
+  over a preset's value is written as `null`, and the engine's option is not written: such a config holds none
+  (`--write-config` writes one with `"args"`).
+- Without a config file (`-m` alone) the card's changes last until the server stops, and the start-up settings come
+  from the command line.

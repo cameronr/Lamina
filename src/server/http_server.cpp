@@ -7,6 +7,7 @@
 #include "log.hpp"
 #include "mcp.hpp"
 #include "net.hpp"
+#include "params.hpp"
 #include "prometheus.hpp"
 #include "responses.hpp"
 #include "runconfig.hpp"
@@ -25,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 
 namespace lamina {
@@ -554,6 +556,8 @@ void HttpServer::stop() {
 // ============================================================================================ GET
 namespace {
 
+json config_view(Service& svc);   // (with POST /config's, below)
+
 void get_props(Exchange& x) {
     Service& svc = x.svc;
     const std::string* m = x.param("model");
@@ -568,7 +572,8 @@ void get_props(Exchange& x) {
         return;
     }
     json defaults = model_card_sampling(svc.model_arch, true);
-    for (auto it = svc.sampling_defaults.begin(); it != svc.sampling_defaults.end(); ++it) defaults[it.key()] = it.value();
+    const json config_defaults = svc.sampling_defaults_now();
+    for (auto it = config_defaults.begin(); it != config_defaults.end(); ++it) defaults[it.key()] = it.value();
     const json shared = svc.shared();
     for (auto it = shared.begin(); it != shared.end(); ++it) defaults[it.key()] = it.value();
     json params = json::object();
@@ -602,9 +607,10 @@ void get_models(Exchange& x) {
         model["status"] = {{"value", "unloaded"}};   // like llama-server's router: listed, loads on use
         loaded = true;
     }
-    if (!svc.aliases.empty()) model["aliases"] = svc.aliases;   // #297: each alias listed under its own id too
+    const std::vector<std::string> aliases = svc.aliases_now();
+    if (!aliases.empty()) model["aliases"] = aliases;   // #297: each alias listed under its own id too
     json data = json::array({model});
-    for (const auto& a : svc.aliases) {
+    for (const auto& a : aliases) {
         json m = model;
         m["id"] = a;
         m["alias_of"] = svc.model;
@@ -732,20 +738,17 @@ void do_get(Service& svc, HttpServer& server, const httplib::Request& req, httpl
         }
         return;
     }
-    if (path == "/config") {   // #564: the Settings view's keys of the run config
+    if (path == "/config") {   // #564: the Settings view's keys, as this session runs them
         if (!x.authorized()) return;
-        if (svc.config_path.empty()) {
-            x.reply(404, {{"error", {{"message", "this server was started without a run config"}}}});
-            return;
-        }
-        json cfg;
+        json view;
         try {
-            cfg = runconfig::load(svc.config_path);
+            std::lock_guard<std::mutex> lk(svc.config_mu);
+            view = config_view(svc);
         } catch (const std::exception& e) {
             x.reply(500, {{"error", {{"type", "server_error"}, {"message", std::string("the run config cannot be read: ") + e.what()}}}});
             return;
         }
-        x.reply(200, runconfig::view(cfg, svc.config_path));
+        x.reply(200, view);
         return;
     }
     if (path == "/mcp") {   // the MCP servers, their state and tools (the web app's switch and Monitor card)
@@ -941,41 +944,130 @@ void post_settings(Exchange& x) {
     x.reply(200, {{"shared", truthy(shared)}, {"defaults", shared}});
 }
 
+/// the session's config file as it is now, and the settings a start takes from it (its preset's under its own, for a
+/// config that names a model and has no "args"); under config_mu
+runconfig::FileSettings file_settings(const Service& svc, const json& file) {
+    runconfig::FileSettings fs;
+    fs.path = svc.config_path;
+    fs.file = file;
+    fs.preset = svc.preset_config;
+    fs.gives = svc.preset_config;
+    merge_settings(fs.gives, file);
+    fs.engine_options = jget(file, "args").is_array();
+    return fs;
+}
+
+/// GET /config's answer: the session's values, marked against what the config file gives (when the session has
+/// one); under config_mu
+json config_view(Service& svc) {
+    const std::vector<std::string> command_line(svc.command_line_keys.begin(), svc.command_line_keys.end());
+    if (svc.config_path.empty()) return runconfig::view(svc.live_config, svc.started_config, command_line, nullptr);
+    json file;
+    try {
+        file = runconfig::load(svc.config_path);
+    } catch (const std::exception& e) {   // moved, or edited into something else: Apply still works, Save cannot
+        json v = runconfig::view(svc.live_config, svc.started_config, command_line, nullptr);
+        v["file"] = u8_str(u8_path(svc.config_path).filename());
+        v["note"] = "The config file cannot be read (" + std::string(e.what()) + "): Apply's changes last for this "
+                    "session, and Save configuration waits for the file.";
+        return v;
+    }
+    const runconfig::FileSettings fs = file_settings(svc, file);
+    return runconfig::view(svc.live_config, svc.started_config, command_line, &fs);
+}
+
+std::string joined(const std::vector<std::string>& v) {
+    std::string out;
+    for (const auto& s : v) out += (out.empty() ? "" : ", ") + s;
+    return out;
+}
+
 void post_config(Exchange& x) {
-    // #564: a few documented keys of the run config, from Lamina's own page only; every other key stays as it is
+    // #564: a few documented keys, from Lamina's own page only: {"set": {...}} changes them for this session (Apply),
+    // "save": true also writes the session's values into the config file (Save configuration): the keys whose value is
+    // not the one the file gives; every other key of the file stays as it is
     if (!x.own_page("the run config can be changed")) return;
     Service& svc = x.svc;
-    if (svc.config_path.empty()) {
-        x.reply(404, {{"error", {{"message", "this server was started without a run config"}}}});
-        return;
-    }
+    const std::string name = u8_str(u8_path(svc.config_path).filename());
     json view;
-    std::vector<std::string> changed;
+    std::vector<std::string> changed, at_start, skipped;
     std::string bak;
+    bool save = false;
     try {
         json req;
         std::string err;
         if (!py_loads(x.req.body.empty() ? "{}" : x.req.body, req, &err)) throw RequestError(err);
+        const json set = req.is_object() ? jget(req, "set") : json(nullptr);
+        save = req.is_object() && jget(req, "save") == true;
+        if (save && svc.config_path.empty())
+            throw RequestError("this session runs without a config file: its changes last until the server stops");
         std::lock_guard<std::mutex> lk(svc.config_mu);
-        const json cfg = runconfig::load(svc.config_path);
-        json updated;
-        std::tie(updated, changed) = runconfig::apply(cfg, req.is_object() ? jget(req, "set") : json(nullptr));
-        if (!changed.empty()) bak = runconfig::save(svc.config_path, updated);
-        view = runconfig::view(updated, svc.config_path);
+        std::optional<json> file;   // the config file as it is now, read once; a save's before anything changes
+        const auto file_now = [&]() -> const json& {
+            try {
+                if (!file) file = runconfig::load(svc.config_path);
+            } catch (const std::exception& e) {   // the file's fault, not the request's
+                throw runconfig::ConfigFileError(name + " cannot be read: " + e.what());
+            }
+            return *file;
+        };
+        if (save) file_now();
+        if (!save || (set.is_object() && !set.empty())) {
+            for (auto it = set.is_object() ? set.begin() : set.end(); it != set.end(); ++it) {
+                const runconfig::Editable* e = runconfig::editable(it.key());
+                if (e == nullptr || e->live) continue;   // a start-up setting the session cannot keep is refused
+                if (svc.config_path.empty())
+                    throw RequestError(it.key() + " is read when the server starts, and this session has no config "
+                                       "file to keep it in: the command line sets it");
+                const runconfig::FileSettings fs = file_settings(svc, file_now());
+                if (!runconfig::savable(*e, &fs))
+                    throw RequestError(it.key() + " is an engine option, read when the server starts, and a config "
+                                       "without \"args\" holds none: the command line sets it (or a config "
+                                       "lamina-server --write-config writes)");
+            }
+            json updated;
+            std::tie(updated, changed) = runconfig::apply(svc.live_config, set);
+            for (const auto& key : changed) {
+                if (runconfig::editable(key)->live) svc.apply_setting(key, runconfig::value_of(updated, key));
+                else at_start.push_back(key);
+            }
+            svc.live_config = std::move(updated);
+        }
+        if (save) {
+            std::vector<std::string> in_file;
+            const json written = runconfig::saved(svc.live_config, file_settings(svc, *file), in_file, skipped);
+            try {
+                if (!in_file.empty()) bak = runconfig::save(svc.config_path, written);
+            } catch (const std::exception& e) {
+                throw runconfig::ConfigFileError(name + " cannot be written: " + e.what());
+            }
+        }
+        view = config_view(svc);
     } catch (const std::invalid_argument& e) {
         x.reply(400, {{"error", {{"type", "invalid_request_error"}, {"message", e.what()}}}});
         return;
     } catch (const std::exception& e) {
-        x.reply(500, {{"error", {{"type", "server_error"}, {"message", std::string("the run config cannot be written: ") + e.what()}}}});
+        x.reply(500, {{"error", {{"type", "server_error"}, {"message", e.what()}}}});
         return;
     }
     if (!changed.empty()) {
-        std::string list;
-        for (const auto& c : changed) list += (list.empty() ? "" : ", ") + c;
-        say("[lamina] the Settings view changed " + list + " in " + u8_str(u8_path(svc.config_path).filename()) +
-            " (the earlier file: " + u8_str(u8_path(bak).filename()) + "); used from the next start");
+        std::vector<std::string> now;
+        for (const auto& k : changed)
+            if (std::find(at_start.begin(), at_start.end(), k) == at_start.end()) now.push_back(k);
+        std::string line = now.empty() ? "" : "applied " + joined(now) + " for this session";
+        if (!at_start.empty())
+            line += (line.empty() ? "changed " : "; ") + joined(at_start) + " for the next start (once saved)";
+        say("[lamina] the Settings view " + line);
     }
+    if (save)
+        say("[lamina] the Settings view saved the session's settings to " + name +
+            (bak.empty() ? " (nothing new for it)" : " (the earlier file: " + u8_str(u8_path(bak).filename()) + ")") +
+            (skipped.empty() ? "" : "; " + joined(skipped) + " not: a config without \"args\" holds no engine option"));
     view["changed"] = changed;
+    view["at_start"] = at_start;
+    view["saved"] = save;
+    view["backup"] = bak.empty() ? json(nullptr) : json(u8_str(u8_path(bak).filename()));   // null: the file did not change
+    view["skipped"] = skipped;
     x.reply(200, view);
 }
 

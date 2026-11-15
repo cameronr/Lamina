@@ -15364,11 +15364,200 @@
    }
   ],
   "config": [
-   404,
+   200,
    {
-    "error": {
-     "message": "this server was started without a run config"
-    }
+    "file": null,
+    "keys": [
+     {
+      "key": "sampling.temperature",
+      "value": null,
+      "help": "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "sampling.top_p",
+      "value": null,
+      "help": "Default top_p for requests that send none",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "sampling.top_k",
+      "value": null,
+      "help": "Default top_k for requests that send none (1-64)",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "sampling.min_p",
+      "value": null,
+      "help": "Default min_p for requests that send none",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "reasoning_budget_tokens",
+      "value": null,
+      "help": "Cap the thinking of every request at this many tokens (0 or empty: no cap)",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "fit_max_tokens",
+      "value": null,
+      "help": "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp",
+      "kind": "bool",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "anthropic_thinking",
+      "value": null,
+      "help": "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)",
+      "kind": "enum",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false,
+      "choices": [
+       "model",
+       "on_request"
+      ]
+     },
+     {
+      "key": "effort_position",
+      "value": null,
+      "help": "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)",
+      "kind": "enum",
+      "engine_option": false,
+      "live": false,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false,
+      "choices": [
+       "start",
+       "end"
+      ]
+     },
+     {
+      "key": "aliases",
+      "value": null,
+      "help": "Other model names the server lists and answers to (comma-separated)",
+      "kind": "names",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "idle_unload_s",
+      "value": null,
+      "help": "Unload the model after this many seconds without requests (0 or empty: never)",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "lazy_load",
+      "value": null,
+      "help": "Start without loading the model; the first request loads it (text only)",
+      "kind": "bool",
+      "engine_option": false,
+      "live": false,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "engine_silence_s",
+      "value": null,
+      "help": "End a request when the engine says nothing for this long (default 300 s, 0 = wait)",
+      "kind": "number",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "api_monitor",
+      "value": null,
+      "help": "Keep the last 100 requests' prompts and answers in memory for /api-monitor",
+      "kind": "bool",
+      "engine_option": false,
+      "live": true,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "open_browser",
+      "value": null,
+      "help": "Open the chat page in the browser when the model is ready",
+      "kind": "bool",
+      "engine_option": false,
+      "live": false,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     },
+     {
+      "key": "vram_reserve_mib",
+      "value": null,
+      "help": "VRAM in MiB the engine leaves free for other programs (engine default 700)",
+      "kind": "number",
+      "engine_option": true,
+      "live": false,
+      "savable": false,
+      "command_line": false,
+      "pending": false,
+      "unsaved": false
+     }
+    ],
+    "note": "This session runs without a config file: Apply's changes last until the server stops, and the start-up settings come from the command line."
    }
   ],
   "unknown-get": [

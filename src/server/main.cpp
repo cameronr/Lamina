@@ -18,6 +18,7 @@
 #include "process.hpp"
 #include "prometheus.hpp"
 #include "replicas.hpp"
+#include "runconfig.hpp"
 #include "service.hpp"
 #include "telemetry.hpp"
 #include "vision.hpp"
@@ -309,6 +310,7 @@ int run(int argc, char** argv) {
     std::string preset;          // the preset
     std::vector<std::string> preset_keys;   // its keys, which --write-config renews
     std::vector<std::string> notes;   // the preset's lines for the window: the model, the pictures, the log
+    json preset_base = json::object();   // the preset's settings, under the file's (the Settings view compares)
     if (from_preset || cl.check) gpus = nvidia_gpus();
     try {
         if (from_preset) {
@@ -326,6 +328,7 @@ int run(int argc, char** argv) {
             mo.allowed_gpus = gpu_list(given);
             ModelConfig mc = config_from_model(mo, gpus);
             cfg = std::move(mc.cfg);
+            preset_base = cfg;
             model_arch = mc.model.arch;
             preset = mc.preset;
             preset_keys = std::move(mc.preset_keys);
@@ -600,7 +603,7 @@ int run(int argc, char** argv) {
         svc.codex_thread_titles = jget(cfg, "codex_thread_titles") == true;       // #923: opt-in
         svc.codex_compaction_cache = jget(cfg, "codex_compaction_cache") == true; // #924: opt-in
         svc.set_aliases(jget(cfg, "aliases"));   // #297: other names the model answers to
-        if (!svc.aliases.empty()) say("[lamina] model aliases: " + join(svc.aliases, ", "));
+        if (!svc.aliases_now().empty()) say("[lamina] model aliases: " + join(svc.aliases_now(), ", "));
         svc.api_key = api_key;
         if (!truthy(svc.api_key) && cfg.contains("api_key"))   // #569: written, but empty: a warning, not a stop
             say_err("[lamina] the api_key in the config is empty: this server has no API key (anyone who can reach it can use "
@@ -648,7 +651,7 @@ int run(int argc, char** argv) {
         svc.repeat_stop_tokens = rs.get<int64_t>();
         svc.effort_end = effort_end.has_value();
         if (!jget(cfg, "reasoning_budget_tokens").is_null()) {   // #123: a default thinking budget for every request
-            svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"];
+            svc.set_reasoning_budget_tokens(cfg["reasoning_budget_tokens"]);
             const auto budget = svc.reasoning_budget(json::object());
             if (budget && *budget)
                 say("[lamina] thinking budget: " + std::to_string(*budget) + " tokens (reasoning_budget_tokens; a request can set its own)");
@@ -672,8 +675,25 @@ int run(int argc, char** argv) {
         say_err(std::string("[lamina] config ") + e.what());
         return 1;
     }
+    // #564: the Settings view's settings: this session's (the merged config), the preset's under the file's, the keys
+    // the command line set
+    svc.live_config = cfg;
+    svc.started_config = cfg;
+    svc.preset_config = preset_base;
+    for (const auto& e : runconfig::kEditable) {
+        bool on_line = false;
+        if (e.kind == "arg") {
+            for (const EngineOption& eo : cl.engine) on_line = on_line || eo[0] == e.rule;
+        } else {
+            const json* at = &cl.settings;
+            for (const std::string& part : split(std::string(e.key), "."))
+                at = at != nullptr && at->is_object() && at->contains(part) ? &(*at)[part] : nullptr;
+            on_line = at != nullptr;
+        }
+        if (on_line) svc.command_line_keys.insert(std::string(e.key));
+    }
     if (!cl.config.empty()) {
-        svc.config_path = cl.config;   // #564: the web page's Settings view
+        svc.config_path = cl.config;   // #564: the web page's Settings view saves into it
         // the Chat settings shared with other apps, from last time
         std::filesystem::path sp = u8_path(cl.config);
         sp.replace_extension("");
