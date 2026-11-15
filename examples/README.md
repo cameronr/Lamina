@@ -2,7 +2,9 @@
 
 The configs Lamina is developed with, on a PC with two RTX 3090s, an RTX 5070 Ti and 160 GB of RAM
 (their speeds: [COMPARISON.md](../docs/COMPARISON.md)). Setup writes each PC's own configs from them, with its GPUs
-and data folder ([SETUP.md](../docs/SETUP.md)):
+and data folder ([SETUP.md](../docs/SETUP.md)), and they are built into `lamina-server` as the presets of `-m`, which
+takes the model file, the GPU, the draft layer, the projector and the files a run writes from the PC instead
+([SETUP.md](../docs/SETUP.md#a-model-file-without-setup)):
 
 - `iq3_s.json`: Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S (~53 GB of RAM taken).
 - `ud-q4_k_xl.json`: Qwen3.8-Flash-Next, unsloth's UD-Q4_K_XL (~81 GB of RAM taken).

@@ -366,12 +366,16 @@ bool network_path(const std::string& path) {
     return starts_with(p, "\\\\") || starts_with(p, "\\??\\");
 }
 
-std::string vision_exe() {
+std::string vision_exe_path() {
 #ifdef _WIN32
-    const fs::path exe = u8_path(self_dir()) / "lamina-vision.exe";
+    return u8_str(u8_path(self_dir()) / "lamina-vision.exe");
 #else
-    const fs::path exe = u8_path(self_dir()) / "lamina-vision";
+    return u8_str(u8_path(self_dir()) / "lamina-vision");
 #endif
+}
+
+std::string vision_exe() {
+    const fs::path exe = u8_path(vision_exe_path());
     std::error_code ec;
     if (!fs::is_regular_file(exe, ec))
         throw std::runtime_error("the config has a \"vision\" section, and the image encoder is not there: " + u8_str(exe) +

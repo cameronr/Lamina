@@ -2,6 +2,7 @@
 #include "config.hpp"
 
 #include "lamina/artifact/draft_layer.hpp"
+#include "lamina/core/expert_cache.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <set>
 
 namespace lamina {
 namespace {
@@ -36,14 +38,21 @@ std::vector<std::string> args_of(const json& cfg) {
 
 bool has(const std::vector<std::string>& args, const char* flag) { return std::find(args.begin(), args.end(), flag) != args.end(); }
 
-/// an expert profile's (layers, experts per layer) from its header (tools/make_profile.py's format)
+/// an expert profile's (layers, experts per layer) from its header (tools/make_profile.py's format); `path`
+/// core::kBuiltinExpertProfile is the engine's own
 std::optional<std::pair<uint32_t, uint32_t>> profile_shape(const std::string& path) {
-    std::ifstream f(u8_path(path), std::ios::binary | std::ios::ate);
-    if (!f) return std::nullopt;
-    const std::streamoff size = f.tellg();
-    f.seekg(0);
+    std::string bytes;
+    if (path == core::kBuiltinExpertProfile) {
+        bytes = core::builtin_expert_profile();
+    } else {
+        std::ifstream f(u8_path(path), std::ios::binary);
+        if (!f) return std::nullopt;
+        bytes.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    const std::streamoff size = (std::streamoff) bytes.size();
     unsigned char head[24];
-    if (!f.read((char*) head, sizeof head) || std::memcmp(head, "STRP", 4) != 0) return std::nullopt;
+    if (bytes.size() < sizeof head || std::memcmp(bytes.data(), "STRP", 4) != 0) return std::nullopt;
+    std::memcpy(head, bytes.data(), sizeof head);
     auto u32 = [&](int i) { return (uint32_t) head[4 + 4 * i] | (uint32_t) head[5 + 4 * i] << 8 | (uint32_t) head[6 + 4 * i] << 16 | (uint32_t) head[7 + 4 * i] << 24; };
     const uint32_t nl = u32(1), ne = u32(2), n = u32(4);
     if (size < 24 + 4 * (std::streamoff) n) return std::nullopt;
@@ -52,7 +61,7 @@ std::optional<std::pair<uint32_t, uint32_t>> profile_shape(const std::string& pa
 
 std::string here_path(const json& cfg, const std::string& p) {
     const std::filesystem::path x = u8_path(p);
-    if (x.is_absolute()) return p;
+    if (x.is_absolute() || p == core::kBuiltinExpertProfile) return p;
     const std::string cwd = jstr(cfg, "cwd", ".");
     return u8_str(u8_path(cwd.empty() ? "." : cwd) / x);
 }
@@ -222,7 +231,8 @@ std::vector<GpuInfo> nvidia_gpus() {
     std::vector<GpuInfo> out;
     try {
         SpawnOptions o;
-        o.args = {"nvidia-smi", "--query-gpu=index,name,pci.bus_id,uuid", "--format=csv,noheader"};
+        o.args = {"nvidia-smi", "--query-gpu=index,name,pci.bus_id,uuid,memory.total,compute_cap,display_active,"
+                  "driver_version", "--format=csv,noheader,nounits"};
         o.in = SpawnOptions::null;
         o.out = SpawnOptions::pipe;
         o.err = SpawnOptions::null;
@@ -231,8 +241,15 @@ std::vector<GpuInfo> nvidia_gpus() {
         while (p.read_line(line, 30) == 1) {
             std::vector<std::string> f = split(line, ",");
             for (auto& x : f) x = std::string(strip(x));
-            if (f.size() == 4 && !f[0].empty() && std::all_of(f[0].begin(), f[0].end(), ::isdigit))
-                out.push_back({std::stoi(f[0]), f[1], f[2], f[3]});
+            if (f.size() != 8 || f[0].empty() || !std::all_of(f[0].begin(), f[0].end(), ::isdigit)) continue;
+            GpuInfo g{std::stoi(f[0]), f[1], f[2], f[3]};
+            g.memory_mib = std::atoll(f[4].c_str());
+            const size_t dot = f[5].find('.');   // "8.6"; "[N/A]" where the driver does not say
+            if (dot != std::string::npos && std::isdigit((unsigned char) f[5][0]))
+                g.cc = std::atoi(f[5].c_str()) * 10 + std::atoi(f[5].c_str() + dot + 1);
+            g.display = lower(f[6]) == "enabled";
+            g.driver = f[7];
+            out.push_back(std::move(g));
         }
         p.wait(30);
     } catch (const std::exception&) {
@@ -389,14 +406,38 @@ std::vector<std::string> engine_args(const json& cfg) {
     if (every.is_number() && every.get<double>() >= 0)
         args.insert(args.end(), {"--expert-profile-save-every", every.is_number_integer() ? std::to_string(every.get<int64_t>())
                                                                                            : py_repr(every.get<double>())});
-    for (size_t i = 0; i + 2 < args.size(); ++i)
-        if (args[i] == "--expert-profile") {
-            const auto learned = profile_shape(here_path(cfg, save.get<std::string>()));
-            const auto base = profile_shape(here_path(cfg, args[i + 1]));
-            if (learned && learned == base) args[i + 1] = save.get<std::string>();
-            break;
-        }
+    // the profile the engine would start from: the args' --expert-profile, else (--serve) its built-in one
+    auto at = std::find(args.begin(), args.end(), "--expert-profile");
+    const bool named = at != args.end() && at + 1 != args.end();
+    const auto learned = profile_shape(here_path(cfg, save.get<std::string>()));
+    const auto base = profile_shape(named ? here_path(cfg, *(at + 1)) : core::kBuiltinExpertProfile);
+    if (learned && learned == base) {
+        if (named) *(at + 1) = save.get<std::string>();
+        else args.insert(args.end(), {"--expert-profile", save.get<std::string>()});
+    }
     return args;
+}
+
+void apply_engine_options(json& cfg, const std::vector<EngineOption>& opts) {
+    if (opts.empty()) return;
+    auto flag = [](const std::string& s) { return s.size() > 2 && starts_with(s, "--"); };
+    std::set<std::string> drop;
+    for (const EngineOption& o : opts) {
+        drop.insert(o[0]);
+        drop.insert(starts_with(o[0], "--no-") ? "--" + o[0].substr(5) : "--no-" + o[0].substr(2));
+    }
+    const std::vector<std::string> args = args_of(cfg);
+    json out = json::array();
+    for (size_t i = 0; i < args.size();) {
+        if (flag(args[i]) && drop.count(args[i]) > 0) {
+            for (++i; i < args.size() && !flag(args[i]);) ++i;   // its values
+            continue;
+        }
+        out.push_back(args[i++]);
+    }
+    for (const EngineOption& o : opts)
+        for (const std::string& w : o) out.push_back(w);
+    cfg["args"] = std::move(out);
 }
 
 std::string model_file(const json& cfg) {

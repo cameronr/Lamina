@@ -12,7 +12,7 @@
 #include "runconfig.hpp"
 #include "structured.hpp"
 #include "vision.hpp"
-#include "web_assets.hpp"
+#include "lamina/embedded.hpp"
 
 #include <httplib.h>
 
@@ -664,7 +664,7 @@ void get_status(Exchange& x) {
 }
 
 void serve_asset(Exchange& x, const std::string& name, const char* type, const char* cache) {
-    const WebAsset* a = web_asset(name);
+    const EmbeddedFile* a = web_asset(name);
     if (a == nullptr) {
         x.reply(404, {{"error", {{"message", "not found"}}}});
         return;

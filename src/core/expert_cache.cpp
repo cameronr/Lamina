@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "lamina/core/expert_cache.hpp"
+#include "lamina/embedded.hpp"
 #include "lamina/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -55,22 +56,35 @@ size_t device_free_bytes() {
     return free_b;
 }
 
+std::string_view builtin_expert_profile() {
+    const EmbeddedFile* f = profile_file("expert-profile.bin");
+    return f != nullptr ? f->data : std::string_view();
+}
+
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        err = "read_expert_profile: cannot open " + path;
-        return false;
+    std::string bytes;
+    if (path == kBuiltinExpertProfile) {
+        bytes = builtin_expert_profile();
+    } else {
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) {
+            err = "read_expert_profile: cannot open " + path;
+            return false;
+        }
+        char buf[65536];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) bytes.append(buf, n);
+        std::fclose(f);
     }
     char magic[4] = {0, 0, 0, 0};
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
-    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5) {
-        std::fclose(f);
+    if (bytes.size() < sizeof magic + sizeof hdr) {
         err = "read_expert_profile: " + path + " is too short to hold a header";
         return false;
     }
+    std::memcpy(magic, bytes.data(), sizeof magic);
+    std::memcpy(hdr, bytes.data() + sizeof magic, sizeof hdr);
     if (std::memcmp(magic, "STRP", 4) != 0) {
-        std::fclose(f);
         err = "read_expert_profile: " + path + " does not start with STRP";
         return false;
     }
@@ -78,7 +92,6 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     // the version comes first: the fields after it are only known to be these in a version 1 file, so a later
     // format is refused by its number rather than read as if it were this one
     if (version != 1) {
-        std::fclose(f);
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "read_expert_profile: %s is a version %u profile but this engine reads version 1 - it was "
@@ -88,7 +101,6 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     if ((int64_t) nl != n_layers || (int64_t) ne != n_expert) {
-        std::fclose(f);
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "read_expert_profile: %s is %ux%u but this model is %lldx%lld - it is a profile for a "
@@ -97,18 +109,17 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     if (n_ranked > want) {
-        std::fclose(f);
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
     ranked.assign(n_ranked, {0, 0});
     std::vector<uint16_t> raw((size_t) n_ranked * 2);
-    if (n_ranked > 0 && std::fread(raw.data(), 2, (size_t) n_ranked * 2, f) != (size_t) n_ranked * 2) {
-        std::fclose(f);
+    const size_t list = raw.size() * sizeof(uint16_t);
+    if (bytes.size() < sizeof magic + sizeof hdr + list) {
         err = "read_expert_profile: the ranked list is truncated";
         return false;
     }
-    std::fclose(f);
+    if (list > 0) std::memcpy(raw.data(), bytes.data() + sizeof magic + sizeof hdr, list);
     for (uint32_t i = 0; i < n_ranked; ++i) {
         const int32_t l = (int32_t) raw[(size_t) i * 2], e = (int32_t) raw[(size_t) i * 2 + 1];
         if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {

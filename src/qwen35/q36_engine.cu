@@ -4311,7 +4311,8 @@ int serve(Engine& E) {
 
 }  // namespace
 
-static int run_engine(int argc, char** argv) {
+/// The engine's run, or with `check_only` its command line's parse alone (no CUDA call, nothing loaded).
+static int run_engine(int argc, char** argv, bool check_only) {
     std::string model, tokens, force, dump_full, emb_file, kv = "fp16";
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
@@ -4386,7 +4387,7 @@ static int run_engine(int argc, char** argv) {
         else if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // not a skip: it steers
             std::fprintf(stderr, "lamina: %s: control vectors run on Qwen3.8-Flash-Next's engine only\n", a.c_str());
             return 2;
-        } else if (serve_mode && a.rfind("--", 0) == 0) {
+        } else if (serve_mode && !check_only && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
@@ -4394,6 +4395,7 @@ static int run_engine(int argc, char** argv) {
                          val ? " " : "", val ? argv[i + 1] : "");
             if (val) ++i;
         } else {
+            std::fprintf(stderr, "lamina: unknown argument for Qwen3.6-35B-A3B and Qwen3.8-27B: %s\n", a.c_str());
             std::fprintf(stderr,
                          "usage: lamina-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
@@ -4402,13 +4404,18 @@ static int run_engine(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "lamina: --model is required\n"); return 2; }
+    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "lamina: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "lamina: bad --chunk / --max-context\n"); return 2; }
+    if (kv != "fp16" && kv != "q8_0") {
+        std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n");
+        return 2;
+    }
+    if (check_only) return 0;
 #if !defined(_WIN32)
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
 #else
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
-    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "lamina: --mtp takes 0 .. 7 drafts\n"); return 2; }
-    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "lamina: bad --chunk / --max-context\n"); return 2; }
     if (stage_gpus.empty()) {
         int cur = 0;
         CK(cudaGetDevice(&cur));
@@ -4417,10 +4424,6 @@ static int run_engine(int argc, char** argv) {
     if (stage_gpus.size() > 1 && batch > 1) {
         std::fprintf(stderr, "lamina: the batch slots (\"parallel\" / --batch) run on one GPU: drop --second-gpu or "
                      "--batch\n");
-        return 2;
-    }
-    if (kv != "fp16" && kv != "q8_0") {
-        std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n");
         return 2;
     }
     Model m;
@@ -4655,11 +4658,19 @@ int lamina::qwen35::run(int argc, char** argv) {
         ~Unset() { g_owned = nullptr; }
     } unset;
     try {
-        return run_engine(argc, argv);
+        return run_engine(argc, argv, false);
     } catch (const Fatal& f) {
         return f.code;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "lamina: %s\n", e.what());
         return 1;
+    }
+}
+
+int lamina::qwen35::check_args(int argc, char** argv) {
+    try {
+        return run_engine(argc, argv, true);
+    } catch (const Fatal& f) {
+        return f.code;
     }
 }

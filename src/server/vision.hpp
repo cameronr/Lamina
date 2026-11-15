@@ -70,8 +70,10 @@ private:
     std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> cache_;   ///< key -> (file, tokens), oldest first
 };
 
-/// the image encoder: lamina-vision in this program's folder, where a release and every build put it (no config
-/// names another); std::runtime_error when it is not there
+/// where the image encoder belongs: lamina-vision in this program's folder, where a release and every build put it (no
+/// config names another)
+std::string vision_exe_path();
+/// that encoder; std::runtime_error when it is not there
 std::string vision_exe();
 /// the encoder's command line from the config's vision section: it runs in its own directory, so the section's paths
 /// are made absolute

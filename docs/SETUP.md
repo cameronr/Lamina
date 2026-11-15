@@ -1,7 +1,8 @@
 # Setup
 
-What a PC needs: [the README](../README.md#what-you-need). This page covers what setup does, the release binaries, the
-config it writes, the GPUs, the engine options worth knowing, Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
+What a PC needs: [the README](../README.md#what-you-need). This page covers what setup does, a model file run without
+it (`lamina-server -m`), the release binaries, the config, the GPUs, the engine options worth knowing,
+Qwen3.6-35B-A3B and Qwen3.8-27B, and Docker.
 
 ## Setup
 
@@ -97,6 +98,50 @@ On Windows on Arm the build takes LLVM's clang-cl for the C and C++ code (ggml's
 MSVC; nvcc keeps MSVC's cl): Visual Studio's "C++ Clang Compiler for Windows" or LLVM's own install
 (`LAMINA_CLANG_CL` names another).
 
+## A model file without setup
+
+`lamina-server -m MODEL.gguf` runs a model file as it lies, a split one by any of its shards:
+
+```
+lamina-server -m D:\Models\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+```
+
+The server builds the config setup would write for the file and says in its window what it took:
+
+- **The preset**, one of `examples/*.json`, built into the server and picked by the file's header: ISTA-DASLab's
+  Qwen3.8-Flash-Next files take `iq3_s`, the family's other files (unsloth's quants, Agention's Gyro-L) `ud-q4_k_xl`,
+  Qwen3.6-35B-A3B's `qwen36-ud-q4_k_xl`, Qwen3.8-27B's `qwen38-27b-ud-q6_k_m`. Its engine options, sampling and port
+  (8081 to 8084) are the config's; the model's name in the API is the file's, without the shard number.
+- **The GPU** it runs on: of the cards of the RTX 30 series and newer, the one with the most VRAM that drives no
+  display (the lower number on a tie; `--main-gpu` names another), every other card as `--second-gpu auto` takes it.
+- **Flash-Next's draft layer**, `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, beside the model, else beside the server
+  ([the README](../README.md#the-draft-layer)).
+- **Pictures**: an image projector made for the model beside it (an `mmproj*.gguf` whose width is the model's; of
+  several the smallest, as the CPU encodes a Q8_0 one sooner than an F16 one), read by the `lamina-vision` beside the
+  server on the CPU's logical cores. `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
+  projector or the encoder the window says why there are none.
+- **The expert profile**, Qwen3.8-Flash-Next's, built into the programs (`--expert-profile builtin`, the engine's
+  default under `--serve`).
+- **What a run writes**, beside the server: the engine's log (`<model>.log`) and what the run learned about the
+  experts (`<model>-learned.bin`, [below](#the-config)), which the next start begins from.
+
+An engine option on the command line, with the values after it, takes the place of the preset's:
+`lamina-server -m MODEL.gguf --max-context 65536 --kv q4_0`. It works the same with `--config`. The engine's own parser
+reads those options first, for the model's family, and the server stops on one it does not take ("unknown argument:
+...", a value out of range); `--native`, `--serve` and `--vision` are the server's to set. The server's options
+(`--port`, `--host`, `--api-key`, ...) work as with a config.
+
+`--write-config FILE` writes that config to FILE, with the command line's server options that have a config key
+(`--port`, `--host`, `--api-key`, `--parallel`, `--gpu`, ...), and stops; `lamina-server --config FILE` then runs it,
+and the web app's Settings view changes it (a server started with `-m` has no file for that view). The log and the
+learned profile then go beside FILE. An earlier FILE is kept as `FILE.bak`, and its keys outside the preset (an
+`api_key`, an `images` section) carry over.
+
+`--check` says what this PC has (the CPU, the RAM, the GPUs) and, with `-m` or `--config`, the model's file, the preset,
+the GPUs it runs on, the RAM its experts take, the draft layer, the pictures, the port and the engine's command line,
+then whether it would start; it loads nothing and exits with 1 when the model would not start (no usable GPU, too
+little RAM, a file the engine does not read, a missing encoder or projector).
+
 ## Release binaries
 
 Each [release](https://github.com/eddoursul/Lamina/releases) has the programs built for Windows and Linux, on x64 and
@@ -108,8 +153,9 @@ arm64, in two downloads a platform:
 - `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, beside them (the same in every
   release of that CUDA version: one download serves the next releases).
 
-Both are flat: extract them into one folder, `bin` in a clone of the release's tag (or of its source archive), and run
-setup without the build:
+Both are flat: extract them into one folder, and `lamina-server -m` runs a model file from there
+([above](#a-model-file-without-setup)). For setup's configs and launchers, extract them into `bin` in a clone of the
+release's tag (or of its source archive), and run setup without the build:
 
 ```
 git clone --branch <version> https://github.com/eddoursul/Lamina
@@ -134,7 +180,8 @@ the same way (`toolkit`, `build`, `test`, `package`).
 
 ## The config
 
-`lamina-<model>.json` holds the engine's command line and the server's settings. Its keys from setup:
+`lamina-<model>.json` holds the engine's command line and the server's settings. Its keys from setup (and
+`--write-config`'s, without `cwd` and `lib_dirs`: its paths are absolute):
 
 | Key | |
 | --- | --- |
@@ -150,9 +197,10 @@ The server's other keys (the network, API keys, idle unload, MCP servers, image 
 [USING.md](USING.md#the-config). Relative paths are the clone's: the launchers start the server there.
 
 **The learned expert profile.** The GPUs' expert caches start from a ranking of the experts by how often the model
-routes to them (`data/expert-profile.bin`). With `expert_profile_save`, the engine also counts this PC's routing and
-writes a profile (`<model>-learned.bin` in the data folder) at exit, on Ctrl+C and between requests at most once a
-minute (`expert_profile_save_every`); the next start fills the caches from it. It ranks the experts by this PC's routing
+routes to them (`data/expert-profile.bin`, built into the programs). With `expert_profile_save`, the engine also counts
+this PC's routing and writes a profile (`<model>-learned.bin` in setup's data folder, beside the server with `-m`) at
+exit, on Ctrl+C and between requests at most once a minute (`expert_profile_save_every`); the next start fills the
+caches from it. It ranks the experts by this PC's routing
 and the profile it started from at equal weight. On the development PC, after a session of code and reasoning requests,
 a round of fixed text took 9-14% less time on code, -3.8 to +0.9% on thinking and edits. Remove both keys to start from
 the shipped profile every time.

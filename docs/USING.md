@@ -306,7 +306,9 @@ put a reverse proxy in front of it.
 
 ## The config
 
-The server reads `lamina-<model>.json` at its start. Setup's keys: [SETUP.md](SETUP.md#the-config). The server's:
+The server reads `lamina-<model>.json` at its start, or with `-m` builds one from the model file
+([SETUP.md](SETUP.md#a-model-file-without-setup); `--write-config` writes it). Setup's keys:
+[SETUP.md](SETUP.md#the-config). The server's:
 
 | Key | |
 | --- | --- |

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <regex>
 #include <sstream>
 
 namespace lamina {
@@ -325,9 +326,10 @@ std::string LaminaEngine::death_note() {
         if (it->find("issue #29") != std::string::npos)
             return "The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                    "line: " + std::string(strip(*it)) + " - please report it at github.com/eddoursul/Lamina/issues.";
+    static const std::regex message(R"(^lamina( [a-z0-9_-]+)?:)");   // not the usage's "lamina --native ..."
     for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
         const std::string_view s = strip(*it);
-        if (starts_with(s, "lamina") || starts_with(s, "ERR"))
+        if (std::regex_search(s.begin(), s.end(), message) || starts_with(s, "ERR"))
             return "The engine ended (code " + std::to_string(rc_.load()) + "). Its last log line: " + std::string(s) +
                    " - if that does not explain it, please report it at github.com/eddoursul/Lamina/issues with the log.";
     }

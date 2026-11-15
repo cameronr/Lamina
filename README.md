@@ -27,10 +27,10 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
 
   | Model file | RAM taken | Download |
   | --- | --- | --- |
-  | Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S | ~53 GB | ~86 GB |
-  | Qwen3.8-Flash-Next, unsloth's UD-Q4_K_XL | ~81 GB | ~114 GB |
-  | Qwen3.6-35B-A3B, unsloth's UD-Q4_K_XL | ~22 GB on one GPU, ~2 GB split over GPUs that hold it | ~24 GB |
-  | Qwen3.8-27B, unsloth's UD-Q6_K_M | ~2 GB | ~24 GB |
+  | Qwen3.8-Flash-Next, [ISTA-DASLab's GSQ-RCO IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | ~53 GB | ~86 GB |
+  | Qwen3.8-Flash-Next, [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | ~81 GB | ~114 GB |
+  | Qwen3.6-35B-A3B, [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) | ~22 GB on one GPU, ~2 GB split over GPUs that hold it | ~24 GB |
+  | Qwen3.8-27B, [unsloth's UD-Q6_K_M](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | ~2 GB | ~24 GB |
 
   The engine also runs unsloth's other Flash-Next quants, all but UD-IQ1_S and BF16: UD-IQ1_M, UD-Q2_0, UD-IQ2_XS,
   UD-Q2_K_XL, UD-IQ3_XXS, UD-Q3_K_XL, UD-IQ4_XS, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, whose experts take ~35 GB (UD-IQ1_M)
@@ -48,6 +48,14 @@ own output. Its speeds against llama.cpp and Strata on one PC are in [docs/COMPA
   RTX 30, 40 and 50 GPUs.
 
 ## Install
+
+**A release:** extract both archives of a [release](https://github.com/eddoursul/Lamina/releases) for your platform
+into one folder: the programs (`lamina-server`, `lamina`, `lamina-vision`) and the CUDA runtime they load. Download a
+model's GGUF files into a folder of their own: one of the table's above (every shard of a split one), with an image
+projector of its repository (an `mmproj-*.gguf`) for pictures and, for Qwen3.8-Flash-Next, Lamina's draft layer
+([below](#the-draft-layer)). [Run](#run) then starts it.
+
+**The source:** from a clone, setup builds the programs and sets up one of the table's models:
 
 ```
 git clone https://github.com/eddoursul/Lamina
@@ -68,8 +76,8 @@ Details: [docs/SETUP.md](docs/SETUP.md).
 Qwen3.8-Flash-Next needs one thing no model file holds: Lamina's draft layer, one file of 0.8 GB,
 `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, in
 [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP). Setup
-downloads it. Whoever installs Lamina another way, a person or an agent, with a config of their own or a model file
-setup does not know, should download it too, into the model's folder:
+downloads it. Whoever installs Lamina another way, a person or an agent, from a release, with a config of their own or
+a model file setup does not know, should download it too, into the model's folder:
 
 ```
 download-draft-layer.bat MODEL_FOLDER      (Windows)
@@ -87,11 +95,19 @@ nothing more.
 ## Run
 
 ```
-run-iq3_s.bat                    (Windows)
-./run-iq3_s.sh                   (Linux)
+lamina-server -m D:\Models\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf     (a model file)
+run-iq3_s.bat                    (setup's launcher; ./run-iq3_s.sh on Linux)
 ```
 
-The model loads in a minute or so. Then:
+`-m` takes a model file the engine runs, a split one by any of its shards. The server builds its config from the
+preset for it (the file's header picks one of [`examples/*.json`](examples/README.md), built into the server), this
+PC's GPUs and the files beside the model, and its window says what it took. `--check` says beforehand what the model
+needs against what this PC has, and loads nothing. An engine option on the command line takes the place of the
+preset's (`--max-context 65536`), and `--write-config FILE` writes the config for `lamina-server --config FILE`:
+[docs/SETUP.md](docs/SETUP.md#a-model-file-without-setup).
+
+The model loads in a minute or so. Then, on the preset's port (the window's `ready` line names it: 8081 for
+ISTA-DASLab's Flash-Next files, 8082 for the family's others, 8083 for Qwen3.6-35B-A3B, 8084 for Qwen3.8-27B):
 
 - **http://127.0.0.1:8081** is the web app: chat with pictures, the monitor, settings.
 - **http://127.0.0.1:8081/v1** is the API, for any OpenAI- or Anthropic-compatible client, coding agents such as

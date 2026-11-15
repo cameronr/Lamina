@@ -35,6 +35,10 @@ std::vector<int> gpu_list(const json& cfg);
 struct GpuInfo {
     int index;
     std::string name, bus_id, uuid;
+    int64_t memory_mib = 0;   ///< its VRAM
+    int cc = 0;               ///< compute capability x 10 (86: 8.6), 0 when nvidia-smi does not say
+    bool display = false;     ///< a display is active on it
+    std::string driver;       ///< the NVIDIA driver's version
 };
 /// the NVIDIA cards as nvidia-smi lists them (empty without nvidia-smi)
 std::vector<GpuInfo> nvidia_gpus();
@@ -49,6 +53,13 @@ std::optional<std::vector<std::string>> effort_end_args(const json& cfg, const T
 double engine_silence_s(const json& cfg);
 /// the engine's arguments: the config's, with what "vision", "parallel" and "expert_profile_save" ask for
 std::vector<std::string> engine_args(const json& cfg);
+/// An engine option on lamina-server's command line: the flag ("--max-context") and the values that follow it.
+using EngineOption = std::vector<std::string>;
+/// `opts` into the config's args, each in place of the args' own instances of its flag (with their values: the words
+/// after a flag that do not start with "--") and of its other form ("--kv-grow" for "--no-kv-grow" and back), at the
+/// end in their order.  The engine takes an option's last value, so the command line's wins either way; the args stay
+/// without the old ones for a config that is written.
+void apply_engine_options(json& cfg, const std::vector<EngineOption>& opts);
 /// the model file of the engine's arguments (--native), relative ones the config's cwd's
 std::string model_file(const json& cfg);
 /// the engine's environment, set in this process before the engine starts: "gpu" (CUDA_DEVICE_ORDER and

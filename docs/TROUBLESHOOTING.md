@@ -41,6 +41,20 @@ experts take RAM only when they do not all fit in VRAM: more GPUs (`--second-gpu
 beside it: other programs hold the rest, or the model leaves little. Windows pages them out to disk while the model
 runs, and Linux may end the engine. Close other programs, or use a smaller quant.
 
+**"...: not a model Lamina runs (its architecture '...'; ...)".** `-m` names a GGUF that is no model of these families:
+an image projector (`mmproj-*.gguf`), the draft layer, another model. Name the model's file, a split one's first shard
+or any other.
+
+**"--mmproj ...: the projector of a model N wide, and this one is M", or "... not an image projector".** The file
+`--mmproj` names belongs to another model, or is no projector: name the one of the model's repository, or leave
+`--mmproj` out and the server takes the one beside the model.
+
+**"unknown argument: ..." and "the engine of this model does not take an option of the command line (above)".** An
+option on `lamina-server`'s command line that is not the server's goes to the engine, whose parser refused it: a typo,
+a value it does not take, or an option of Qwen3.8-Flash-Next's engine given for Qwen3.6-35B-A3B or Qwen3.8-27B (or the
+other way). `lamina --help` lists Flash-Next's options; [SETUP.md](SETUP.md#qwen36-35b-a3b-and-qwen38-27b) the
+qwen35 path's.
+
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.
 

@@ -1263,37 +1263,304 @@ struct PromptBuffers {
     }
 };
 
+/// The command line into `o` (argv[0] the program's name): 0, else the exit code with the reason printed (and the
+/// usage after it with `usage_on_error`); --help prints the usage and sets `help`.  No CUDA call: lamina-server checks
+/// the options it is given with it (check_args) before anything loads.
+int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_error = true) {
+    struct MissingValue {
+        const char* what;
+    };
+    bool have_tokens = false;
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string a = argv[i];
+            auto next = [&](const char* what) -> const char* {
+                if (i + 1 >= argc) throw MissingValue{what};
+                return argv[++i];
+            };
+            {   // switches outside the chain below: MSVC refuses one this long (C1061)
+                bool* on = a == "--hc-q8" ? &o.hc_q8 : a == "--arena-place" ? &o.arena_place
+                         : a == "--no-file-cache" ? &o.no_file_cache : nullptr;
+                if (on != nullptr) {
+                    *on = true;
+                    continue;
+                }
+            }
+            if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // core/control_vector.hpp
+                std::string e;
+                bool ok = true;
+                if (a == "--control-vector" || a == "--control-vector-scaled") {
+                    ok = lamina::core::parse_control_vectors(next(a.c_str()), a == "--control-vector-scaled",
+                                                             o.cvec.files, e);
+                } else if (a == "--control-vector-layer-range") {
+                    o.cvec.first = std::atoi(next(a.c_str()));
+                    o.cvec.last = std::atoi(next(a.c_str()));
+                } else if (a == "--cvec-mode") {
+                    const std::string m = next(a.c_str());
+                    ok = m == "add" || m == "project";
+                    o.cvec.project = m == "project";
+                    if (!ok) e = "--cvec-mode: add or project, not '" + m + "'";
+                } else if (a == "--cvec-dir") {
+                    const std::string d = next(a.c_str());
+                    char* end = nullptr;
+                    const long l = d.rfind("single:", 0) == 0 ? std::strtol(d.c_str() + 7, &end, 10) : -1;
+                    ok = d == "per-layer" || (l >= 1 && end != d.c_str() + 7 && *end == '\0');
+                    o.cvec.single = d == "per-layer" ? -1 : (int) l;
+                    if (!ok) e = "--cvec-dir: per-layer or single:L (L >= 1), not '" + d + "'";
+                } else {
+                    ok = false;
+                    e = "unknown argument: " + a;
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "%s\n", e.c_str());
+                    return 2;
+                }
+                continue;
+            }
+            {   // the knobs, the texts and the lists below outside the chain as well
+                std::string* text = a == "--expert-profile-save" ? &o.expert_profile_save
+                                  : a == "--dump-draft-data" ? &o.dump_draft_data
+                                  : a == "--rope-scaling" ? &o.rope_scaling : nullptr;
+                if (text != nullptr) {
+                    *text = next(a.c_str());
+                    continue;
+                }
+                if (a == "--prompt-split") {   // a layer, or two
+                    const std::string v = next(a.c_str());
+                    const size_t comma = v.find(',');
+                    o.prompt_split = std::atof(v.c_str());
+                    o.prompt_split2 = comma == std::string::npos ? 0.0 : std::atof(v.c_str() + comma + 1);
+                    continue;
+                }
+                double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-tiers" ? &o.prompt_tiers
+                             : a == "--prompt-split-from" ? &o.prompt_split_from
+                             : a == "--second-gpu-clocks-hold" ? &o.clocks_hold
+                             : a == "--second-gpu-clocks-lead" ? &o.clocks_lead
+                             : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
+                             : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
+                             : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
+                             : a == "--yarn-ext-factor" ? &o.yarn_ext_factor : a == "--yarn-attn-factor" ? &o.yarn_attn_factor
+                             : a == "--yarn-beta-fast" ? &o.yarn_beta_fast : a == "--yarn-beta-slow" ? &o.yarn_beta_slow
+                             : nullptr;
+                if (knob != nullptr) {
+                    *knob = std::atof(next(a.c_str()));
+                    continue;
+                }
+                if (a == "--second-gpu" || a == "--tier-gpus") {   // names, as --main-gpu's (a negative number: none)
+                    o.tier_names.clear();
+                    std::stringstream names(next(a.c_str()));
+                    for (std::string s; std::getline(names, s, ',');) {
+                        s.erase(0, s.find_first_not_of(" \t"));
+                        s.erase(s.find_last_not_of(" \t") + 1);
+                        if (!s.empty() && s[0] != '-') o.tier_names.push_back(s);
+                    }
+                    continue;
+                }
+                if (a == "--second-gpu-clocks") {
+                    o.second_gpu_clocks.clear();
+                    std::stringstream specs(next(a.c_str()));
+                    for (std::string s; std::getline(specs, s, ',');) {
+                        s.erase(0, s.find_first_not_of(" \t"));
+                        s.erase(s.find_last_not_of(" \t") + 1);
+                        o.second_gpu_clocks.push_back(s);
+                    }
+                    continue;
+                }
+                std::vector<double>* list = a == "--second-gpu-gib" ? &o.second_gpu_gib
+                                          : a == "--second-gpu-reserve-mib" ? &o.second_gpu_reserve_mib
+                                          : a == "--second-gpu-prefetch-mb" ? &o.second_gpu_prefetch_mb
+                                          : a == "--second-gpu-sleep-us" ? &o.second_gpu_sleep_us : nullptr;
+                if (list != nullptr) {
+                    if (!number_list(next(a.c_str()), *list)) {
+                        std::fprintf(stderr, "lamina: %s takes a number or a comma-separated list\n", a.c_str());
+                        return 2;
+                    }
+                    continue;
+                }
+            }
+            if (a == "--help" || a == "-h") { usage(); help = true; return 0; }
+            else if (a == "--tokens") {
+                if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
+                std::string e;
+                if (!parse_i64_list(next("--tokens"), o.tokens, e)) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
+                have_tokens = true;
+            }
+            else if (a == "--tokens-file") {
+                if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
+                std::ifstream input(next("--tokens-file"));
+                if (!input) { std::fprintf(stderr, "cannot open token file\n"); return 2; }
+                std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+                if (input.bad()) { std::fprintf(stderr, "cannot read token file\n"); return 2; }
+                std::string error;
+                if (text.find('\0') != std::string::npos || !parse_i64_list(text.c_str(), o.tokens, error)) {
+                    std::fprintf(stderr, "malformed token file: %s\n", error.c_str()); return 2;
+                }
+                have_tokens = true;
+            }
+            else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
+            else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+            else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
+            else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
+            else if (a == "--ple-io") o.ple_io = next("--ple-io");
+            else if (a == "--kv") o.kv = next("--kv");
+            else if (a == "--disable-hit") o.disable_hit = true;
+            else if (a == "--expert-math") o.expert_math = next("--expert-math");
+            else if (a == "--native") o.native_preset = next("--native");
+            else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+            else if (a == "--expert-cache") {
+                const std::string v = next("--expert-cache");
+                o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
+            }
+            else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
+            else if (a == "--prefill") {   // auto: 16K-token chunks, halved until their buffers fit the lendable slots
+                const std::string v = next("--prefill");
+                o.prefill_chunk = v == "auto" ? 16384 : std::atoll(v.c_str());
+            }
+            else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
+            else if (a == "--no-prompt-offload") o.no_prompt_offload = true;
+            else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+            else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
+            else if (a == "--temperature") o.temperature = std::atof(next("--temperature"));
+            else if (a == "--top-p") o.top_p = std::atof(next("--top-p"));
+            else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
+            else if (a == "--min-p") o.min_p = std::atof(next("--min-p"));
+            else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
+            else if (a == "--mtp") o.mtp = next("--mtp");
+            else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+            else if (a == "--main-gpu") o.main_gpu_name = next("--main-gpu");
+            else if (a == "--second-gpu-min-mb") o.second_gpu_min_mb = std::atof(next("--second-gpu-min-mb"));
+            else if (a == "--no-second-gpu-adapt") o.no_second_gpu_adapt = true;
+            else if (a == "--deterministic-adapt") o.deterministic_adapt = true;
+            else if (a == "--vram-pin-gib") o.vram_pin_gib = std::atof(next("--vram-pin-gib"));
+            else if (a == "--second-gpu-pin-gib") o.second_gpu_pin_gib = std::atof(next("--second-gpu-pin-gib"));
+            else if (a == "--kv-grow") { o.kv_grow = true; o.no_kv_grow = false; }
+            else if (a == "--no-kv-grow") { o.kv_grow = false; o.no_kv_grow = true; }
+            else if (a == "--head-split") o.head_split = std::atof(next("--head-split"));
+            else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
+            else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
+            else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
+            else if (a == "--spec-lookup") o.spec_lookup = std::max(0, std::atoi(next("--spec-lookup")));
+            else if (a == "--stop-eos") o.stop_eos = true;
+            else if (a == "--spec-split") o.spec_split = true;
+            else if (a == "--window-profile") o.window_profile = true;
+            else if (a == "--prefill-profile") o.prefill_profile = true;
+            else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
+            else if (a == "--window-logits") o.window_logits = next("--window-logits");
+            else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
+            else if (a == "--serve") o.serve = true;
+            else if (a == "--vision") o.vision = true;
+            else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+            else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max<int64_t>(1, std::atoll(next("--prompt-cache-every")));
+            else if (a == "--conversation-cache-mib") o.conversation_cache_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-mib")));
+            else if (a == "--conversation-cache-slots") o.conversation_cache_slots = std::max(0, std::atoi(next("--conversation-cache-slots")));
+            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = std::max<int64_t>(0, std::atoll(next("--conversation-cache-min-tokens")));
+            else if (a == "--ram-reserve-mib") o.ram_reserve_mib = std::max<int64_t>(0, std::atoll(next("--ram-reserve-mib")));
+            else if (a == "--feed-max") o.feed_max = std::max<int64_t>(0, std::atoll(next("--feed-max")));
+            else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
+            else if (a == "--eos-ids") {
+                std::string e;
+                if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
+                o.stop_eos = true;
+            }
+            else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+            else if (a == "--adapt-decay") {
+                o.adapt_decay = (float) std::atof(next("--adapt-decay"));
+                // at 1 or more the usage counts grow without end and the swap gains turn NaN (upstream PR #591)
+                if (!(o.adapt_decay > 0.0f && o.adapt_decay < 1.0f)) {
+                    std::fprintf(stderr, "--adapt-decay must be between 0 and 1 (exclusive)\n");
+                    return 2;
+                }
+            }
+            else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
+            else if (a == "--stats") o.stats = true;
+            else {
+                // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
+                // tokens would look like a working run.
+                std::fprintf(stderr, "lamina: unknown argument: %s\n", a.c_str());
+                if (usage_on_error) usage();
+                return 2;
+            }
+        }
+    } catch (const MissingValue& m) {
+        std::fprintf(stderr, "lamina: %s needs a value\n", m.what);
+        return 2;
+    }
+    if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
+        o.tokens = {248045};
+        o.max_new = 1;
+        have_tokens = true;
+        o.stop_eos = true;
+    }
+    if (!have_tokens) {
+        std::fprintf(stderr, "lamina: --tokens is required (this build has no tokenizer; see the "
+                             "header of src/program/generate.cpp)\n");
+        if (usage_on_error) usage();
+        return 2;
+    }
+
+    if (o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") {
+        std::fprintf(stderr, "lamina: --ple-io must be direct, mmap or ram\n");
+        return 2;
+    }
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "k8v4" && o.kv != "q4_0") {
+        std::fprintf(stderr, "lamina: --kv must be fp16, int8, k8v4 or q4_0\n");
+        return 2;
+    }
+    if (o.expert_math != "fast" && o.expert_math != "exact") {
+        std::fprintf(stderr, "lamina: --expert-math must be fast or exact\n");
+        return 2;
+    }
+    // the profile serve mode fills the VRAM tiers from when none is named: Qwen3.8-Flash-Next's, built in
+    if (o.serve && o.expert_profile.empty()) o.expert_profile = lamina::core::kBuiltinExpertProfile;
+    return 0;
+}
+
 #if defined(LAMINA_HAVE_QWEN35)
 constexpr int kNotQwen35 = -1;
 /// The family switch: kNotQwen35 for a file this engine runs, else the exit code of the engine path of Qwen3.6-35B-A3B
 /// and Qwen3.8-27B (src/qwen35), which qwen35moe and qwen35 files (--native's header) run on.  That path runs on
 /// --main-gpu (named as for this engine), made current before its first CUDA call, and splits the layers over it and
 /// --second-gpu's GPUs where one does not hold them; it gets the command line without either, the GPUs as --stage-gpus.
-int qwen35_switch(int argc, char** argv) {
-    std::string model, main_gpu = "0", second;
+/// The family switch's reading of a command line: the family of --native's file (Unknown when it is not readable here:
+/// the engine below says why), and the line without --main-gpu and --second-gpu, which the switch takes.
+struct Qwen35Line {
     lamina::ModelFamily family = lamina::ModelFamily::Unknown;
-    std::vector<char*> rest{argv[0]};
+    std::string main_gpu = "0", second;
+    std::vector<char*> rest;
+    bool qwen35() const { return family == lamina::ModelFamily::Qwen35Moe || family == lamina::ModelFamily::Qwen35; }
+};
+Qwen35Line qwen35_line(int argc, char** argv) {
+    Qwen35Line q;
+    std::string model;
+    q.rest.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--main-gpu") == 0 && i + 1 < argc) {
-            main_gpu = argv[++i];
+            q.main_gpu = argv[++i];
             continue;
         }
         if (std::strcmp(argv[i], "--second-gpu") == 0 && i + 1 < argc) {
-            second = argv[++i];
+            q.second = argv[++i];
             continue;
         }
         if ((std::strcmp(argv[i], "--native") == 0 || std::strcmp(argv[i], "--model") == 0) && i + 1 < argc)
             model = argv[i + 1];
-        rest.push_back(argv[i]);
+        q.rest.push_back(argv[i]);
     }
-    if (model.empty()) return kNotQwen35;
+    if (model.empty()) return q;
     try {
         const lamina::GgufFile meta(lamina::gguf_split_paths(model).front());
-        family = lamina::model_family(meta);
-        if (family != lamina::ModelFamily::Qwen35Moe && family != lamina::ModelFamily::Qwen35) return kNotQwen35;
+        q.family = lamina::model_family(meta);
     } catch (const std::exception&) {
-        return kNotQwen35;   // not readable here: the engine below says why
     }
+    return q;
+}
+
+int qwen35_switch(int argc, char** argv) {
+    Qwen35Line q = qwen35_line(argc, argv);
+    if (!q.qwen35()) return kNotQwen35;
+    const lamina::ModelFamily family = q.family;
+    const std::string main_gpu = q.main_gpu, second = q.second;
+    std::vector<char*>& rest = q.rest;
     const std::vector<lamina::core::GpuInfo> gpus = lamina::core::list_gpus();
     std::string why;
     const int dev = lamina::core::find_gpu(gpus, main_gpu, why);
@@ -1353,6 +1620,16 @@ int qwen35_switch(int argc, char** argv) {
 
 }  // namespace
 
+int lamina::program::check_args(int argc, char** argv) {
+#if defined(LAMINA_HAVE_QWEN35)
+    if (Qwen35Line q = qwen35_line(argc, argv); q.qwen35())
+        return lamina::qwen35::check_args((int) q.rest.size(), q.rest.data());
+#endif
+    Options o;
+    bool help = false;
+    return parse_options(argc, argv, o, help, false);
+}
+
 int lamina::program::run(int argc, char** argv) {
     // device ordinals in nvidia-smi's order, not CUDA's fastest-first guess (before the first CUDA call)
     if (std::getenv("CUDA_DEVICE_ORDER") == nullptr) {
@@ -1375,241 +1652,8 @@ int lamina::program::run(int argc, char** argv) {
         }
     } at_exit;
     Options o;
-    bool have_tokens = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
-            return argv[++i];
-        };
-        {   // switches outside the chain below: MSVC refuses one this long (C1061)
-            bool* on = a == "--hc-q8" ? &o.hc_q8 : a == "--arena-place" ? &o.arena_place
-                     : a == "--no-file-cache" ? &o.no_file_cache : nullptr;
-            if (on != nullptr) {
-                *on = true;
-                continue;
-            }
-        }
-        if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // core/control_vector.hpp
-            std::string e;
-            bool ok = true;
-            if (a == "--control-vector" || a == "--control-vector-scaled") {
-                ok = lamina::core::parse_control_vectors(next(a.c_str()), a == "--control-vector-scaled",
-                                                         o.cvec.files, e);
-            } else if (a == "--control-vector-layer-range") {
-                o.cvec.first = std::atoi(next(a.c_str()));
-                o.cvec.last = std::atoi(next(a.c_str()));
-            } else if (a == "--cvec-mode") {
-                const std::string m = next(a.c_str());
-                ok = m == "add" || m == "project";
-                o.cvec.project = m == "project";
-                if (!ok) e = "--cvec-mode: add or project, not '" + m + "'";
-            } else if (a == "--cvec-dir") {
-                const std::string d = next(a.c_str());
-                char* end = nullptr;
-                const long l = d.rfind("single:", 0) == 0 ? std::strtol(d.c_str() + 7, &end, 10) : -1;
-                ok = d == "per-layer" || (l >= 1 && end != d.c_str() + 7 && *end == '\0');
-                o.cvec.single = d == "per-layer" ? -1 : (int) l;
-                if (!ok) e = "--cvec-dir: per-layer or single:L (L >= 1), not '" + d + "'";
-            } else {
-                ok = false;
-                e = "unknown argument: " + a;
-            }
-            if (!ok) {
-                std::fprintf(stderr, "%s\n", e.c_str());
-                return 2;
-            }
-            continue;
-        }
-        {   // the knobs, the texts and the lists below outside the chain as well
-            std::string* text = a == "--expert-profile-save" ? &o.expert_profile_save
-                              : a == "--dump-draft-data" ? &o.dump_draft_data
-                              : a == "--rope-scaling" ? &o.rope_scaling : nullptr;
-            if (text != nullptr) {
-                *text = next(a.c_str());
-                continue;
-            }
-            if (a == "--prompt-split") {   // a layer, or two
-                const std::string v = next(a.c_str());
-                const size_t comma = v.find(',');
-                o.prompt_split = std::atof(v.c_str());
-                o.prompt_split2 = comma == std::string::npos ? 0.0 : std::atof(v.c_str() + comma + 1);
-                continue;
-            }
-            double* knob = a == "--prompt-shift" ? &o.prompt_shift : a == "--prompt-tiers" ? &o.prompt_tiers
-                         : a == "--prompt-split-from" ? &o.prompt_split_from
-                         : a == "--second-gpu-clocks-hold" ? &o.clocks_hold
-                         : a == "--second-gpu-clocks-lead" ? &o.clocks_lead
-                         : a == "--expert-profile-save-every" ? &o.expert_profile_save_min
-                         : a == "--rope-scale" ? &o.rope_scale : a == "--rope-freq-base" ? &o.rope_freq_base
-                         : a == "--rope-freq-scale" ? &o.rope_freq_scale : a == "--yarn-orig-ctx" ? &o.yarn_orig_ctx
-                         : a == "--yarn-ext-factor" ? &o.yarn_ext_factor : a == "--yarn-attn-factor" ? &o.yarn_attn_factor
-                         : a == "--yarn-beta-fast" ? &o.yarn_beta_fast : a == "--yarn-beta-slow" ? &o.yarn_beta_slow
-                         : nullptr;
-            if (knob != nullptr) {
-                *knob = std::atof(next(a.c_str()));
-                continue;
-            }
-            if (a == "--second-gpu" || a == "--tier-gpus") {   // names, as --main-gpu's (a negative number: none)
-                o.tier_names.clear();
-                std::stringstream names(next(a.c_str()));
-                for (std::string s; std::getline(names, s, ',');) {
-                    s.erase(0, s.find_first_not_of(" \t"));
-                    s.erase(s.find_last_not_of(" \t") + 1);
-                    if (!s.empty() && s[0] != '-') o.tier_names.push_back(s);
-                }
-                continue;
-            }
-            if (a == "--second-gpu-clocks") {
-                o.second_gpu_clocks.clear();
-                std::stringstream specs(next(a.c_str()));
-                for (std::string s; std::getline(specs, s, ',');) {
-                    s.erase(0, s.find_first_not_of(" \t"));
-                    s.erase(s.find_last_not_of(" \t") + 1);
-                    o.second_gpu_clocks.push_back(s);
-                }
-                continue;
-            }
-            std::vector<double>* list = a == "--second-gpu-gib" ? &o.second_gpu_gib
-                                      : a == "--second-gpu-reserve-mib" ? &o.second_gpu_reserve_mib
-                                      : a == "--second-gpu-prefetch-mb" ? &o.second_gpu_prefetch_mb
-                                      : a == "--second-gpu-sleep-us" ? &o.second_gpu_sleep_us : nullptr;
-            if (list != nullptr) {
-                if (!number_list(next(a.c_str()), *list)) {
-                    std::fprintf(stderr, "lamina: %s takes a number or a comma-separated list\n", a.c_str());
-                    return 2;
-                }
-                continue;
-            }
-        }
-        if (a == "--help" || a == "-h") { usage(); return 0; }
-        else if (a == "--tokens") {
-            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
-            std::string e;
-            if (!parse_i64_list(next("--tokens"), o.tokens, e)) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
-            have_tokens = true;
-        }
-        else if (a == "--tokens-file") {
-            if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
-            std::ifstream input(next("--tokens-file"));
-            if (!input) { std::fprintf(stderr, "cannot open token file\n"); return 2; }
-            std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-            if (input.bad()) { std::fprintf(stderr, "cannot read token file\n"); return 2; }
-            std::string error;
-            if (text.find('\0') != std::string::npos || !parse_i64_list(text.c_str(), o.tokens, error)) {
-                std::fprintf(stderr, "malformed token file: %s\n", error.c_str()); return 2;
-            }
-            have_tokens = true;
-        }
-        else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
-        else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
-        else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
-        else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
-        else if (a == "--ple-io") o.ple_io = next("--ple-io");
-        else if (a == "--kv") o.kv = next("--kv");
-        else if (a == "--disable-hit") o.disable_hit = true;
-        else if (a == "--expert-math") o.expert_math = next("--expert-math");
-        else if (a == "--native") o.native_preset = next("--native");
-        else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
-        else if (a == "--expert-cache") {
-            const std::string v = next("--expert-cache");
-            o.expert_cache = (v == "auto") ? -1 : std::atoi(v.c_str());
-        }
-        else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib"));
-        else if (a == "--prefill") {   // auto: 16K-token chunks, halved until their buffers fit the lendable slots
-            const std::string v = next("--prefill");
-            o.prefill_chunk = v == "auto" ? 16384 : std::atoll(v.c_str());
-        }
-        else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
-        else if (a == "--no-prompt-offload") o.no_prompt_offload = true;
-        else if (a == "--spec") o.spec = std::atoi(next("--spec"));
-        else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
-        else if (a == "--temperature") o.temperature = std::atof(next("--temperature"));
-        else if (a == "--top-p") o.top_p = std::atof(next("--top-p"));
-        else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
-        else if (a == "--min-p") o.min_p = std::atof(next("--min-p"));
-        else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
-        else if (a == "--mtp") o.mtp = next("--mtp");
-        else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-        else if (a == "--main-gpu") o.main_gpu_name = next("--main-gpu");
-        else if (a == "--second-gpu-min-mb") o.second_gpu_min_mb = std::atof(next("--second-gpu-min-mb"));
-        else if (a == "--no-second-gpu-adapt") o.no_second_gpu_adapt = true;
-        else if (a == "--deterministic-adapt") o.deterministic_adapt = true;
-        else if (a == "--vram-pin-gib") o.vram_pin_gib = std::atof(next("--vram-pin-gib"));
-        else if (a == "--second-gpu-pin-gib") o.second_gpu_pin_gib = std::atof(next("--second-gpu-pin-gib"));
-        else if (a == "--kv-grow") { o.kv_grow = true; o.no_kv_grow = false; }
-        else if (a == "--no-kv-grow") { o.kv_grow = false; o.no_kv_grow = true; }
-        else if (a == "--head-split") o.head_split = std::atof(next("--head-split"));
-        else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
-        else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
-        else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
-        else if (a == "--spec-lookup") o.spec_lookup = std::max(0, std::atoi(next("--spec-lookup")));
-        else if (a == "--stop-eos") o.stop_eos = true;
-        else if (a == "--spec-split") o.spec_split = true;
-        else if (a == "--window-profile") o.window_profile = true;
-        else if (a == "--prefill-profile") o.prefill_profile = true;
-        else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
-        else if (a == "--window-logits") o.window_logits = next("--window-logits");
-        else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
-        else if (a == "--serve") o.serve = true;
-        else if (a == "--vision") o.vision = true;
-        else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
-        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max<int64_t>(1, std::atoll(next("--prompt-cache-every")));
-        else if (a == "--conversation-cache-mib") o.conversation_cache_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-mib")));
-        else if (a == "--conversation-cache-slots") o.conversation_cache_slots = std::max(0, std::atoi(next("--conversation-cache-slots")));
-        else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = std::max<int64_t>(0, std::atoll(next("--conversation-cache-min-tokens")));
-        else if (a == "--ram-reserve-mib") o.ram_reserve_mib = std::max<int64_t>(0, std::atoll(next("--ram-reserve-mib")));
-        else if (a == "--feed-max") o.feed_max = std::max<int64_t>(0, std::atoll(next("--feed-max")));
-        else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
-        else if (a == "--eos-ids") {
-            std::string e;
-            if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
-            o.stop_eos = true;
-        }
-        else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
-        else if (a == "--adapt-decay") {
-            o.adapt_decay = (float) std::atof(next("--adapt-decay"));
-            // at 1 or more the usage counts grow without end and the swap gains turn NaN (upstream PR #591)
-            if (!(o.adapt_decay > 0.0f && o.adapt_decay < 1.0f)) {
-                std::fprintf(stderr, "--adapt-decay must be between 0 and 1 (exclusive)\n");
-                return 2;
-            }
-        }
-        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
-        else if (a == "--stats") o.stats = true;
-        else {
-            // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
-            // tokens would look like a working run.
-            std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
-            usage();
-            return 2;
-        }
-    }
-    if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
-        o.tokens = {248045};
-        o.max_new = 1;
-        have_tokens = true;
-        o.stop_eos = true;
-    }
-    if (!have_tokens) {
-        std::fprintf(stderr, "lamina: --tokens is required (this build has no tokenizer; see the "
-                             "header of src/program/generate.cpp)\n");
-        usage();
-        return 2;
-    }
-
-    if (o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") {
-        std::fprintf(stderr, "lamina: --ple-io must be direct, mmap or ram\n");
-        return 2;
-    }
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "k8v4" && o.kv != "q4_0") {
-        std::fprintf(stderr, "lamina: --kv must be fp16, int8, k8v4 or q4_0\n");
-        return 2;
-    }
-    if (o.expert_math != "fast" && o.expert_math != "exact") {
-        std::fprintf(stderr, "lamina: --expert-math must be fast or exact\n");
-        return 2;
-    }
+    bool help = false;
+    if (const int rc = parse_options(argc, argv, o, help); rc != 0 || help) return rc;
     // exact: a prompt's experts on the main GPU, whatever it holds (llama.cpp's MMQ kernels round them differently on
     // the second GPU, so a residency would show in the output)
     if (o.expert_math == "exact") o.no_prompt_offload = true;

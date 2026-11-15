@@ -95,6 +95,17 @@ if(LAMINA_WERROR)
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MSVC}>>>:-Werror>)
 endif()
 
+# Files built into a program (cmake/embed_files.cmake, include/lamina/embedded.hpp): `out`, a source of the build tree,
+# defines lamina::<func>(path) for the files that `glob` matches below `dir`.
+function(lamina_embed out dir glob func comment)
+  file(GLOB_RECURSE _files CONFIGURE_DEPENDS ${dir}/${glob})
+  add_custom_command(OUTPUT ${out}
+    COMMAND ${CMAKE_COMMAND} -DDIR=${dir} -DGLOB=${glob} -DOUT=${out} -DFUNC=${func}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake
+    DEPENDS ${_files} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake
+    COMMENT "${comment}" VERBATIM)
+endfunction()
+
 # ---- lamina_artifact -------------------------------------------------------
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
 # scalar dequantizers hold no state worth hiding, and a header-only boundary cannot introduce a
@@ -194,11 +205,14 @@ if(LAMINA_ENABLE_CUDA)
   # already links `lamina_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+  # Qwen3.8-Flash-Next's expert profile, --expert-profile builtin (the default under --serve)
+  lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/embedded_profile.cpp ${CMAKE_CURRENT_SOURCE_DIR}/data expert-profile.bin
+               profile_file "Embedding the expert profile")
   add_library(lamina_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/prompt_cache.cpp src/core/adaptive_tier.cpp src/core/second_gpu.cpp src/core/arena_place.cpp
     src/core/split_head.cpp src/core/vmm.cpp src/core/gpu_select.cpp src/core/gpu_usable.cu src/core/pack_image.cpp
-    src/core/control_vector.cpp)
+    src/core/control_vector.cpp ${CMAKE_CURRENT_BINARY_DIR}/embedded_profile.cpp)
   # the architectures a GPU the build has no kernels for is told of (a definition's value cannot hold a ';')
   string(REPLACE ";" "," _lamina_archs "${CMAKE_CUDA_ARCHITECTURES}")
   set_source_files_properties(src/core/gpu_usable.cu PROPERTIES
@@ -701,19 +715,18 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
   target_link_libraries(tool_args_test PRIVATE lamina_text)
   add_test(NAME tool_args_test COMMAND tool_args_test)
   if(TARGET lamina_program)
-    # the web app inside the binary (cmake/embed_web.cmake)
-    file(GLOB_RECURSE _lamina_web CONFIGURE_DEPENDS src/server/web/*)
-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp
-      COMMAND ${CMAKE_COMMAND} -DWEB_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/server/web
-              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_web.cmake
-      DEPENDS ${_lamina_web} cmake/embed_web.cmake
-      COMMENT "Embedding the web app")
+    # the web app and the presets (examples/*.json: lamina-server -m) inside the binary
+    lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/server/web * web_asset
+                 "Embedding the web app")
+    lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/presets.cpp ${CMAKE_CURRENT_SOURCE_DIR}/examples *.json preset_file
+                 "Embedding the presets")
     add_library(lamina_server_core STATIC src/server/api.cpp src/server/config.cpp src/server/engine.cpp
                 src/server/engine_batch.cpp src/server/http_client.cpp src/server/http_server.cpp src/server/images.cpp
-                src/server/keepawake.cpp src/server/mcp.cpp src/server/net.cpp src/server/process.cpp
-                src/server/prometheus.cpp src/server/replicas.cpp src/server/responses.cpp src/server/runconfig.cpp
-                src/server/service.cpp src/server/service_run.cpp src/server/structured.cpp src/server/telemetry.cpp
-                src/server/vision.cpp ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp)
+                src/server/keepawake.cpp src/server/mcp.cpp src/server/model_config.cpp src/server/net.cpp
+                src/server/process.cpp src/server/prometheus.cpp src/server/replicas.cpp src/server/responses.cpp
+                src/server/runconfig.cpp src/server/service.cpp src/server/service_run.cpp src/server/structured.cpp
+                src/server/telemetry.cpp src/server/vision.cpp ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp
+                ${CMAKE_CURRENT_BINARY_DIR}/presets.cpp)
     target_include_directories(lamina_server_core PUBLIC src/server ${_lamina_llama_root}/vendor
                                ${_lamina_llama_root}/vendor/cpp-httplib)
     target_link_libraries(lamina_server_core PUBLIC lamina_text cpp-httplib vendor-hash lamina_program lamina_warnings)
@@ -725,6 +738,10 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
     endif()
     add_executable(lamina-server src/server/main.cpp)
     target_link_libraries(lamina-server PRIVATE lamina_server_core)
+    # -m's config pieces: the presets, the main GPU, the command line's engine options, projectors (CPU only)
+    add_executable(model_config_test tests/server/model_config_test.cpp)
+    target_link_libraries(model_config_test PRIVATE lamina_server_core)
+    add_test(NAME model_config_test COMMAND model_config_test)
     # cmake --install <build> --component lamina --prefix <dir>: the programs in <dir>/bin, on Windows with the CUDA
     # runtime beside them (lamina-vision installs from tools/vision's own build; the component leaves out the install
     # rules of llama.cpp's libraries)
@@ -749,7 +766,7 @@ if(LAMINA_BUILD_TESTS)
   foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
              q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
              conversation_cache_test control_vector_test deterministic_adapt_help platform_memory_test
-             ple_reader_selftest)
+             ple_reader_selftest model_config_test)
     if(TEST ${_t})
       set_tests_properties(${_t} PROPERTIES LABELS cpu)
     endif()
