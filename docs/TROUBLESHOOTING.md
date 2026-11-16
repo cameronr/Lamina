@@ -8,7 +8,8 @@ and what a model needs.
 
 **"Visual Studio's C++ tools are needed".** `build.bat` found no Visual Studio 2022 (nor 2019 or 2026) with the C++
 tools: install Visual Studio 2022 or its free Build Tools with the workload "Desktop development with C++", which has
-CMake and Ninja too, or run `build.bat` from a developer prompt of the one to use.
+CMake and Ninja too, or run `build.bat` from a developer prompt of the one to use, or after a portable MSVC's
+`setup_x64.bat` ([SETUP.md](SETUP.md#building), Without Visual Studio).
 
 **"CMake 3.22 or newer is needed", "Ninja is needed", or CMake's "CMake 3.22 or higher is required".** Install them:
 on Windows Visual Studio's "C++ CMake tools for Windows" (part of that workload) or cmake.org's; on Linux the

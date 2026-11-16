@@ -7,8 +7,8 @@ Qwen3.6-35B-A3B and Qwen3.8-27B.
 ## Building
 
 From a clone of this repository, with the CUDA toolkit 13.0 or newer and, on Windows, Visual Studio 2022's C++ tools
-(its free Build Tools with the workload "Desktop development with C++" do), on Linux GCC 11 or newer, CMake 3.22 or
-newer and Ninja (Ubuntu 22.04's own packages do):
+(its free Build Tools with the workload "Desktop development with C++" do, or MSVC without Visual Studio, below), on
+Linux GCC 11 or newer, CMake 3.22 or newer and Ninja (Ubuntu 22.04's own packages do):
 
 ```
 build.bat                        (Windows)
@@ -29,11 +29,12 @@ Studio developer prompt).
 - **llama.cpp**: the first configure downloads it at the commit the engine is built against, checks its SHA-256 and
   unpacks it into `third_party/llama.cpp`, without llama.cpp's web app (`tools/ui`, whose deep paths pass Windows'
   260-character limit). `-DLAMINA_GGML_DIR=<folder>` names another checkout.
-- **The tools**: `build.bat` finds Visual Studio 2022 (else 2019 or 2026) itself, or takes a developer prompt's, and
-  its CMake and Ninja unless the PATH has others; on Windows on Arm it compiles C and C++ with LLVM's clang-cl (Visual
-  Studio's "C++ Clang Compiler for Windows" or LLVM's own: ggml's CPU code for Arm does not build with MSVC). nvcc is
-  the one on the PATH, in `CUDA_PATH` or in `/usr/local/cuda`; `CUDACXX` names another, `CXX` the C++ compiler (on
-  Linux nvcc's host compiler too: `CXX=g++-14` when the GCC is newer than the toolkit takes).
+- **The tools**: `build.bat` takes the MSVC the prompt has set up (a developer prompt's, or a portable one's: below),
+  else finds Visual Studio 2022 (else 2019 or 2026) itself, and its CMake and Ninja unless the PATH has others; on
+  Windows on Arm it compiles C and C++ with LLVM's clang-cl (Visual Studio's "C++ Clang Compiler for Windows" or
+  LLVM's own: ggml's CPU code for Arm does not build with MSVC). nvcc is the one on the PATH, in `CUDA_PATH` or in
+  `/usr/local/cuda`; `CUDACXX` names another, `CXX` the C++ compiler (on Linux nvcc's host compiler too:
+  `CXX=g++-14` when the GCC is newer than the toolkit takes).
 - **The checks**: a CUDA toolkit older than 13.0 stops the configure (engines built with CUDA 12.8 crashed in long
   prompts on RTX 50 GPUs), as do 13.2.0 and 13.2.1 for RTX 50 GPUs (their nvcc compiled some of the kernels wrong: the
   answers were garbage), and GPUs older than the RTX 30 series are left out.
@@ -44,6 +45,21 @@ Studio developer prompt).
   parity checks and the tools, which otherwise build by name (`cmake --build build --target verify_parity`);
   `-DLAMINA_BUILD_VISION=OFF` leaves the image encoder out.
 
+**Without Visual Studio.** On Windows nvcc compiles with MSVC alone, and Visual Studio's installer is one way to get it:
+[portable-msvc.py](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977) (Python 3.9 or newer) downloads
+MSVC and the Windows SDK from Microsoft's servers into a folder, `msvc`, once Visual Studio's license is accepted (it
+asks; ~0.5 GB downloaded, 1.2 GB unpacked). `--vs 2022` takes MSVC 14.44, which CUDA 13.0 and newer accept (the
+script's default, Visual Studio 2026's compiler, needs CUDA 13.3 or newer). In a prompt with CMake and Ninja on the
+PATH (cmake.org's and ninja-build.org's, or `pip install cmake ninja`):
+
+```
+python portable-msvc.py --vs 2022
+msvc\setup_x64.bat
+build.bat
+```
+
+The CUDA toolkit's Visual Studio integration is not needed.
+
 `cmake --install build --prefix <folder>` puts the programs into a folder of their own, flat, as a release's two
 downloads extract: the programs, `download-draft-layer.bat` (`.sh` on Linux) and the licenses (the component
 `lamina`), and the CUDA runtime and cuBLAS the programs load, with NVIDIA's license (`cudart`; `--component` installs
@@ -51,7 +67,8 @@ one). Installed on Linux, the programs load the libraries in their own folder.
 
 **A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 5 MB instead of the CUDA build's
 ~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone (on Windows in a Visual Studio developer
-prompt; it downloads llama.cpp as the engine's build does when `third_party/llama.cpp` is not there):
+prompt or after a portable MSVC's `setup_x64.bat`; it downloads llama.cpp as the engine's build does when
+`third_party/llama.cpp` is not there):
 
 ```
 cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release

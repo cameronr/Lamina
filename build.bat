@@ -3,8 +3,9 @@ rem Builds Lamina from this clone with a preset of CMakePresets.json: native (th
 rem into build\) or portable (the releases' build for other PCs, into build-portable\). lamina-server.exe, lamina.exe
 rem and lamina-vision.exe run from there, with the CUDA runtime beside them.
 rem   build.bat [native or portable] [CMake options, e.g. -DLAMINA_BUILD_TESTS=ON; quote one that holds a ;]
-rem It takes Visual Studio's C++ tools (2022, else 2019 or 2026; in a developer prompt that prompt's) and, unless the
-rem PATH has others, their CMake and Ninja; the CUDA toolkit's nvcc from the PATH or CUDA_PATH (CUDACXX names another).
+rem It takes the MSVC the shell has set up (a developer prompt, or a portable MSVC's setup_x64.bat: cl.exe on the PATH,
+rem INCLUDE and LIB), else Visual Studio's C++ tools (2022, else 2019 or 2026) and, unless the PATH has others, their
+rem CMake and Ninja; the CUDA toolkit's nvcc from the PATH or CUDA_PATH (CUDACXX names another).
 setlocal
 cd /d "%~dp0"
 set "PRESET=native"
@@ -14,7 +15,7 @@ if /i "%~1"=="portable" (set "PRESET=portable" & set "ARGS=%ARGS:*portable=%")
 set "OUT=build"
 if "%PRESET%"=="portable" set "OUT=build-portable"
 
-if defined VCINSTALLDIR goto have_vs
+where cl.exe >nul 2>nul && if defined INCLUDE if defined LIB goto have_vs
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VCTOOLS=x86.x64"
 set "VCVARS=vcvars64.bat"
@@ -54,5 +55,5 @@ exit /b 0
 :no_vs
 echo Visual Studio's C++ tools are needed: Visual Studio 2022 or its free Build Tools
 echo (https://visualstudio.microsoft.com/downloads/) with the workload "Desktop development with C++";
-echo or run this from a developer prompt.
+echo or run this from a developer prompt, or after a portable MSVC's setup_x64.bat.
 exit /b 1
