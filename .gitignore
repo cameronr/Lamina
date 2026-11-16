@@ -27,8 +27,9 @@ td.log
 
 # llama.cpp as the build downloads it (cmake/lamina_llama.cmake), with its lock, zip and unpack folder
 /third_party/llama.cpp*
-# what earlier versions' setup wrote in the clone; the build trees are build*/ above
+# the tools' Python environment (requirements.txt)
 /.venv/
+# what earlier versions' setup wrote in the clone; the build trees are build*/ above
 /third_party/stable-diffusion.cpp
 /third_party/*.zip
 /third_party/*.zip.part
