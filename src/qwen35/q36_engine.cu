@@ -3728,7 +3728,7 @@ struct Slot {
     long long offered = 0, accepted = 0;
 };
 
-/// The engine protocol (serve/server.py).  One request at a time on the control lines: GEN / GENI (alone: speculative
+/// The engine protocol (lamina-server's).  One request at a time on the control lines: GEN / GENI (alone: speculative
 /// steps with the MTP block), or with --batch N BGEN / BGENI <slot> (the request's prompt is read into that slot's
 /// session - the decode windows of the other slots go on between its chunks - then its tokens come as BT lines, one
 /// window for every slot decoding, until BDONE).  BSTOP <slot> ends a slot at its next window; STOP the request on the

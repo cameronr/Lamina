@@ -38,8 +38,8 @@ bool gpu_in_desktop_use(const std::string& bus_id);
 /// bus id ("10:00.0", "0000:10:00.0", nvidia-smi's "00000000:10:00.0"), or a name or a part of one that only one card
 /// has ("RTX 3090", case-insensitive; a whole name wins over a part of another; a number no ordinal is, as a word of
 /// one: "3090", not "7").  -1
-/// with `why` when none or several match (then each one's ordinal, name and UUID).  serve/server.py's find_gpu reads
-/// names the same way.
+/// with `why` when none or several match (then each one's ordinal, name and UUID).  lamina-server's find_gpu
+/// (src/server/config.cpp) reads names the same way.
 int find_gpu(const std::vector<GpuInfo>& gpus, const std::string& spec, std::string& why);
 
 /// A tier's GPU as a short probe saw it: the pinned host-to-device rate of 64 MiB copies (GB/s, the best of five

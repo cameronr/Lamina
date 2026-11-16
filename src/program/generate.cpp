@@ -1,11 +1,11 @@
 // src/program/generate.cpp - the engine (`lamina`): a model's prompt through the batched prompt path and its
 // decoding in verify windows of the last token and the draft layer's drafts, the experts in the GPUs' VRAM tiers and
 // the CPU pool.  Generate mode reads pretokenized ids (--tokens) and prints the tokens it decodes; --serve keeps
-// the model loaded and takes requests on stdin (serve/server.py speaks to it).
+// the model loaded and takes requests on stdin, or on lamina-server's in-process channels (serve_io.hpp).
 
+#include "lamina/artifact/draft_layer.hpp"
 #include "lamina/artifact/gguf_split.hpp"
 #if defined(LAMINA_HAVE_QWEN35)
-#include "lamina/artifact/draft_layer.hpp"
 #include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/qwen35/engine.hpp"
 #endif
@@ -357,7 +357,7 @@ void usage() {
                  "  --max-context N      KV/state capacity (default 4096; at most the QSA selection's capacity, set\n"
                  "                       by the GPU's shared memory: 1,466,368 cells on 99 KiB, 630,784 on 48 KiB)\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
-                 "  --serve              stay resident and take requests on stdin, as serve/server.py sends them\n"
+                 "  --serve              stay resident and take requests on stdin, as lamina-server sends them\n"
                  "  --vision             --serve takes images too (GENI requests; embeddings from lamina-vision)\n"
                  "  --prompt-cache N     --serve: keep up to N checkpoints of the sequence state per conversation in\n"
                  "                       host memory and continue each request from the longest cached prefix\n"
@@ -390,8 +390,8 @@ void usage() {
                  "                       --spec allows the draft layer (windows of up to 8 tokens; 0 = off)\n"
                  "  --spec-split         a window's tokens in two groups, the GPU's work on one beside the CPU's on\n"
                  "                       the other (exact, ~7%% slower: a measurement arm)\n"
-                 "  --mtp FILE           the MTP draft layer, Lamina-Qwen3.8-Flash-Next-MTP.gguf (download-draft-layer\n"
-                 "                       .bat / .sh; tools/mtp_rt.py writes one), or a folder of its earlier layout;\n"
+                 "  --mtp FILE           the MTP draft layer, Lamina-Qwen3.8-Flash-Next-MTP.gguf (%s;\n"
+                 "                       tools/mtp_rt.py writes one), or a folder of its earlier layout;\n"
                  "                       --serve without it: one token a window, or prompt lookup's drafts.\n"
                  "                       Qwen3.6-35B-A3B and\n"
                  "                       Qwen3.8-27B: --mtp N, at most N drafts of the file's own MTP block a step\n"
@@ -535,7 +535,8 @@ void usage() {
                  "                       it), kernel (a copy kernel stages it inside the window's graph) or direct\n"
                  "                       (the expert kernels read the mapped RAM)\n"
                  "  --pool-workers N     the CPU expert pool's workers (default 0: every physical core but the\n"
-                 "                       host loop's)\n");
+                 "                       host loop's)\n",
+                 lamina::kDraftLayerScript);
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
