@@ -319,3 +319,26 @@ is read again from the start), `/v1/choose` and the GPU tiers. The config's `par
 
 `git pull` and the build again update a clone's programs; the configs and the model files stay where they are. With
 release binaries, extract the new release's archives over the old ones.
+
+**A clone an earlier version's setup made.** `setup.bat` and `setup.sh` are gone: `build.bat` (`./build.sh`) builds the
+programs into the same `build/`, where the `run-<model>.bat` (`.sh`) and `lamina-<model>.json` setup wrote run them
+as before. The configs need no change: their `vision` section's `exe`, which named setup's encoder in
+`build-vision/bin` or `build-vision-cuda/bin`, is not read (the server starts the `lamina-vision` the build writes
+beside it, so a build of `lamina-server` alone, or with `-DLAMINA_BUILD_VISION=OFF`, leaves such a config unable to
+start), and the draft layer's folder `mtp/rt-distilled` still loads.
+
+- **CMake and Ninja**: setup installed them into `.venv`. `build.bat` takes Visual Studio's ("C++ CMake tools for
+  Windows", part of the workload "Desktop development with C++"), `build.sh` the PATH's (`sudo apt install cmake
+  ninja-build`). `build/` keeps the Ninja of `.venv` it was configured with: once `.venv` is deleted, its configure
+  stops ("Running '...ninja' '--version' failed") until `build.bat --fresh` (`./build.sh --fresh`).
+- **The CUDA toolkit**: `build/` keeps the nvcc setup chose. `LAMINA_NVCC` and `LAMINA_VCVARS` are not read any more:
+  `CUDACXX=<path to nvcc>` names a toolkit (with `--fresh`), a Visual Studio developer prompt a Visual Studio.
+- **What setup did otherwise**: `setup --check` is `lamina-server --config lamina-<model>.json --check`; `BENCH.bat`
+  and `bench.sh` are `lamina-server --config lamina-<model>.json --bench`, and `--bench-compare <an earlier report's
+  folder>` reads the reports they wrote; a model setup did not download runs with `lamina-server -m`
+  ([above](#a-model-file)), which downloads nothing. The image generator `tools/image/install.py` built
+  (`build-image-cuda`) and the config's `images` section keep working; it is built again by hand
+  ([USING.md](USING.md#image-generation)).
+- **What nothing uses now**: `build-vision/` and `build-vision-cuda/` (setup's encoders) and, after a build with
+  `--fresh`, `.venv` (unless the Python tools' packages, `requirements.txt`, went into it). `third_party/llama.cpp` is
+  the build's.

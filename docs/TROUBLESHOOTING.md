@@ -81,7 +81,8 @@ config's port: close it, or start this one with `--port`.
 **"the config has a "vision" section, and the image encoder is not there: ...".** The server starts the
 `lamina-vision` (`.exe`) in its own folder and no other: a release has it there, and the build writes it there. Put
 it back (a release's programs archive extracted whole, or the build run again), or take the `vision` section
-and `"--vision"` out of the config to run without pictures.
+and `"--vision"` out of the config to run without pictures. The `exe` a config of an earlier version's setup holds is
+not read ([SETUP.md](SETUP.md#updating)).
 
 **"the vision encoder did not start: ERR this lamina-vision was built without CUDA ...".** The `lamina-vision` beside
 the server is a CPU-only build and the config's `vision` section asks for a GPU (`"gpu": true`). Set `"gpu"` to
