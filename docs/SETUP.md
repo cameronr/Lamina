@@ -331,8 +331,8 @@ start), and the draft layer's folder `mtp/rt-distilled` still loads.
   Windows", part of the workload "Desktop development with C++"), `build.sh` the PATH's (`sudo apt install cmake
   ninja-build`). `build/` keeps the Ninja of `.venv` it was configured with: once `.venv` is deleted, its configure
   stops ("Running '...ninja' '--version' failed") until `build.bat --fresh` (`./build.sh --fresh`).
-- **The CUDA toolkit**: `build/` keeps the nvcc setup chose. `LAMINA_NVCC` and `LAMINA_VCVARS` are not read any more:
-  `CUDACXX=<path to nvcc>` names a toolkit (with `--fresh`), a Visual Studio developer prompt a Visual Studio.
+- **The CUDA toolkit**: `build/` keeps the nvcc setup chose; `CUDACXX=<path to nvcc>` with `--fresh` takes another
+  ([above](#building)).
 - **What setup did otherwise**: `setup --check` is `lamina-server --config lamina-<model>.json --check`; `BENCH.bat`
   and `bench.sh` are `lamina-server --config lamina-<model>.json --bench`, and `--bench-compare <an earlier report's
   folder>` reads the reports they wrote; a model setup did not download runs with `lamina-server -m`
