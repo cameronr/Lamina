@@ -42,9 +42,14 @@ struct GpuInfo {
 };
 /// the NVIDIA cards as nvidia-smi lists them (empty without nvidia-smi)
 std::vector<GpuInfo> nvidia_gpus();
-/// the card `spec` names, read as the engine reads --main-gpu / --second-gpu; -1 when none or several match
-int find_gpu(const std::string& spec, const std::vector<GpuInfo>& gpus);
-/// the cards the engine works on (the config's "gpu", else --main-gpu and --second-gpu), the first its main one
+/// the card `spec` names, read as the engine reads --main-gpu / --second-gpu; -1 when none or several match, with
+/// the reason in `why` when given
+int find_gpu(const std::string& spec, const std::vector<GpuInfo>& gpus, std::string* why = nullptr);
+/// the cards the engine works on (the config's "gpu", else --main-gpu and --second-gpu), the first its main one, among
+/// `gpus` (nvidia-smi's list; a number is taken as given when it is empty); empty, with the reason in `why` when
+/// given, when --main-gpu names no card or several, where the engine stops
+std::vector<int> engine_gpus(const json& cfg, const std::vector<GpuInfo>& gpus, std::string* why = nullptr);
+/// the same over nvidia-smi's list, read when the args name a GPU
 std::vector<int> engine_gpus(const json& cfg);
 /// #458: --tail-role-token for "effort_position": "end" (nullopt: the effort stays at the top); ConfigError for a
 /// value other than "start" / "end"

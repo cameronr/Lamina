@@ -230,7 +230,7 @@ bool engine_options_ok(const json& cfg, const std::vector<EngineOption>& opts) {
 
 /// -m: the GPU the engine runs on, as the args name it now (an engine option may have named another)
 void say_main_gpu(const json& cfg, const std::vector<GpuInfo>& gpus) {
-    const std::vector<int> on = engine_gpus(cfg);
+    const std::vector<int> on = engine_gpus(cfg, gpus);
     for (const GpuInfo& g : gpus)
         if (!on.empty() && g.index == on.front())
             say("[lamina] it runs on GPU " + std::to_string(g.index) + ", " + g.name + " (--main-gpu names another)");
@@ -279,7 +279,7 @@ void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
     const bool named = !dev.is_null() && !(dev.is_string() && strip(dev.get<std::string>()).empty());
     if (!v.is_object() || !truthy(jget(v, "gpu")) || named) return;
     if (gpus.empty()) gpus = nvidia_gpus();
-    const std::vector<int> engine = engine_gpus(cfg);
+    const std::vector<int> engine = engine_gpus(cfg, gpus);
     const int pick = pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
     for (const GpuInfo& g : gpus)
         if (g.index == pick) {

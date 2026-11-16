@@ -392,7 +392,9 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
                 stops.push_back(std::string("its tokenizer: ") + e.what());
             }
             // where it runs
-            const std::vector<int> on = engine_gpus(c);
+            std::string gpu_why;
+            const std::vector<int> on = engine_gpus(c, gpus, &gpu_why);
+            if (!gpu_why.empty() && !gpus.empty()) stops.push_back(gpu_why);   // none listed: said above
             const GpuInfo* main = on.empty() ? nullptr : gpu_by_index(gpus, on.front());
             std::string more;
             for (size_t i = 1; i < on.size(); ++i)

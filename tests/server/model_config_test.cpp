@@ -1,5 +1,6 @@
 // lamina-server -m's config pieces that need no model and no GPU (src/server/model_config.hpp): the preset by the
-// header's architecture and quantizer, the main GPU and the image encoder's, a GPU's name in a config, the command
+// header's architecture and quantizer, the main GPU and the image encoder's, a GPU's name in a config, the cards a
+// config's --main-gpu and --second-gpu name (none for a --main-gpu the engine would not find), the command
 // line's engine options in place of the config's, image projectors told apart by their width, and a config written
 // over an earlier one.  The projectors are small GGUF headers written here.  (CPU only.)
 #include "config.hpp"
@@ -133,6 +134,24 @@ int main() {
     CHECK(lamina::pick_vision_gpu(old, 1) == 1);   // the V100 is too old: the main card
     CHECK(lamina::pick_vision_gpu(pc, -1) == 2);   // the main card unknown: the least VRAM without a display
     CHECK(lamina::pick_vision_gpu({}, -1) == -1);
+
+    // the cards the engine works on, as it reads --main-gpu: one it cannot find gives none and why, not a guess
+    auto on = [&](std::vector<std::string> a, const std::vector<lamina::GpuInfo>& gpus, std::string* why = nullptr) {
+        a.insert(a.begin(), {"--native", "m.gguf"});
+        return lamina::engine_gpus(json{{"args", a}}, gpus, why);
+    };
+    std::string why;
+    CHECK((on({"--main-gpu", "GPU-bbb", "--second-gpu", "auto"}, pc) == std::vector<int>{1, 0, 2}));
+    CHECK((on({"--main-gpu", "RTX 5070", "--second-gpu", "GPU-ccc"}, pc) == std::vector<int>{0, 2}));
+    CHECK((on({"--second-gpu", "auto"}, pc) == std::vector<int>{0, 1, 2}));   // the engine's default, GPU 0
+    CHECK((on({"--main-gpu", "2", "--second-gpu", "GPU-dead"}, pc, &why) == std::vector<int>{2}) && why.empty());
+    CHECK(on({"--main-gpu", "RTX 3090", "--second-gpu", "auto"}, pc, &why).empty());
+    CHECK(why == "--main-gpu RTX 3090: several GPUs match RTX 3090 (name one by its UUID): 1 NVIDIA GeForce RTX 3090 "
+                 "GPU-bbb; 2 NVIDIA GeForce RTX 3090 GPU-ccc");
+    CHECK(on({"--main-gpu", "GPU-dead"}, pc, &why).empty() && why == "--main-gpu GPU-dead: no GPU is GPU-dead");
+    CHECK(on({"--main-gpu", "5"}, pc, &why).empty() && why == "--main-gpu 5: no GPU 5 (nvidia-smi lists 3) or GPU named so");
+    CHECK((on({"--main-gpu", "1"}, {}) == std::vector<int>{1}));   // nvidia-smi lists nothing: the number as given
+    CHECK((lamina::engine_gpus(json{{"gpu", "0,2"}, {"args", {"--main-gpu", "GPU-dead"}}}, pc) == std::vector<int>{0, 2}));
 
     // the command line's engine options in place of the config's, with their values and the other form's
     json cfg = {{"args", {"--native", "m.gguf", "--kv", "int8", "--kv-grow", "--second-gpu", "-1",

@@ -258,7 +258,7 @@ std::vector<GpuInfo> nvidia_gpus() {
     return out;
 }
 
-int find_gpu(const std::string& spec_in, const std::vector<GpuInfo>& gpus) {
+int find_gpu(const std::string& spec_in, const std::vector<GpuInfo>& gpus, std::string* why) {
     // a number (or, when no card has it, a word of a name: "3090"), a UUID or its start, a PCI bus id, or a name or a
     // part of one (a whole name first), as src/core/gpu_select.cpp reads them
     const std::string s(strip_chars(strip(spec_in), "\"'"));
@@ -302,10 +302,32 @@ int find_gpu(const std::string& spec_in, const std::vector<GpuInfo>& gpus) {
             }
         }
     }
-    return hits.size() == 1 ? hits[0]->index : -1;
+    if (hits.size() == 1) return hits[0]->index;
+    if (why != nullptr) {   // the engine's words (src/core/gpu_select.cpp), nvidia-smi's list in place of CUDA's
+        if (gpus.empty()) {
+            *why = "nvidia-smi lists no GPU";
+        } else if (hits.empty() && num) {
+            *why = "no GPU " + s + " (nvidia-smi lists " + std::to_string(gpus.size()) + ") or GPU named so";
+        } else if (hits.empty()) {
+            *why = "no GPU is " + s;
+        } else {
+            *why = "several GPUs match " + s + " (name one by its UUID):";
+            for (const GpuInfo* g : hits) *why += " " + std::to_string(g->index) + " " + g->name + " " + g->uuid + ";";
+            why->pop_back();
+        }
+    }
+    return -1;
 }
 
 std::vector<int> engine_gpus(const json& cfg) {
+    const std::vector<std::string> args = args_of(cfg);
+    const bool named = gpu_list(cfg).empty() && std::any_of(args.begin(), args.end(), [](const std::string& a) {
+        return a == "--main-gpu" || a == "--second-gpu" || a == "--tier-gpus";
+    });
+    return engine_gpus(cfg, named ? nvidia_gpus() : std::vector<GpuInfo>{});
+}
+
+std::vector<int> engine_gpus(const json& cfg, const std::vector<GpuInfo>& gpus, std::string* why) {
     const std::vector<int> listed = gpu_list(cfg);
     if (!listed.empty()) return listed;
     const std::vector<std::string> args = args_of(cfg);
@@ -325,23 +347,27 @@ std::vector<int> engine_gpus(const json& cfg) {
     const auto main_spec = values({"--main-gpu"});
     const std::vector<std::string> tiers = values({"--second-gpu", "--tier-gpus"}).value_or(std::vector<std::string>{});
     if ((!main_spec || main_spec->empty()) && tiers.empty()) return {};
-    std::optional<std::vector<GpuInfo>> known;
-    auto index = [&](const std::string& spec) {
-        if (!spec.empty() && std::all_of(spec.begin(), spec.end(), ::isdigit) && !known) return std::stoi(spec);
-        if (!known) known = nvidia_gpus();
-        return find_gpu(spec, *known);
+    auto index = [&](const std::string& spec, std::string* w) {   // a number as given when nvidia-smi lists nothing
+        if (gpus.empty() && !spec.empty() && std::all_of(spec.begin(), spec.end(), ::isdigit)) return std::stoi(spec);
+        return find_gpu(spec, gpus, w);
     };
-    int main_gpu = main_spec && !main_spec->empty() ? index((*main_spec)[0]) : 0;
-    if (main_gpu < 0) main_gpu = 0;
+    int main_gpu = 0;   // the engine's default, --main-gpu 0
+    if (main_spec && !main_spec->empty()) {
+        std::string w;
+        main_gpu = index((*main_spec)[0], &w);
+        if (main_gpu < 0) {   // the engine stops at it
+            if (why != nullptr) *why = "--main-gpu " + (*main_spec)[0] + ": " + w;
+            return {};
+        }
+    }
     std::vector<int> out = {main_gpu};
     if (tiers.size() == 1 && tiers[0] == "auto") {
-        if (!known) known = nvidia_gpus();
-        for (const auto& g : *known)
+        for (const auto& g : gpus)
             if (g.index != main_gpu) out.push_back(g.index);
         return out;
     }
-    for (const auto& t : tiers) {
-        const int i = index(t);
+    for (const auto& t : tiers) {   // one no card matches the engine leaves out
+        const int i = index(t, nullptr);
         if (i >= 0 && std::find(out.begin(), out.end(), i) == out.end() && out.size() <= 3) out.push_back(i);   // kMaxGpuTiers
     }
     return out;
