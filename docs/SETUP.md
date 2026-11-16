@@ -327,10 +327,10 @@ as before. The configs need no change: their `vision` section's `exe`, which nam
 beside it, so a build of `lamina-server` alone, or with `-DLAMINA_BUILD_VISION=OFF`, leaves such a config unable to
 start), and the draft layer's folder `mtp/rt-distilled` still loads.
 
-- **CMake and Ninja**: setup installed them into `.venv`. `build.bat` takes Visual Studio's ("C++ CMake tools for
-  Windows", part of the workload "Desktop development with C++"), `build.sh` the PATH's (`sudo apt install cmake
-  ninja-build`). `build/` keeps the Ninja of `.venv` it was configured with: once `.venv` is deleted, its configure
-  stops ("Running '...ninja' '--version' failed") until `build.bat --fresh` (`./build.sh --fresh`).
+- **CMake and Ninja**: `build.bat` takes Visual Studio's ("C++ CMake tools for Windows", part of the workload "Desktop
+  development with C++"), `build.sh` the PATH's (`sudo apt install cmake ninja-build`). `build/` keeps the Ninja it was
+  configured with: when that one is gone, its configure stops ("Running '...ninja' '--version' failed") until
+  `build.bat --fresh` (`./build.sh --fresh`).
 - **The CUDA toolkit**: `build/` keeps the nvcc setup chose; `CUDACXX=<path to nvcc>` with `--fresh` takes another
   ([above](#building)).
 - **What setup did otherwise**: `setup --check` is `lamina-server --config lamina-<model>.json --check`; `BENCH.bat`
@@ -339,6 +339,5 @@ start), and the draft layer's folder `mtp/rt-distilled` still loads.
   ([above](#a-model-file)), which downloads nothing. The image generator `tools/image/install.py` built
   (`build-image-cuda`) and the config's `images` section keep working; it is built again by hand
   ([USING.md](USING.md#image-generation)).
-- **What nothing uses now**: `build-vision/` and `build-vision-cuda/` (setup's encoders) and, after a build with
-  `--fresh`, `.venv` (unless the Python tools' packages, `requirements.txt`, went into it). `third_party/llama.cpp` is
+- **What nothing uses now**: `build-vision/` and `build-vision-cuda/` (setup's encoders). `third_party/llama.cpp` is
   the build's.
