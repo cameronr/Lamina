@@ -337,12 +337,14 @@ is read again from the start), `/v1/choose` and the GPU tiers. The config's `par
 `git pull` and the build again update a clone's programs; the configs and the model files stay where they are. With
 release binaries, extract the new release's archives over the old ones.
 
-**A clone an earlier version's setup made.** `setup.bat` and `setup.sh` are gone: `build.bat` (`./build.sh`) builds the
-programs into the same `build/`, where the `run-<model>.bat` (`.sh`) and `lamina-<model>.json` setup wrote run them
-as before. The configs need no change: their `vision` section's `exe`, which named setup's encoder in
-`build-vision/bin` or `build-vision-cuda/bin`, is not read (the server starts the `lamina-vision` the build writes
-beside it, so a build of `lamina-server` alone, or with `-DLAMINA_BUILD_VISION=OFF`, leaves such a config unable to
-start), and the draft layer's folder `mtp/rt-distilled` still loads.
+**A clone an earlier version's setup made.** `setup.bat` and `setup.sh` are gone. Their `--update` pulls, then stops
+at the `setup.py` it runs after the pull ("can't open file '...setup.py'", on Windows also "The batch file cannot be
+found"): the pull went through, and nothing is built. `build.bat` (`./build.sh`) builds the programs into the same
+`build/`, where the `run-<model>.bat` (`.sh`) and `lamina-<model>.json` setup wrote run them as before. The configs
+need no change: their `vision` section's `exe`, which named setup's encoder in `build-vision/bin` or
+`build-vision-cuda/bin`, is not read (the server starts the `lamina-vision` the build writes beside it, so a build of
+`lamina-server` alone, or with `-DLAMINA_BUILD_VISION=OFF`, leaves such a config unable to start), and the draft
+layer's folder `mtp/rt-distilled` still loads.
 
 - **CMake and Ninja**: `build.bat` takes Visual Studio's ("C++ CMake tools for Windows", part of the workload "Desktop
   development with C++"), `build.sh` the PATH's (`sudo apt install cmake ninja-build`). `build/` keeps the Ninja it was

@@ -6,6 +6,10 @@ and what a model needs.
 
 ## Building
 
+**`setup --update` ends with "can't open file '...setup.py'"** (on Windows also "The batch file cannot be found").
+Setup is gone; an earlier version's `--update` pulls, then runs the pulled `setup.py`. The pull went through: build
+with `build.bat` (`./build.sh`) ([SETUP.md](SETUP.md#updating), A clone an earlier version's setup made).
+
 **"Visual Studio's C++ tools are needed".** `build.bat` found no Visual Studio 2022 (nor 2019 or 2026) with the C++
 tools: install Visual Studio 2022 or its free Build Tools with the workload "Desktop development with C++", which has
 CMake and Ninja too, or run `build.bat` from a developer prompt of the one to use, or after a portable MSVC's
