@@ -919,6 +919,11 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
           list(APPEND _lamina_vision_args "-D${_v}:STRING=${${_v}}")
         endif()
       endforeach()
+      # Windows paths with forward slashes: the encoder's initial cache file sets each value in quotes, where a
+      # backslash starts an escape (a build folder an earlier setup.py configured holds its Ninja as ...\ninja.exe)
+      if(CMAKE_HOST_WIN32)
+        string(REPLACE "\\" "/" _lamina_vision_args "${_lamina_vision_args}")
+      endif()
       ExternalProject_Add(lamina-vision
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision
         BINARY_DIR ${CMAKE_BINARY_DIR}/vision
