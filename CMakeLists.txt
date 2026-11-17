@@ -8,7 +8,7 @@
 # with the CUDA runtime, into a folder of their own as a release lays them out.
 # CMake 3.22 (Ubuntu 22.04's) or newer, with 3.24's policies where CMake has them
 cmake_minimum_required(VERSION 3.22...3.24)
-project(lamina VERSION 0.1.43.1 LANGUAGES CXX)
+project(lamina VERSION 0.2 LANGUAGES CXX)
 add_compile_definitions(LAMINA_VERSION="${PROJECT_VERSION}")
 
 # cmake --install: flat, as a release's two downloads extract into one folder. Component lamina: the programs, the
