@@ -12,7 +12,6 @@
 #include "vision.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -251,18 +250,12 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
     bool main_named = false;
     for (size_t i = 0; pa.is_array() && i < pa.size(); ++i) {
         const std::string a = str_of(pa[i]);
-        const std::string v = i + 1 < pa.size() ? str_of(pa[i + 1]) : "";
         if (a == "--native" && i + 1 < pa.size()) {
             args.push_back(a);
             args.push_back(m.path);
             ++i;
         } else if ((a == "--mtp" || a == "--expert-profile") && i + 1 < pa.size()) {
-            // Flash-Next's draft layer is found beside the model (resolve_draft_layer), its profile is the engine's
-            // own; the qwen35 path's --mtp is a number of drafts
-            if (a == "--mtp" && !v.empty() && std::isdigit((unsigned char) v[0])) {
-                args.push_back(a);
-                args.push_back(v);
-            }
+            // Flash-Next's draft layer is found beside the model (resolve_draft_layer), its profile is the engine's own
             ++i;
         } else if (a == "--main-gpu" && i + 1 < pa.size()) {
             if (main_gpu >= 0) {

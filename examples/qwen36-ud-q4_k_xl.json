@@ -10,7 +10,7 @@
     "65536",
     "--prefill",
     "auto",
-    "--mtp",
+    "--drafts-per-step",
     "2",
     "--vision"
   ],

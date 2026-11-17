@@ -6,8 +6,8 @@
 namespace lamina::qwen35 {
 
 /// The engine's command line (lamina's own flag names where they mean the same thing: --native / --model,
-/// --max-context, --prefill / --chunk, --serve, --mtp N, --pool-workers, --tokens, --max-new, --no-token-graph; the
-/// family's own: --expert-vram, --expert-slots, --hybrid-rows, --cpu-threads).  Returns the process exit code.
+/// --max-context, --prefill / --chunk, --serve, --pool-workers, --tokens, --max-new, --no-token-graph; the family's
+/// own: --drafts-per-step, --expert-vram, --expert-slots, --hybrid-rows, --cpu-threads).  Returns the process exit code.
 int run(int argc, char** argv);
 
 /// run()'s parse of the command line alone, an option it does not have refused even under --serve: 0, else the exit

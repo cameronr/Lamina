@@ -310,10 +310,11 @@ name the file with `--native` like the others. It reads the GGUF as it is (no ex
 file's own MTP block). K and V are fp16 (~22 KB a cell for Qwen3.6, ~68 KB for the 27B), or with `--kv q8_0` 8 bits
 in llama.cpp's q8_0 rounding, about half: the 27B's full 262,144 cells then take ~9 GiB.
 
-The drafts: `--mtp N` at most a step; `--spec-min-p P` ends a step's drafts before one whose joint probability with the
-drafts before it, under the draft head, is below P; `--draft-vocab N` lets the draft head score only the first N token
-ids (a draft outside them is a rejected draft, nothing else). The 27B's example takes 7, 0.3 and 65,536: up to 8
-tokens a step on text that repeats its prompt, fewer where the drafts are unsure.
+The drafts: `--drafts-per-step N` at most a step (an earlier config's `--mtp N` is taken as it, with a warning);
+`--spec-min-p P` ends a step's drafts before one whose joint probability with the drafts before it, under the draft
+head, is below P; `--draft-vocab N` lets the draft head score only the first N token ids (a draft outside them is a
+rejected draft, nothing else). The 27B's example takes 7, 0.3 and 65,536: up to 8 tokens a step on text that repeats
+its prompt, fewer where the drafts are unsure.
 
 With `--second-gpu` (GPUs named as for `--main-gpu`, comma-separated, or `auto`: every other GPU in CUDA's order; the
 examples have `auto`) the path splits the layers over the fewest of those GPUs, in order, that hold the whole model:

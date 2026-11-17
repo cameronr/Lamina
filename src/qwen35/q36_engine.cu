@@ -1045,8 +1045,8 @@ struct Model {
     bool kv_q8 = false;                        // --kv q8_0: K and V in q8_0 rows (kKvQ8Row), else FP16
     /// A KV head's cell of K or V, in bytes
     size_t kv_row() const { return kv_q8 ? (size_t) kKvQ8Row : (size_t) g.head_dim * sizeof(__half); }
-    // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
-    // attention + MoE layer, shared_head_norm, the main head
+    // the GGUF-native MTP block (blk.<n_layers>, drafting with --drafts-per-step): eh_proj over [enorm(e) | hnorm(h)],
+    // then an attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
     Layer mtp;
     Mat eh_proj;
@@ -1337,8 +1337,8 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
     m.layers.resize((size_t) g.n_layers);
-    // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
-    // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
+    // the MTP block whenever the file has one, with or without drafts (--drafts-per-step): the VRAM it takes is then
+    // the same either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on drafts
     (void) want_mtp;
     m.has_mtp = g.n_mtp_layers > 0;
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
@@ -2638,7 +2638,7 @@ struct Engine {
     /// rejected draft and nothing else - the answer is the plain greedy answer whatever draft_n is.  0 = the whole vocabulary.
     int draft_n = 0;
     // --spec-min-p: a draft whose probability under the draft head (p_draft, from head_draft) is below this ends the
-    // step's drafts before it (0: every step makes --mtp drafts)
+    // step's drafts before it (0: every step makes --drafts-per-step drafts)
     float draft_min_p = 0.f;
     float* p_draft = nullptr;
     void head_draft(const float* hn) {
@@ -4364,16 +4364,23 @@ static int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-graph") graph = false;
         else if (a == "--no-warmup") warm = false;
+        else if (a == "--drafts-per-step") mtp_d = std::atoi(next().c_str());   // the GGUF's own MTP block's drafts
         else if (a == "--mtp") {
-            // a number of drafts; Flash-Next's "--mtp <draft layer dir>" means nothing for this family
+            // Flash-Next's draft layer file, which this family has no use for; a number is the earlier releases'
+            // --drafts-per-step, taken with a warning so their configs still start
             const std::string v = next();
-            if (!v.empty() && std::isdigit((unsigned char) v[0])) mtp_d = std::atoi(v.c_str());
-            else std::fprintf(stderr, "lamina: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N "
-                                      "drafts)\n", v.c_str());
+            if (!v.empty() && std::isdigit((unsigned char) v[0])) {
+                mtp_d = std::atoi(v.c_str());
+                std::fprintf(stderr, "lamina: --mtp %s is --drafts-per-step %s on this path (--mtp names Flash-Next's "
+                                     "draft layer)\n", v.c_str(), v.c_str());
+            } else {
+                std::fprintf(stderr, "lamina: ignoring --mtp %s (this family drafts with the GGUF's own MTP block: "
+                                     "--drafts-per-step N)\n", v.c_str());
+            }
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--kv") kv = next();                                        // the K / V cache's format: fp16 or q8_0
-        else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next().c_str());   // drafts while this sure (0: --mtp of them)
+        else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next().c_str());   // drafts while this sure (0: all of them)
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is lamina-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
@@ -4403,7 +4410,7 @@ static int run_engine(int argc, char** argv, bool check_only) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "lamina: --model is required\n"); return 2; }
-    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "lamina: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "lamina: --drafts-per-step takes 0 .. 7\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "lamina: bad --chunk / --max-context\n"); return 2; }
     if (kv != "fp16" && kv != "q8_0") {
         std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n");
@@ -4541,7 +4548,7 @@ static int run_engine(int argc, char** argv, bool check_only) {
         S->draft_min_p = spec_min_p;
     }
     E.bmtp = (batch_mtp || (std::getenv("LAMINA_BATCH_MTP") != nullptr && std::string(std::getenv("LAMINA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
-    if (batch_mtp && !E.bmtp) std::fprintf(stderr, "lamina: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
+    if (batch_mtp && !E.bmtp) std::fprintf(stderr, "lamina: --batch-mtp needs --batch N (2 or more) and --drafts-per-step N: ignored\n");
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
