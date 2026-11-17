@@ -1392,8 +1392,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
             return false;
         }
         if (!K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff)) {
-            err = L(l, "experts are ") + tg->type_name() + "/" + td->type_name() + ", which the native expert kernels " +
-                  "do not take (build with -DLAMINA_Q6K_EXPERTS=ON for Q6_K)";
+            err = L(l, "experts are ") + tg->type_name() + "/" + td->type_name() + ", which the native expert kernels do not take";
             return false;
         }
         y.L = K::native_expert_layout((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
