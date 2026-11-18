@@ -3,6 +3,7 @@
 #include "vision.hpp"
 #include "keepawake.hpp"
 #include "service.hpp"
+#include "dialect.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -743,7 +744,8 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
                         return false;
                     }
                     if (literal_markers && marker_names < kMarkerNames && parser.buf() != kThinkEnd &&
-                        names_stop_marker(tok.decode(raw_ids), parser.state())) {
+                        names_stop_marker(tok.hy4 ? TagTranslator(*tok.hy4).text(tok.decode(raw_ids)) : tok.decode(raw_ids),
+                                          parser.state())) {
                         --n;   // its text comes in plain tokens
                         named_marker = t;
                         return false;
