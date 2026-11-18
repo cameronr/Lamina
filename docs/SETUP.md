@@ -93,8 +93,10 @@ The server builds a config for the file and says in its window what it took:
   Qwen3.8-Flash-Next files take `iq3_s`, the family's other files (unsloth's quants, Agention's Gyro-L) `ud-q4_k_xl`,
   Qwen3.6-35B-A3B's `qwen36-ud-q4_k_xl`, Qwen3.8-27B's `qwen38-27b-ud-q6_k_m`. Its engine options, sampling and port
   (8081 to 8084) are the config's; the model's name in the API is the file's, without the shard number.
-- **The GPU** it runs on: of the cards of the RTX 30 series and newer, the one with the most VRAM that drives no
-  display (the lower number on a tie; `--main-gpu` names another), every other card as `--second-gpu auto` takes it.
+- **The GPUs** ([below](#the-gpus)): the model on the card of the RTX 30 series or newer with the most VRAM that
+  drives no display (the lower number on a tie), every other card an expert tier, as the preset's `"gpu"` (that card,
+  then `auto`) has them; `--gpu NAME` names the main one, `--gpu 0,1` keeps it to those cards (the main one picked
+  among them, the others its tiers).
 - **Flash-Next's draft layer**, `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, beside the model, else beside the server
   ([the README](../README.md#the-draft-layer)).
 - **Pictures**: an image projector made for the model beside it (an `mmproj*.gguf` whose width is the model's; of
@@ -122,9 +124,9 @@ the command line or in a config's `args`, or the file renamed over the quant's t
 **The draft layer.** `download-draft-layer.bat FOLDER` (`./download-draft-layer.sh FOLDER` on Linux; a release's archive
 has its platform's script beside the programs) downloads `Lamina-Qwen3.8-Flash-Next-MTP.gguf` from
 [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) into a folder,
-at a pinned revision, checked by its SHA-256 and a broken download resumed. A config whose `args` name no `--mtp` takes
+at a pinned revision, checked by its SHA-256 and a broken download resumed. A config whose `args` name no `mtp` takes
 `Lamina-Qwen3.8-Flash-Next-MTP.gguf` from beside the model, else from beside the server, and the server's window says
-which; elsewhere the `args` name it: `"--mtp", "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"`. A folder of the layer's
+which; elsewhere the `args` name it: `"mtp": "<folder>/Lamina-Qwen3.8-Flash-Next-MTP.gguf"`. A folder of the layer's
 earlier layout (`dense.txt`, `dense.bin`, `experts.bin`, `draft_vocab.bin`), as earlier versions downloaded it to
 `mtp/rt-distilled`, still works as `--mtp`. Flash-Next's server starts without the layer too, when none is found or the
 named file or folder is not there, and warns in its window with the script's command. It then generates a token a verify
@@ -137,12 +139,16 @@ Every key of a config is an option of the command line too ([USING.md](USING.md#
 takes the place of the config file's, the file's that of the preset: `lamina-server -m MODEL.gguf --port 8090
 --temperature 0.6`. A config file can be as short as `{"model": "D:/Models/x.gguf", "port": 8090}`: without `"args"`
 the server builds the rest from the model's preset, as with `-m`, and the file's keys take the place of the preset's;
-a config with `"args"` stays as it is, `-m` or its `"model"` then naming the file in place of their `--native`. What a
-run writes (the log, the learned profile) goes beside that config file. An engine option on the command line, with the
-values after it, takes the place of the preset's or the config's: `lamina-server -m MODEL.gguf --max-context 65536
---kv q4_0`. The engine's own parser reads those options first, for the model's family, and the server stops on one it
-does not take ("unknown argument: ...", a value out of range); `--native`, `--serve` and `--vision` are the server's to
-set.
+a config with `"args"` (an empty `{}` too) stays as it is, its `"model"` (or `-m`) naming the file. `"args"` holds the
+engine's options that differ from its defaults, as an object of the options without their dashes (`"kv": "k8v4"`, a
+switch `true` or `false`: `"kv-grow": false` is `--no-kv-grow`, a list for several values:
+`"control-vector-layer-range": [4, 44]`) or as a list of words (`"--kv", "k8v4"`). What a run writes (the log, the
+learned profile) goes beside that config file. An engine option on the command line, with the values after it, takes
+the place of the preset's or the config's: `lamina-server -m MODEL.gguf --max-context 65536 --kv q4_0`. The engine's own
+parser reads those options first, for the model's family, and the server stops on one it does not take ("unknown
+argument: ...", a value out of range); `--native`, `--serve` and `--vision` are the server's to set (the model is
+`"model"`, the pictures the `vision` section). `lamina-server --config OLD.json --write-config NEW.json` writes an
+earlier config in this form: its GPUs as cards, its options at the engine's default left out, `"args"` an object.
 
 `--write-config FILE` writes the config the command line runs to FILE (the preset's, the config file's and the command
 line's settings in one) and stops; `lamina-server --config FILE` then runs it, and the web app's Model settings card
@@ -194,17 +200,19 @@ the same way (`toolkit`, `build`, `test`, `package`).
 
 ## The config
 
-A config holds the engine's command line and the server's settings; `--write-config` writes one from a preset
-([above](#a-model-file)). Its keys:
+A config holds the model, its GPUs, the engine's options and the server's settings; `--write-config` writes one from a
+preset ([above](#a-model-file)). Its keys:
 
 | Key | |
 | --- | --- |
-| `args` | the engine's options (below and `build/lamina --help`) |
+| `model` | the model's GGUF (its first shard) |
+| `gpu` | the GPUs as cards in their roles, each with its settings ([below](#the-gpus)) |
+| `args` | the engine's options that differ from its defaults, an object (`"kv": "k8v4"`) or a list of words ([below](#engine-options) and `build/lamina --help`) |
 | `cwd`, `lib_dirs` | the folder the engine runs in, where the config's relative paths start (the folder the server starts in when it has none); on Linux, folders put first on the library path |
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder's files and settings: the projector, the model, `threads` (the CPU's logical cores), or `gpu` and `cuda_device` (the card it runs on, by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does). The encoder itself is the `lamina-vision` in the server's folder |
+| `vision` | the image encoder's files and settings: the projector, the model (by default the config's), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does). The encoder itself is the `lamina-vision` in the server's folder |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):
@@ -220,22 +228,46 @@ to +0.9% on thinking and edits. Remove both keys to start from the shipped profi
 
 ## The GPUs
 
-**`--main-gpu`** names the GPU the model runs on. Nothing else may use it: the engine synchronizes the GPU with its host
-loop through spin-waits, and a display or another program on the same GPU makes the driver time-slice it, which slows
-generation to a few tokens per second. Name it by its name or a part only its name has (`"RTX 3090"`), its UUID or the
-start of it (`nvidia-smi -L` lists them), its PCI bus id, or its number as `nvidia-smi` numbers the GPUs (a number
-moves when a card is added). The engine leaves `--vram-reserve-mib` (default 700) of it free and fills the rest with
-experts (`--expert-cache auto`).
+A config's `"gpu"` names the GPUs in their roles, each with its own settings: the first card runs the model, the others
+hold experts as tiers, in their order (up to three). On the command line `--gpu`, again for each card, its settings
+after its name:
 
-**`--second-gpu auto`** (the examples' setting) makes every other GPU a further expert tier, up to three, the fastest
-link first: a short copy test at the start measures each GPU's rate from the host, and the log shows it. Each tier
-holds the next experts of the profile and of the conversation and computes them beside the CPU; the first one also
+```
+"gpu": ["GPU-75af3083", "RTX 5070 Ti", {"id": "GPU-f26e9ba6", "clocks": "1395-2100/9751", "sleep": "55us"}]
+--gpu GPU-75af3083 --gpu "RTX 5070 Ti" --gpu GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us
+```
+
+A card is named by its name or a part only its name has (`"RTX 3090"`), its UUID or the start of it (`nvidia-smi -L`
+lists them), its PCI bus id, or its number as `nvidia-smi` numbers the GPUs (a number moves when a card is added).
+
+**The first card runs the model.** Nothing else may use it: the engine synchronizes the GPU with its host loop through
+spin-waits, and a display or another program on the same GPU makes the driver time-slice it, which slows generation to
+a few tokens per second. It leaves 700 MiB of its VRAM free and fills the rest with experts.
+
+**The cards after it are expert tiers**; `auto` after the first (the examples' setting) makes every other GPU one, the
+fastest link first: a short copy test at the start measures each GPU's rate from the host, and the log shows it. Each
+tier holds the next experts of the profile and of the conversation and computes them beside the CPU; the first one also
 computes the experts of a prompt that the main GPU lacks and part of the output head. A tier may drive the display: one
-that does keeps 2048 MiB free, a headless one 512 (`--second-gpu-reserve-mib`). To fix the tiers and their order, name
-them: `--second-gpu "RTX 5070 Ti,RTX 5060 Ti"`; `--second-gpu -1` uses none. Only the first tier takes part in
-prompts. The others help generation, where an expert crosses the link once and stays, so a GPU on a slow link (an x1
-or x4 slot) still pays as a later tier. Such a tier gets only short pieces of work, and a driver may lower its clocks
-between them until its results come late: `--second-gpu-clocks` (below) locks them while the engine generates.
+that does keeps 2 GiB free, a headless one 512 MiB. Only the first tier takes part in prompts (and the second with
+`--prompt-tiers 2`). The others help generation, where an expert crosses the link once and stays, so a GPU on a slow
+link (an x1 or x4 slot) still pays as a later tier. Such a tier gets only short pieces of work, and a driver may lower
+its clocks between them until its results come late: its `clocks` lock them while the engine generates.
+
+A card's settings, each optional:
+
+| Setting | |
+| --- | --- |
+| `cache=auto\|SIZE\|N` | its VRAM for experts: `auto` (the default) all but its reserve, or a size (`22G`); the first card's also N expert slots |
+| `reserve=SIZE` | the VRAM it leaves free: the first card 700 MiB; a tier 2 GiB when the desktop uses it, else 512 MiB |
+| `vram-only=SIZE\|auto` | the profile's experts it keeps only in its VRAM, out of the RAM: for a model whose experts outgrow the RAM; `auto` takes as many as keep them within it (the RAM less 4 GiB, and 6 GiB of it left available). The first card and the first two tiers (the second then computes its experts in prompts too); not with `sleep` |
+| `prefetch=SIZE` | a tier: each layer's likeliest experts no GPU holds, copied to it ahead while the RAM is idle (12 MiB over a link of 20 GB/s or more, else none) |
+| `clocks=MIN-MAX/MEM` | a tier: its graphics and memory clocks locked through NVML while the engine generates, in MHz, the card's own (`1395-2100/9751` for an RTX 3090; a memory clock of 0: the driver's); needs administrator rights (root on Linux). `--clocks-hold` and `--clocks-lead` time the locks around a request ([below](#engine-options)) |
+| `sleep=TIME` | a tier after the first: it sleeps (its experts to the CPU, its lock released) while the CPU pool would need less than TIME a layer without it, averaged over a few seconds of generation; trades speed for the card's awake power, TIME by model file (`55us`) |
+
+Sizes are binary (`8G`, `700M`), times have their unit (`55us`, `1.5ms`, `1s`). `"gpu"` as numbers alone (`[0, 1]`,
+`--gpu 0,1`) keeps its earlier meaning: the cards the engine sees, the first its main one. An earlier config's
+`--main-gpu`, `--second-gpu` and per-tier lists (`--second-gpu-clocks 0,1395-2100/9751`: a value per tier in their
+order) still work, a card's own setting winning over them.
 
 **Each GPU is checked** before the engine uses it: one older than the RTX 30 series (compute capability below 8.0), or
 one the programs have no kernels for, stops the start as the main GPU and is left out as a tier or a layer split's GPU,
@@ -244,32 +276,30 @@ programs run on the RTX 30, 40 and 50 series.
 
 ## Engine options
 
-The example configs' options, and the ones that pay on some PCs. `build/lamina --help` lists every one.
+The engine's defaults are the examples' values: a config's `args` holds what differs. The options the examples set, and
+the ones that pay on some PCs; `build/lamina --help` lists the common ones, `--help-all` every one.
 
 | Option | |
 | --- | --- |
-| `--max-context N` | the context the K/V is sized for (the examples: 262,144, the trained context) |
-| `--kv-grow` | the K/V takes VRAM only for the cells the requests reach; the expert cache holds the rest and gives it back as a conversation grows |
+| `--max-context N` | the context the K/V is sized for (by default under `--serve` 262,144, the trained context) |
+| `--kv-grow` | the default: the K/V takes VRAM only for the cells the requests reach; the expert cache holds the rest and gives it back as a conversation grows (`--no-kv-grow`: the whole context at start) |
 | `--kv fp16\|int8\|k8v4\|q4_0` | the K/V's format: 8-bit (`int8`), 8-bit keys and 4-bit values (`k8v4`), 4-bit both; smaller formats leave more VRAM to experts, at a cost in precision |
-| `--spec T`, `--spec-min-p P`, `--spec-lookup N` | verify windows of up to T tokens (the last one and T-1 drafts), a draft kept while its probability under the draft layer stays above P (a sampled request's by the number its position is drawn with: [HOW_IT_WORKS.md](HOW_IT_WORKS.md#drafts)), and drafts from earlier text that repeats (16 tokens of it) |
-| `--prefill N` | the prompt chunk (the examples: 16,384 tokens) |
-| `--feed-max N` | prompt parts of up to N tokens go through verify windows instead of the prompt path |
-| `--hc-q8` | the hyper-connection projections in 8 bits only: half their VRAM, read ~30% faster |
+| `--spec T`, `--spec-min-p P`, `--spec-lookup N` | verify windows of up to T tokens (the last one and T-1 drafts), a draft kept while its probability under the draft layer stays above P (a sampled request's by the number its position is drawn with: [HOW_IT_WORKS.md](HOW_IT_WORKS.md#drafts)), and drafts from earlier text that repeats (16 tokens of it); 4, 0.5 and 16 by default |
+| `--prefill N` | the prompt chunk (by default 16,384 tokens, halved until its buffers fit the caches' lendable slots) |
+| `--feed-max N` | prompt parts of up to N tokens go through verify windows instead of the prompt path (46 by default) |
+| `--hc-q8` | the default: the hyper-connection projections in 8 bits only, half their VRAM, read ~30% faster (`--no-hc-q8`: BF16) |
 | `--prompt-shift F` | on a second GPU, a share of the experts the main GPU holds is computed beside it in long prompts |
-| `--pcie-mode kernel --pcie-frac 0` | the experts no GPU holds are all computed by the CPU, none read by the main GPU over its link (the examples' setting) |
+| `--pcie-frac F`, `--pcie-mode M` | 0 by default: the experts no GPU holds are all computed by the CPU, none read by the main GPU over its link (over an x4 link the CPU is sooner); a share F of them read over it otherwise (`kernel`, the default mode: a copy kernel in the window's graph) |
 | `--prompt-split L[,M]` | off by default: a prompt of more than one chunk runs in two stages, the second GPU taking each chunk's layers L and up while the main GPU runs the next chunk; `L,M` with two or more tiers: three stages, the tier after the first taking the layers L to M-1 (with one tier: two stages, split halfway between L and M) |
 | `--prompt-split-from N` | off by default: with `--prompt-split`, a prompt part of N tokens or more that fits one chunk is read as two chunks of half its size through the stages (a shorter one runs on the main GPU's stage alone) |
 | `--prompt-tiers 2` | off by default: with two or more tiers, the tier after the first computes the experts it holds in prompts too, where they otherwise stream to the first tier |
 | `--arena-place` | off by default: for RAM with slower regions (unpaired DIMMs), the experts the CPU reads are kept out of them |
 | `--no-file-cache` | off by default: the experts are read past the OS file cache, which then holds no second copy of the model |
-| `--second-gpu-clocks C[,..]` | off by default: per tier, its graphics and memory clocks locked through NVML while the engine generates, `<graphics min>-<graphics max>/<memory>` in MHz, the card's own (`0`: that tier's stay the driver's); needs administrator rights (root on Linux) |
+| `--clocks-hold TIME` | with a card's `clocks` under `--serve`: the locks stay this long after a request (`5s` by default); a locked card draws its awake power until then |
+| `--clocks-lead TIME` | off by default (the locks are asked for from a batched prompt part's last chunk on): they are asked for this long before the part ends, by its progress; a lock is at speed ~0.6 s after it is asked for |
 
-| `--second-gpu-clocks-hold S` | with `--second-gpu-clocks` under `--serve`: the locks stay S seconds after a request (5 by default); a locked card draws its awake power until then |
-| `--second-gpu-clocks-lead S` | off by default (the locks are asked for from a batched prompt part's last chunk on): they are asked for S seconds before the part ends, by its progress; a lock is at speed ~0.6 s after it is asked for |
-| `--second-gpu-sleep-us T[,..]` | off by default: per tier after the first, the tier sleeps (its experts to the CPU, its lock released) while the CPU pool would need less than T microseconds a layer without it, averaged over a few seconds of generation; trades speed for the card's awake power, T by model file |
-
-The last nine are measured on the development PC in [examples/](../examples/README.md); measure them on yours before
-keeping them.
+The options off by default, and the cards' `clocks` and `sleep`, are measured on the development PC in
+[examples/](../examples/README.md); measure them on yours before keeping them.
 
 ## Control vectors
 
@@ -292,8 +322,8 @@ each layer writes, v2 inverts it at 1.78 times that). In a config's `args`, as S
 own vector:
 
 ```
-"--control-vector-scaled", "<folder>/Huihui-Qwen3.8-Flash-Next-refusal-direction-r-v2.gguf:1.0",
-"--control-vector-layer-range", "4", "44", "--cvec-mode", "project"
+"control-vector-scaled": "<folder>/Huihui-Qwen3.8-Flash-Next-refusal-direction-r-v2.gguf:1.0",
+"control-vector-layer-range": [4, 44], "cvec-mode": "project"
 ```
 
 On the development PC, IQ3_S declined none of eight requests that it declined every one of without it, and began four
@@ -306,7 +336,7 @@ The vector holds for every request of the process: Strata's per-request switch i
 
 The engine runs Qwen3.6-35B-A3B (GGUF architecture `qwen35moe`) and Qwen3.8-27B (`qwen35`, a dense model of the same
 family) on a path of its own (`src/qwen35`): `lamina` switches to it from the model file's header, so their configs
-name the file with `--native` like the others. It reads the GGUF as it is (no expert profile; the drafts come from the
+name the file with `"model"` like the others. It reads the GGUF as it is (no expert profile; the drafts come from the
 file's own MTP block). K and V are fp16 (~22 KB a cell for Qwen3.6, ~68 KB for the 27B), or with `--kv q8_0` 8 bits
 in llama.cpp's q8_0 rounding, about half: the 27B's full 262,144 cells then take ~9 GiB.
 
@@ -316,8 +346,9 @@ head, is below P; `--draft-vocab N` lets the draft head score only the first N t
 rejected draft, nothing else). The 27B's example takes 7, 0.3 and 65,536: up to 8 tokens a step on text that repeats
 its prompt, fewer where the drafts are unsure.
 
-With `--second-gpu` (GPUs named as for `--main-gpu`, comma-separated, or `auto`: every other GPU in CUDA's order; the
-examples have `auto`) the path splits the layers over the fewest of those GPUs, in order, that hold the whole model:
+With more cards than one in `"gpu"` (named as above, or `auto` after the first: every other GPU in CUDA's order; the
+examples have the main GPU, then `auto`) the path splits the layers over the fewest of those GPUs, in order, that hold
+the whole model (their settings are the Flash-Next path's: this one sizes its own):
 each takes the layers that fit beside their K/V and its buffers, the last the rest with the output head and the MTP
 block, and each pass hands its activations from one GPU to the next. `--layer-split N,N,..` sets each GPU's layer
 count. A prompt of several chunks (`--prefill`, the 27B's example 1,536 tokens) runs on the GPUs at once: the first

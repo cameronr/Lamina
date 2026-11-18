@@ -310,7 +310,7 @@ minutes. llama-swap passes the client's `Host` through: without an API key, add 
 
 ## Replicas
 
-`"replicas": N` with a `"gpu"` list cuts the GPUs into N groups and runs one engine on each, the requests spread over
+`"replicas": N` with a `"gpu"` list of numbers cuts the GPUs into N groups and runs one engine on each, the requests spread over
 them (or `"replicas": [{"gpus": [0, 1]}, {"gpus": [2, 3]}]`). Each engine pins its own experts in RAM.
 
 ## From other devices
@@ -364,12 +364,14 @@ alone: `--config`, `--write-config`, `--check`, `--help` and `--version` (`-v`).
 | `mcp_servers`, `images`, `replicas`, `parallel` | MCP tools, image generation, replicas; `parallel`: the batch slots of Qwen3.6 and Qwen3.8-27B (`--batch`, one GPU) |
 | `api_monitor`, `open_browser`, `prevent_sleep` | the request monitor at `/api-monitor` (the last 100 prompts and answers in memory); a browser at the start; Windows awake while busy |
 | `max_queue`, `queue_timeout`, `shutdown_timeout`, `offline`, `ready_file`, `mcp_config` | the calls that may wait and for how long; the time running requests get at a stop; no network sources; an instance record for a supervisor; MCP servers from a file |
-| `model`, `vision`, `model_name`, `arch`, `log`, `cwd`, `env`, `lib_dirs`, `gpu`, `replica_cpus`, `replica_load_tokens` | the model and its pictures, its name in the API, the engine's log, folder, environment and GPUs, the replicas' CPUs and routing ([SETUP.md](SETUP.md#the-config)) |
+| `model`, `vision`, `model_name`, `arch`, `log`, `cwd`, `env`, `lib_dirs`, `replica_cpus`, `replica_load_tokens` | the model and its pictures, its name in the API, the engine's log, folder and environment, the replicas' CPUs and routing ([SETUP.md](SETUP.md#the-config)) |
+| `gpu`, `args` | the GPUs as cards in their roles, each with its settings ([SETUP.md](SETUP.md#the-gpus)); the engine's options that differ from its defaults, an object or a list ([SETUP.md](SETUP.md#a-model-file)) |
 
 The web app's Model settings card shows the values the server runs with (the command line's over the config file's
 over the preset's, each set on the command line marked so) of `sampling` (`temperature`, `top_p`, `top_k`, `min_p`),
 `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
-`lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and the engine's `--vram-reserve-mib`.
+`lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and the engine's `--vram-reserve-mib` (the main
+GPU's reserve; a card's own `reserve` in `"gpu"` wins over it).
 
 - **Apply** changes them for the running server, at once. `effort_position`, `lazy_load`, `open_browser` and
   `--vram-reserve-mib` are read when the server starts (marked *at start-up*): a change to them waits for the next

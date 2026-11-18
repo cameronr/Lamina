@@ -24,7 +24,7 @@ RTX 5070 Ti and an RTX 5060 Ti as tiers, Ryzen 7 9700X, DDR5-5600.
 - **The main GPU** runs everything each token passes through: the DeltaNet and attention layers, the hyper-connection
   mixes, the routers, the shared experts, the output head, the draft layer, the K/V cache of the attention layers and
   the DeltaNet states. The rest of its VRAM holds experts: on a 24 GB GPU about 9,200 of IQ3_S's, 5,600 of UD-Q4_K_XL's.
-- **Further GPUs** (`--second-gpu`) hold the next experts in line, about 6,300 and 7,500 of IQ3_S's on the two 16 GB
+- **Further GPUs** (the cards after the first in `"gpu"`) hold the next experts in line, about 6,300 and 7,500 of IQ3_S's on the two 16 GB
   tiers, and compute them in each pass beside the CPU.
 - **RAM** holds every expert, in one pinned block per layer that the GPUs can copy from. The CPU computes the experts
   no GPU holds, where they lie: a pool of worker threads, one per physical core but the one that drives the GPUs, with
@@ -70,9 +70,8 @@ the hand-offs cost microseconds. It is also why nothing else may use that GPU: a
 driver share it in time slices, and a spin that loses its slice stalls the pass.
 
 A tier after the first gets only these short shares, and a driver may slow its card between them until its rows come
-late. `--second-gpu-clocks` locks a tier's clocks while the engine generates, `--second-gpu-clocks-hold` and
-`--second-gpu-clocks-lead` time that lock around a request, and `--second-gpu-sleep-us` lets such a tier sleep while
-the CPU pool would not need it: its experts go to the tiers before it and the CPU, its lock is released, and it comes
+late. A card's `clocks` lock a tier's clocks while the engine generates, `--clocks-hold` and `--clocks-lead` time
+that lock around a request, and its `sleep` lets such a tier sleep while the CPU pool would not need it: its experts go to the tiers before it and the CPU, its lock is released, and it comes
 back when the text turns heavy. Each is off unless a config sets it: the clocks are a card's own, and the sleep gives
 up speed for power by an amount that is the model file's and the PC's ([examples/](../examples/README.md)).
 
@@ -188,8 +187,8 @@ independent of where each expert is computed.
 ## Qwen3.6-35B-A3B and Qwen3.8-27B
 
 Qwen3.6-35B-A3B and Qwen3.8-27B, a dense model of the same family, run on a path of their own (`src/qwen35`), chosen
-from the model file's header. It reads the GGUF as it is and drafts with the file's own MTP layer. With `--second-gpu`
-it splits the layers over the fewest GPUs that hold the whole model, each running its layers and handing the
+from the model file's header. It reads the GGUF as it is and drafts with the file's own MTP layer. With more cards
+than one in `"gpu"` it splits the layers over the fewest GPUs that hold the whole model, each running its layers and handing the
 activations to the next; where none do, or on one GPU, it keeps every expert that fits in VRAM and computes the rest on
 the CPU. With the config's `parallel` it runs several requests at once on one GPU
 ([SETUP.md](SETUP.md#qwen36-35b-a3b-and-qwen38-27b)).

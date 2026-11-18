@@ -1803,6 +1803,47 @@ int lamina::program::check_args(int argc, char** argv) {
     return parse_options(argc, argv, o, help, false);
 }
 
+const char* lamina::program::option_default(const char* flag) {
+    static const std::vector<std::pair<std::string, std::string>> table = [] {
+        const Options o;   // the defaults (--max-context: --serve's)
+        auto num = [](double v) {
+            char b[32];
+            std::snprintf(b, sizeof b, "%g", v);
+            return std::string(b);
+        };
+        auto on = [](bool b) { return std::string(b ? "on" : "off"); };
+        return std::vector<std::pair<std::string, std::string>>{
+            {"--expert-cache", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache)},
+            {"--prefill", std::to_string(o.prefill_chunk)},
+            {"--spec", std::to_string(o.spec)},
+            {"--spec-min-p", num(o.spec_min_p)},
+            {"--spec-lookup", std::to_string(o.spec_lookup)},
+            {"--adapt-every", std::to_string(o.adapt_every)},
+            {"--adapt-swaps", std::to_string(o.adapt_swaps)},
+            {"--adapt-decay", num(o.adapt_decay)},
+            {"--feed-max", std::to_string(o.feed_max)},
+            {"--pcie-frac", num(o.pcie_frac)},
+            {"--pcie-mode", o.pcie_mode},
+            {"--max-context", std::to_string(kTrainedContext)},
+            {"--kv", o.kv},
+            {"--head-split", num(o.head_split)},
+            {"--prompt-shift", num(o.prompt_shift)},
+            {"--prompt-tiers", num(o.prompt_tiers)},
+            {"--prompt-cache", std::to_string(o.prompt_cache)},
+            {"--mtp-window", std::to_string(o.mtp_window)},
+            {"--vram-reserve-mib", std::to_string(o.vram_reserve_mib)},
+            {"--kv-grow", on(o.kv_grow)},
+            {"--hc-q8", on(o.hc_q8)},
+            {"--arena-place", on(o.arena_place)},
+            {"--no-file-cache", on(o.no_file_cache)},
+            {"--deterministic-adapt", on(o.deterministic_adapt)},
+        };
+    }();
+    for (const auto& [f, v] : table)
+        if (f == flag) return v.c_str();
+    return "";
+}
+
 int lamina::program::run(int argc, char** argv) {
     // device ordinals in nvidia-smi's order, not CUDA's fastest-first guess (before the first CUDA call)
     if (std::getenv("CUDA_DEVICE_ORDER") == nullptr) {

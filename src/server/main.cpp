@@ -233,7 +233,7 @@ void say_main_gpu(const json& cfg, const std::vector<GpuInfo>& gpus) {
     const std::vector<int> on = engine_gpus(cfg, gpus);
     for (const GpuInfo& g : gpus)
         if (!on.empty() && g.index == on.front())
-            say("[lamina] it runs on GPU " + std::to_string(g.index) + ", " + g.name + " (--main-gpu names another)");
+            say("[lamina] it runs on GPU " + std::to_string(g.index) + ", " + g.name + " (--gpu names another)");
 }
 
 /// a model the file or the command line names for a config with its own engine options: in place of their --native,
@@ -274,6 +274,16 @@ void settle_vision(json& cfg) {
 /// a vision section that asks for a GPU and names none: the card pick_vision_gpu chooses, by its UUID, said in the
 /// window (the encoder would otherwise see every card and take CUDA's first)
 void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
+    // "gpu" naming a card (a name, a UUID's start, a PCI bus id, a number): the encoder on it, by its UUID
+    if (const json& g = jget(jget(cfg, "vision"), "gpu"); g.is_string() && !strip(g.get<std::string>()).empty()) {
+        if (gpus.empty()) gpus = nvidia_gpus();
+        std::string why;
+        const int i = find_gpu(g.get<std::string>(), gpus, &why);
+        if (i < 0) usage_error("vision.gpu " + g.get<std::string>() + ": " + why);
+        for (const GpuInfo& x : gpus)
+            if (x.index == i) cfg["vision"]["cuda_device"] = x.uuid;
+        cfg["vision"]["gpu"] = true;
+    }
     const json& v = jget(cfg, "vision");
     const json& dev = jget(v, "cuda_device");
     const bool named = !dev.is_null() && !(dev.is_string() && strip(dev.get<std::string>()).empty());
@@ -406,6 +416,8 @@ int run(int argc, char** argv) {
         }
         merge_settings(cfg, file_cfg);
         merge_settings(cfg, cl.settings);
+        // -m with "gpu" numbers (the cards it may use): the preset's cards as config_from_model picked them among those
+        if (from_preset && !gpu_list(cfg).empty() && gpu_cards(preset_base)) cfg["gpu"] = preset_base["gpu"];
         if (!from_preset && !model.empty()) use_model(cfg, model);
     } catch (const ConfigError& e) {
         if (cl.check) return check_report(nullptr, gpus, "", e.what()) ? 0 : 1;
@@ -425,8 +437,15 @@ int run(int argc, char** argv) {
     }
     settle_vision_gpu(cfg, gpus);
     if (!cl.write_config.empty()) {
-        json out = cfg;
-        if (jget(out, "args").is_array()) out.erase("model");   // the args name it
+        json out;
+        try {   // the form a config is written in now: its cards, its options past the engine's defaults, an object
+            std::string arch = model_arch;
+            if (arch.empty()) arch = read_model(model_file(cfg)).arch;
+            out = modern_config(cfg, arch == "qwen4exp");
+        } catch (const std::exception& e) {
+            say_err(std::string("[lamina] ") + e.what());
+            return 1;
+        }
         try {
             const std::vector<std::string> kept = write_config(cl.write_config, out, preset_keys);
             json probe = cfg;   // the draft layer as a start would find it

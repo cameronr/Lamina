@@ -1,6 +1,8 @@
 // src/server/params.cpp - lamina-server's settings table and command line (params.hpp).
 #include "params.hpp"
 
+#include "config.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -37,7 +39,11 @@ const std::vector<Param> kParams = {
     {"--chat-template-file", "", "chat_template_file", K::Path, "FILE", "a chat template in place of the model file's"},
 
     {"", "", "", K::Str, "", "The engine"},
-    {"--gpu", "", "gpu", K::Value, "N[,M]", "the GPU(s) the engine sees, as nvidia-smi numbers them"},
+    {"--gpu", "", "gpu", K::Many, "CARD",
+     "a GPU the engine uses, again for each: the first runs the model, the others hold experts (a name only one card "
+     "has, a UUID's start, a PCI bus id, a number or auto, then its settings: cache=, reserve=, vram-only=, prefetch=, "
+     "clocks=, sleep=; lamina --help says them); numbers alone (0,1): the cards the engine sees, as nvidia-smi "
+     "numbers them"},
     {"--parallel", "", "parallel", K::Int, "N", "requests decoding together in the engine's batch slots"},
     {"--replicas", "", "replicas", K::Value, "N|JSON",
      "data-parallel replicas: the gpu list cut into N groups, or [{\"gpus\": [0, 1]}, ...], one engine each"},
@@ -427,6 +433,7 @@ CommandLine parse_command_line(int argc, char** argv) {
         }
         throw std::invalid_argument("unrecognized arguments: " + std::string(argv[i]));
     }
+    if (json* g = setting_at(cl.settings, "gpu")) *g = gpu_canonical(*g);   // --gpu 0,2: [0, 2]; cards: one item each
     return cl;
 }
 

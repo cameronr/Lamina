@@ -105,6 +105,7 @@ json preset(const std::string& name) {
     json cfg;
     if (f == nullptr || !py_loads(f->data, cfg) || !cfg.is_object())
         throw std::runtime_error("this build holds no preset " + name + " (examples/" + name + ".json)");
+    args_to_list(cfg);
     return cfg;
 }
 
@@ -247,7 +248,8 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
 
     json args = json::array();
     const json& pa = jget(p, "args");
-    bool main_named = false;
+    const std::optional<std::vector<std::string>> preset_cards = gpu_cards(p);
+    bool main_named = preset_cards.has_value();   // the cards name it (below)
     for (size_t i = 0; pa.is_array() && i < pa.size(); ++i) {
         const std::string a = str_of(pa[i]);
         if (a == "--native" && i + 1 < pa.size()) {
@@ -274,6 +276,24 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
         args.push_back("--main-gpu");
         args.push_back(gpu_spec(gpus[(size_t) main_gpu], gpus));
     }
+    // the preset's cards: the first the main GPU picked here (its settings kept), the others the preset's, or with
+    // "gpu" numbers given (the cards it may use) the others of those, in their order
+    json cards = json::array();
+    if (preset_cards && !preset_cards->empty()) {
+        const std::string& first = preset_cards->front();
+        const size_t comma = first.find(',');
+        // (none picked: the engine starts on its GPU 0, as the note says)
+        cards.push_back((main_gpu >= 0 ? gpu_spec(gpus[(size_t) main_gpu], gpus) : std::string("0")) +
+                        (comma == std::string::npos ? "" : first.substr(comma)));
+        if (!o.allowed_gpus.empty()) {
+            for (const int g : o.allowed_gpus)
+                if (main_gpu < 0 || g != gpus[(size_t) main_gpu].index)
+                    for (const GpuInfo& gi : gpus)
+                        if (gi.index == g) cards.push_back(gpu_spec(gi, gpus));
+        } else {
+            for (size_t i = 1; i < preset_cards->size(); ++i) cards.push_back((*preset_cards)[i]);
+        }
+    }
 
     json& cfg = mc.cfg;
     cfg = json::object();
@@ -282,6 +302,10 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
         mc.preset_keys.push_back(k);
         if (k == "args") {
             cfg[k] = args;
+        } else if (k == "model") {
+            cfg[k] = m.path;
+        } else if (k == "gpu" && preset_cards) {
+            cfg[k] = cards;
         } else if (k == "cwd" || k == "lib_dirs") {   // the paths are absolute; the release finds its CUDA runtime itself
         } else if (k == "model_name") {
             cfg[k] = name;
@@ -395,6 +419,16 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
             const bool flash = m.arch == "qwen4exp";
             if (main != nullptr)
                 say("  runs on " + gpu_line(*main) + (more.empty() ? "" : (flash ? ", expert tiers: " : ", a layer split may add: ") + more));
+            // each card's own settings (--gpu NAME,key=value)
+            for (const std::string& card : engine_cards(c)) {
+                const size_t comma = card.find(',');
+                if (comma == std::string::npos) continue;
+                const std::string name(strip(card.substr(0, comma)));
+                const int i = name == "auto" ? -1 : find_gpu(name, gpus);
+                const GpuInfo* g = i < 0 ? nullptr : gpu_by_index(gpus, i);
+                say("  " + (g != nullptr ? gpu_line(*g) : name) + ": " + replace_all(card.substr(comma + 1), ",", ", ") +
+                    (flash ? "" : " (this model's path takes the cards' order alone)"));
+            }
             // what it takes
             if (flash) {
                 const platform::RamFit ram = platform::ram_fit(m.expert_bytes);
@@ -437,7 +471,7 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
                                                                                               : str_of(v["threads"])) +
                                                   " threads)"));
             }
-            std::string ctx = "4096";   // the engine's default
+            std::string ctx = flash ? "262144" : "32768";   // the engine's default under --serve, each path's
             const std::vector<std::string> args = engine_args(c);
             for (size_t i = 0; i + 1 < args.size(); ++i)
                 if (args[i] == "--max-context") ctx = args[i + 1];

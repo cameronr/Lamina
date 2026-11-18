@@ -4,6 +4,8 @@
 // <name>.bak). Paths are read as pathlib reads them, and the messages quote values with Python's repr().
 #include "runconfig.hpp"
 
+#include "config.hpp"
+
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
@@ -585,10 +587,23 @@ std::string save(const std::string& path, const json& cfg) {
 #endif
         throw RequestError(std::string(kPathClass) + "(" + py_repr_str(posix) + ") has an empty name");
     }
+    // "args" in the file's form: a list into an object when the file has one
+    json out = cfg;
+    if (jget(out, "args").is_array()) {
+        json was;
+        std::string text;
+        try {
+            text = read_file(target);
+        } catch (const std::exception&) {
+        }
+        if (starts_with(text, "\xEF\xBB\xBF")) text.erase(0, 3);
+        if (py_loads(text, was) && jget(was, "args").is_object())
+            if (const std::optional<json> obj = args_as_object(out["args"])) out["args"] = *obj;
+    }
     const std::string bak = with_name(pp, pp.tail.back() + ".bak");
     copy_file(target, bak);
     const std::string tmp = with_name(pp, pp.tail.back() + ".tmp");
-    write_text(tmp, py_dumps(cfg, true, false, 2) + "\n");   // the form --write-config writes: LF, a final line end
+    write_text(tmp, py_dumps(out, true, false, 2) + "\n");   // the form --write-config writes: LF, a final line end
     replace_file(tmp, target);
     return bak;
 }
@@ -604,6 +619,7 @@ json load(const std::string& path) {
     std::string err;
     if (!py_loads(text, cfg, &err)) throw RequestError(err);   // the parser's words, not CPython's json module's
     if (!cfg.is_object()) throw RequestError(path_name(pp) + " is not a JSON object");
+    args_to_list(cfg);
     return cfg;
 }
 

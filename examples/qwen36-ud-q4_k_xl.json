@@ -1,19 +1,13 @@
 {
-  "args": [
-    "--native",
-    "../Lamina-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
-    "--main-gpu",
+  "model": "../Lamina-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "gpu": [
     "RTX 3090",
-    "--second-gpu",
-    "auto",
-    "--max-context",
-    "65536",
-    "--prefill",
-    "auto",
-    "--drafts-per-step",
-    "2",
-    "--vision"
+    "auto"
   ],
+  "args": {
+    "max-context": 65536,
+    "drafts-per-step": 2
+  },
   "cwd": ".",
   "model_name": "qwen3.6-35b-a3b-ud-q4_k_xl",
   "port": 8083,
@@ -28,7 +22,6 @@
   "lib_dirs": [],
   "vision": {
     "mmproj": "../Lamina-data/models/qwen36-UD-Q4_K_XL/mmproj-F16.gguf",
-    "model": "../Lamina-data/models/qwen36-UD-Q4_K_XL/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
     "gpu": false,
     "threads": 16,
     "max_tokens": 1024

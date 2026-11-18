@@ -102,8 +102,9 @@ int main() {
     CHECK(lamina::preset_name("llama", "Unsloth").empty());
     for (const char* name : {"iq3_s", "ud-q4_k_xl", "qwen36-ud-q4_k_xl", "qwen38-27b-ud-q6_k_m"}) {
         const json p = lamina::preset(name);   // built in from examples/
-        const std::vector<std::string> a = args(p);
-        CHECK(std::find(a.begin(), a.end(), "--native") != a.end());
+        CHECK(!lamina::model_file(p).empty() && lamina::gpu_cards(p).has_value());   // "model", the "gpu" cards
+        const std::vector<std::string> a = lamina::engine_args(p);
+        CHECK(std::find(a.begin(), a.end(), "--native") != a.end() && std::find(a.begin(), a.end(), "--gpu") != a.end());
         CHECK(p["port"].is_number_integer());
     }
 
@@ -222,6 +223,72 @@ int main() {
         CHECK(lamina::py_loads(std::string((std::istreambuf_iterator<char>(f)), {}), third));
     }
     CHECK(!third.contains("vision") && !third.contains("port") && third["api_key"] == "secret");
+
+    // "args" as an object of flags: the engine's words in its order, and back (a list it cannot say stays a list)
+    {
+        const json obj = {{"kv", "k8v4"}, {"prompt-split", 26}, {"arena-place", true}, {"hc-q8", false},
+                          {"control-vector-layer-range", {4, 44}}, {"spec-min-p", 0.5}, {"mtp", nullptr}};
+        const json words = {"--kv", "k8v4", "--prompt-split", "26", "--arena-place", "--no-hc-q8",
+                            "--control-vector-layer-range", "4", "44", "--spec-min-p", "0.5"};
+        CHECK(lamina::args_as_list(obj) == words);
+        json back = obj;
+        back.erase("mtp");
+        CHECK(lamina::args_as_object(words) == back);
+        CHECK(!lamina::args_as_object(json{"--kv", "int8", "--kv", "k8v4"}) && !lamina::args_as_object(json{"x", "--kv"}));
+        json c = {{"args", obj}};
+        lamina::args_to_list(c);
+        CHECK(c["args"] == words);
+    }
+    // "gpu": cards (names, objects of "id" and settings) or the earlier numbers; engine_args puts a --gpu each in place
+    // of the args' own GPU names
+    {
+        const json cfg = {{"gpu", {"GPU-75af3083", "RTX 5070 Ti", {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"},
+                                                                  {"sleep", "55us"}}}},
+                          {"args", {"--native", "m.gguf", "--main-gpu", "0", "--kv", "int8"}}};
+        CHECK((lamina::gpu_cards(cfg) == std::vector<std::string>{"GPU-75af3083", "RTX 5070 Ti",
+                                                                  "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
+        CHECK(lamina::gpu_list(cfg).empty() && (lamina::gpu_list({{"gpu", "0,2"}}) == std::vector<int>{0, 2}) &&
+              !lamina::gpu_cards({{"gpu", {0, 2}}}));
+        CHECK((lamina::engine_args(cfg) ==
+               std::vector<std::string>{"--native", "m.gguf", "--kv", "int8", "--gpu", "GPU-75af3083", "--gpu",
+                                        "RTX 5070 Ti", "--gpu", "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
+        bool refused = false;
+        try {
+            (void) lamina::gpu_cards({{"gpu", {{{"id", "RTX 3090"}, {"reserve", 2048}}}}});   // a size without its unit
+        } catch (const lamina::ConfigError&) {
+            refused = true;
+        }
+        CHECK(refused);
+    }
+    // the form --write-config writes: the older GPU flags as cards, the other older names renamed, the options at the
+    // engine's default left out, --native as "model", "args" an object
+    {
+        const json old = {{"args", {"--native", "m.gguf", "--expert-cache", "auto", "--prefill", "16384", "--spec", "4",
+                                    "--spec-min-p", "0.5", "--adapt-every", "1", "--max-context", "262144", "--kv", "k8v4",
+                                    "--kv-grow", "--hc-q8", "--arena-place", "--pcie-mode", "kernel", "--pcie-frac", "0",
+                                    "--second-gpu", "RTX 5070 Ti,GPU-f26e9ba6", "--second-gpu-clocks", "0,1395-2100/9751",
+                                    "--second-gpu-clocks-hold", "1", "--second-gpu-clocks-lead", "1.0",
+                                    "--second-gpu-sleep-us", "0,55", "--main-gpu", "GPU-75af3083", "--prompt-split", "26"}},
+                          {"port", 8081}};
+        const json m = lamina::modern_config(old, true);
+        CHECK(m["model"] == "m.gguf");
+        CHECK((m["gpu"] == json{"GPU-75af3083", "RTX 5070 Ti",
+                                {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"}, {"sleep", "55us"}}}));
+        CHECK((m["args"] == json{{"kv", "k8v4"}, {"arena-place", true}, {"clocks-hold", "1s"}, {"clocks-lead", "1s"},
+                                 {"prompt-split", 26}}));
+        CHECK(m["port"] == 8081 && m.begin().key() == "model");
+        // the engine reads the same: the cards, the renamed options
+        const std::vector<std::string> e = lamina::engine_args(m);
+        CHECK(std::find(e.begin(), e.end(), "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us") != e.end() &&
+              std::find(e.begin(), e.end(), "--clocks-lead") != e.end());
+        // another model's path keeps its options (its defaults are its own), and an auto tier its per-tier lists
+        const json q = lamina::modern_config({{"args", {"--native", "q.gguf", "--max-context", "262144", "--second-gpu",
+                                                        "auto", "--second-gpu-gib", "20"}}}, false);
+        CHECK(q["args"]["max-context"] == 262144 && q["args"]["second-gpu"] == "auto" && !q.contains("gpu"));
+        // nothing left: an empty object, not none (a config without "args" is the preset's)
+        const json e2 = lamina::modern_config({{"args", {"--native", "m.gguf", "--spec", "4"}}}, true);
+        CHECK(e2["args"].is_object() && e2["args"].empty());
+    }
 
     fs::remove_all(dir, ec);
     if (fails == 0) std::printf("model_config_test: ok\n");

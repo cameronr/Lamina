@@ -4,6 +4,8 @@
 #include "lamina/artifact/draft_layer.hpp"
 #include "lamina/core/expert_cache.hpp"
 #include "lamina/core/gpu_select.hpp"
+#include "lamina/program/engine.hpp"
+#include "lamina/program/gpu_cards.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -32,8 +34,7 @@ std::string arg_str(const json& a) { return a.is_string() ? a.get<std::string>()
 
 std::vector<std::string> args_of(const json& cfg) {
     std::vector<std::string> out;
-    if (jget(cfg, "args").is_array())
-        for (const auto& a : cfg["args"]) out.push_back(arg_str(a));
+    for (const auto& a : args_as_list(jget(cfg, "args"))) out.push_back(arg_str(a));
     return out;
 }
 
@@ -81,7 +82,67 @@ json read_config(const std::string& path) {
                           "option and each value is its own quoted entry, e.g. \"--ple-io\", \"mmap\",) and that no entry is "
                           "followed by a comma at the end of a list.");
     if (!cfg.is_object()) throw ConfigError(path + " is not a JSON object");
+    args_to_list(cfg);
     return cfg;
+}
+
+json args_as_list(const json& args) {
+    json out = json::array();
+    if (args.is_array()) return args;
+    if (!args.is_object()) return out;
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        const json& v = it.value();
+        if (v.is_null()) continue;
+        if (v.is_boolean()) {
+            out.push_back((v.get<bool>() ? "--" : "--no-") + it.key());
+            continue;
+        }
+        out.push_back("--" + it.key());
+        if (v.is_array())
+            for (const json& x : v) out.push_back(arg_str(x));
+        else
+            out.push_back(arg_str(v));
+    }
+    return out;
+}
+
+std::optional<json> args_as_object(const json& args) {
+    if (!args.is_array()) return std::nullopt;
+    auto flag = [](const std::string& s) { return s.size() > 2 && starts_with(s, "--"); };
+    auto value = [](const std::string& s) -> json {   // a number when the text is one that writes back the same
+        json j;
+        if (!s.empty() && (std::isdigit((unsigned char) s[0]) || s[0] == '-') && py_loads(s, j) && j.is_number() &&
+            py_dumps(j) == s)
+            return j;
+        return s;
+    };
+    json out = json::object();
+    for (size_t i = 0; i < args.size();) {
+        const std::string f = arg_str(args[i]);
+        if (!flag(f)) return std::nullopt;   // a value before any flag
+        size_t j = i + 1;
+        while (j < args.size() && !flag(arg_str(args[j]))) ++j;
+        std::string key = f.substr(2);
+        json v;
+        if (j == i + 1) {
+            const bool no = starts_with(key, "no-");
+            v = !no;
+            if (no) key = key.substr(3);
+        } else if (j == i + 2) {
+            v = value(arg_str(args[i + 1]));
+        } else {
+            v = json::array();
+            for (size_t k = i + 1; k < j; ++k) v.push_back(value(arg_str(args[k])));
+        }
+        if (out.contains(key)) return std::nullopt;   // a flag twice: the list says it, the object could not
+        out[key] = std::move(v);
+        i = j;
+    }
+    return out;
+}
+
+void args_to_list(json& cfg) {
+    if (cfg.is_object() && jget(cfg, "args").is_object()) cfg["args"] = args_as_list(cfg["args"]);
 }
 
 void split_joined_args(json& cfg) {
@@ -206,25 +267,119 @@ std::string resolve_draft_layer(json& cfg, const std::string& arch) {
            "  (or from\n         " + kDraftLayerUrl + ")" + then;
 }
 
-std::vector<int> gpu_list(const json& cfg) {
-    const json& g = jget(cfg, "gpu");
-    std::vector<int> out;
-    if (g.is_null() || (g.is_string() && g.get_ref<const std::string&>().empty())) return out;
-    std::vector<std::string> items;
+namespace {
+
+/// the "gpu" value's items: numbers, cards' texts (a comma inside one is its settings') or objects; a text of numbers
+/// and commas ("0,2") its numbers, a JSON text ("[0, 2]") its items
+std::vector<json> gpu_items(const json& g) {
+    std::vector<json> out;
+    auto text = [&](const std::string& raw) {
+        const std::string s(strip(raw));
+        if (s.empty()) return;
+        if (s[0] == '[' || s[0] == '{') {
+            json j;
+            if (py_loads(s, j)) {
+                if (j.is_array())
+                    for (const json& x : j) out.push_back(x);
+                else
+                    out.push_back(j);
+                return;
+            }
+        }
+        const std::vector<std::string> parts = split(s, ",");
+        const bool numbers = std::all_of(parts.begin(), parts.end(), [](const std::string& p) {
+            const std::string q(strip(p));
+            return !q.empty() && std::all_of(q.begin(), q.end(), ::isdigit);
+        });
+        if (!numbers) {
+            out.push_back(s);
+            return;
+        }
+        for (const std::string& p : parts) out.push_back(std::stoi(std::string(strip(p))));
+    };
     if (g.is_array()) {
-        for (const auto& x : g) items.push_back(arg_str(x));
-    } else {
-        items = split(arg_str(g), ",");
+        for (const json& x : g) {
+            if (x.is_string()) text(x.get<std::string>());
+            else if (!x.is_null()) out.push_back(x);
+        }
+    } else if (g.is_string()) {
+        text(g.get<std::string>());
+    } else if (!g.is_null()) {
+        out.push_back(g);
     }
-    for (const auto& x : items) {
-        const std::string s(strip(x));
-        if (s.empty()) continue;
-        try {
-            out.push_back(std::stoi(s));
-        } catch (const std::exception&) {
-            throw ConfigError("\"gpu\": " + py_repr_value(json(s)) + " is not a card number");
+    return out;
+}
+
+bool numbers_only(const std::vector<json>& items) {
+    return std::all_of(items.begin(), items.end(), [](const json& x) { return x.is_number_integer(); });
+}
+
+/// a JSON value as a card setting's text: text as it is, a number as JSON writes it
+std::string card_value(const json& v) { return v.is_string() ? v.get<std::string>() : py_dumps(v); }
+
+}  // namespace
+
+std::vector<int> gpu_list(const json& cfg) {
+    const std::vector<json> items = gpu_items(jget(cfg, "gpu"));
+    std::vector<int> out;
+    if (!numbers_only(items)) return out;   // cards: gpu_cards
+    for (const json& x : items) out.push_back(x.get<int>());
+    return out;
+}
+
+std::optional<std::vector<std::string>> gpu_cards(const json& cfg) {
+    const std::vector<json> items = gpu_items(jget(cfg, "gpu"));
+    if (items.empty() || numbers_only(items)) return std::nullopt;
+    std::vector<std::string> out;
+    for (const json& x : items) {
+        std::string text;
+        if (x.is_object()) {
+            const json& id = jget(x, "id");
+            if (id.is_null()) throw ConfigError("\"gpu\": " + py_repr_value(x) + " names no card: {\"id\": \"RTX 3090\", ...}");
+            text = card_value(id);
+            for (auto it = x.begin(); it != x.end(); ++it)
+                if (it.key() != "id") text += "," + it.key() + "=" + card_value(it.value());
+        } else {
+            text = card_value(x);
+        }
+        program::GpuCard card;
+        std::string why;
+        if (!program::parse_gpu_card(text, card, why)) throw ConfigError("\"gpu\": " + why);
+        out.push_back(text);
+    }
+    return out;
+}
+
+json gpu_canonical(const json& g) {
+    const std::vector<json> items = gpu_items(g);
+    if (items.empty()) return g;
+    json out = json::array();
+    for (const json& x : items) out.push_back(x);
+    return out;
+}
+
+std::vector<std::string> engine_cards(const json& cfg) {
+    if (auto cards = gpu_cards(cfg)) return *cards;
+    const std::vector<std::string> args = args_of(cfg);
+    std::vector<std::string> out;
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == "--gpu") out.push_back(args[i + 1]);
+    if (!out.empty()) return out;
+    std::optional<std::string> main;
+    std::vector<std::string> tiers;
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (args[i] == "--main-gpu") main = args[i + 1];
+        if (args[i] == "--second-gpu" || args[i] == "--tier-gpus") {
+            tiers.clear();
+            for (const std::string& x : split(args[i + 1], ",")) {
+                const std::string s(strip(x));
+                if (!s.empty() && s[0] != '-') tiers.push_back(s);
+            }
         }
     }
+    if (!main && tiers.empty()) return out;
+    out.push_back(main.value_or("0"));
+    out.insert(out.end(), tiers.begin(), tiers.end());
     return out;
 }
 
@@ -320,46 +475,36 @@ int find_gpu(const std::string& spec_in, const std::vector<GpuInfo>& gpus, std::
 }
 
 std::vector<int> engine_gpus(const json& cfg) {
-    const std::vector<std::string> args = args_of(cfg);
-    const bool named = gpu_list(cfg).empty() && std::any_of(args.begin(), args.end(), [](const std::string& a) {
-        return a == "--main-gpu" || a == "--second-gpu" || a == "--tier-gpus";
-    });
+    const bool named = gpu_list(cfg).empty() && !engine_cards(cfg).empty();
     return engine_gpus(cfg, named ? nvidia_gpus() : std::vector<GpuInfo>{});
 }
 
 std::vector<int> engine_gpus(const json& cfg, const std::vector<GpuInfo>& gpus, std::string* why) {
     const std::vector<int> listed = gpu_list(cfg);
     if (!listed.empty()) return listed;
-    const std::vector<std::string> args = args_of(cfg);
-    auto values = [&](std::initializer_list<const char*> flags) -> std::optional<std::vector<std::string>> {
-        std::optional<size_t> at;
-        for (size_t i = 0; i + 1 < args.size(); ++i)
-            for (const char* f : flags)
-                if (args[i] == f) at = i;
-        if (!at) return std::nullopt;
-        std::vector<std::string> out;
-        for (const auto& x : split(args[*at + 1], ",")) {
-            const std::string v(strip(x));
-            if (!v.empty() && !starts_with(v, "-")) out.push_back(v);
-        }
-        return out;
-    };
-    const auto main_spec = values({"--main-gpu"});
-    const std::vector<std::string> tiers = values({"--second-gpu", "--tier-gpus"}).value_or(std::vector<std::string>{});
-    if ((!main_spec || main_spec->empty()) && tiers.empty()) return {};
+    const std::vector<std::string> cards = engine_cards(cfg);
+    if (cards.empty()) return {};
+    auto name = [](const std::string& card) { return std::string(strip(card.substr(0, card.find(',')))); };
     auto index = [&](const std::string& spec, std::string* w) {   // a number as given when nvidia-smi lists nothing
         if (gpus.empty() && !spec.empty() && std::all_of(spec.begin(), spec.end(), ::isdigit)) return std::stoi(spec);
         return find_gpu(spec, gpus, w);
     };
-    int main_gpu = 0;   // the engine's default, --main-gpu 0
-    if (main_spec && !main_spec->empty()) {
+    int main_gpu = 0;   // the engine's default
+    std::vector<std::string> tiers;
+    if (const std::string m = name(cards[0]); m == "auto") {
+        tiers.push_back("auto");
+    } else {
         std::string w;
-        main_gpu = index((*main_spec)[0], &w);
-        if (main_gpu < 0) {   // the engine stops at it
-            if (why != nullptr) *why = "--main-gpu " + (*main_spec)[0] + ": " + w;
+        main_gpu = index(m, &w);
+        if (main_gpu < 0) {   // the engine stops at it; said with what named it
+            const std::vector<std::string> args = args_of(cfg);
+            const char* by = gpu_cards(cfg) ? "\"gpu\"" : std::find(args.begin(), args.end(), "--gpu") != args.end()
+                                                              ? "--gpu" : "--main-gpu";
+            if (why != nullptr) *why = std::string(by) + " " + m + ": " + w;
             return {};
         }
     }
+    for (size_t i = 1; i < cards.size(); ++i) tiers.push_back(name(cards[i]));
     std::vector<int> out = {main_gpu};
     if (tiers.size() == 1 && tiers[0] == "auto") {
         for (const auto& g : gpus)
@@ -399,17 +544,26 @@ double engine_silence_s(const json& cfg) {
 
 std::vector<std::string> engine_args(const json& cfg) {
     std::vector<std::string> args = args_of(cfg);
-    // #1322: a "vision" section without --vision in the args advertised images and then refused every picture
-    if (jget(cfg, "vision").is_object() && !has(args, "--vision")) {
-        args.push_back("--vision");
-        std::string note = "added --vision";
-        if (truthy(jget(cfg["vision"], "gpu")) && !has(args, "--vram-reserve-mib")) {
-            args.insert(args.end(), {"--vram-reserve-mib", "700"});
-            note += " and --vram-reserve-mib 700";
+    // the config's "model" when its args name none
+    if (!has(args, "--native") && !jstr(cfg, "model").empty())
+        args.insert(args.begin(), {"--native", here_path(cfg, jstr(cfg, "model"))});
+    // "gpu" as cards: a --gpu each, in place of the args' own GPU names
+    if (const auto cards = gpu_cards(cfg)) {
+        std::vector<std::string> kept;
+        for (size_t i = 0; i < args.size(); ++i) {
+            const std::string& a = args[i];
+            if ((a == "--main-gpu" || a == "--second-gpu" || a == "--tier-gpus" || a == "--gpu") && i + 1 < args.size()) {
+                ++i;
+                continue;
+            }
+            kept.push_back(a);
         }
-        say("[lamina] the config has a \"vision\" section but no --vision in its args: " + note + " (write them in "
-            "its args)");
+        args = std::move(kept);
+        for (const std::string& c : *cards) args.insert(args.end(), {"--gpu", c});
     }
+    // the "vision" section is the engine's --vision (#1322: without it the server advertised images and the engine
+    // refused every picture)
+    if (jget(cfg, "vision").is_object() && !has(args, "--vision")) args.push_back("--vision");
     // #465 (opt-in): "parallel": N - up to N requests decode together in the engine's batch slots
     const json& n = jget(cfg, "parallel");
     if (!has(args, "--batch") && !has(args, "--slots") && !n.is_null() && n != false) {
@@ -471,7 +625,8 @@ std::string model_file(const json& cfg) {
     const std::vector<std::string> args = args_of(cfg);
     for (size_t i = 0; i + 1 < args.size(); ++i)
         if (args[i] == "--native") return here_path(cfg, args[i + 1]);
-    return "";
+    const std::string model = jstr(cfg, "model");   // the config's "model" when its args name none
+    return model.empty() ? "" : here_path(cfg, model);
 }
 
 const std::vector<std::pair<std::string, std::string>>& offline_env() {
@@ -569,6 +724,136 @@ std::vector<std::string> offline_blockers(const json& cfg) {
                 needs.push_back(std::string("the config's ") + key + "." + field + " permits network sources");
     }
     return needs;
+}
+
+json modern_config(json cfg, bool flash) {
+    std::vector<std::string> a = args_of(cfg);
+    auto flag = [](const std::string& s) { return s.size() > 2 && starts_with(s, "--"); };
+    auto at = [&](const std::string& f) -> std::optional<size_t> {
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i] == f) return i;
+        return std::nullopt;
+    };
+    auto value = [&](const std::string& f) -> std::optional<std::string> {   // the word after the flag
+        const auto i = at(f);
+        if (!i || *i + 1 >= a.size() || flag(a[*i + 1])) return std::nullopt;
+        return a[*i + 1];
+    };
+    auto erase = [&](const std::string& f) {   // the flag and its values
+        if (const auto i = at(f)) {
+            size_t j = *i + 1;
+            while (j < a.size() && !flag(a[j])) ++j;
+            a.erase(a.begin() + (std::ptrdiff_t) *i, a.begin() + (std::ptrdiff_t) j);
+        }
+    };
+    auto unit = [](const std::string& number, const char* u) {   // an older flag's number with its unit
+        char b[48];
+        std::snprintf(b, sizeof b, "%g%s", std::atof(number.c_str()), u);
+        return std::string(b);
+    };
+    // the GPUs: --main-gpu, --second-gpu and the per-tier lists as the cards of "gpu", unless "gpu" names them
+    if (!gpu_cards(cfg) && gpu_list(cfg).empty() && (value("--main-gpu") || value("--second-gpu") || value("--tier-gpus"))) {
+        const std::string main = value("--main-gpu").value_or("0");
+        std::vector<std::string> tiers;
+        if (const auto t = value("--second-gpu") ? value("--second-gpu") : value("--tier-gpus"))
+            for (const std::string& x : split(*t, ",")) {
+                const std::string s(strip(x));
+                if (!s.empty() && s[0] != '-') tiers.push_back(s);
+            }
+        auto list = [&](const char* f) {
+            std::vector<std::string> v;
+            if (const auto s = value(f))
+                for (const std::string& x : split(*s, ",")) v.push_back(std::string(strip(x)));
+            return v;
+        };
+        auto pick = [](const std::vector<std::string>& v, size_t t) {
+            return v.empty() ? std::string() : v[std::min(t, v.size() - 1)];
+        };
+        const auto gib = list("--second-gpu-gib"), reserve = list("--second-gpu-reserve-mib"),
+                   prefetch = list("--second-gpu-prefetch-mb"), clocks = list("--second-gpu-clocks"),
+                   sleep = list("--second-gpu-sleep-us");
+        const auto pin = value("--second-gpu-pin-gib");
+        const bool auto_tiers = tiers.size() == 1 && tiers[0] == "auto";
+        const bool per_tier = !gib.empty() || !reserve.empty() || !prefetch.empty() || !clocks.empty() ||
+                              !sleep.empty() || pin;
+        if (!(auto_tiers && per_tier)) {   // an auto tier's settings stay the per-tier lists'
+            json cards = json::array();
+            json m = json::object();
+            m["id"] = main;
+            if (const auto v = value("--expert-cache"); v && *v != program::option_default("--expert-cache")) m["cache"] = *v;
+            if (const auto v = value("--vram-reserve-mib"); v && *v != program::option_default("--vram-reserve-mib"))
+                m["reserve"] = unit(*v, "M");
+            if (const auto v = value("--vram-pin-gib"); v && std::atof(v->c_str()) > 0) m["vram-only"] = unit(*v, "G");
+            cards.push_back(m.size() == 1 ? json(main) : m);
+            for (size_t t = 0; t < tiers.size(); ++t) {
+                json c = json::object();
+                c["id"] = tiers[t];
+                if (std::atof(pick(gib, t).c_str()) > 0) c["cache"] = unit(pick(gib, t), "G");
+                if (!reserve.empty()) c["reserve"] = unit(pick(reserve, t), "M");
+                if (!prefetch.empty()) c["prefetch"] = unit(pick(prefetch, t), "M");
+                if (const std::string k = pick(clocks, t); !k.empty() && k != "0") c["clocks"] = k;
+                if (std::atof(pick(sleep, t).c_str()) > 0) c["sleep"] = unit(pick(sleep, t), "us");
+                if (t == 0 && pin && std::atof(pin->c_str()) > 0) c["vram-only"] = unit(*pin, "G");
+                cards.push_back(c.size() == 1 ? json(tiers[t]) : c);
+            }
+            cfg["gpu"] = std::move(cards);
+            for (const char* f : {"--main-gpu", "--second-gpu", "--tier-gpus", "--expert-cache", "--vram-reserve-mib",
+                                  "--vram-pin-gib", "--second-gpu-gib", "--second-gpu-reserve-mib",
+                                  "--second-gpu-prefetch-mb", "--second-gpu-clocks", "--second-gpu-sleep-us",
+                                  "--second-gpu-pin-gib"})
+                erase(f);
+        }
+    }
+    // the older names of the tiers' other options
+    auto rename = [&](const char* from, const char* to, const char* u) {
+        const auto i = at(from);
+        if (!i) return;
+        a[*i] = to;
+        if (u != nullptr && *i + 1 < a.size() && !flag(a[*i + 1]))
+            a[*i + 1] = std::string(u) == "s" && std::atof(a[*i + 1].c_str()) < 0 ? "off" : unit(a[*i + 1], u);
+    };
+    rename("--second-gpu-clocks-hold", "--clocks-hold", "s");
+    rename("--second-gpu-clocks-lead", "--clocks-lead", "s");
+    rename("--second-gpu-min-mb", "--tier-min", "M");
+    rename("--no-second-gpu-adapt", "--no-tier-adapt", nullptr);
+    // Qwen3.8-Flash-Next's options at the engine's default (the qwen35 path's defaults are its own)
+    for (size_t i = 0; flash && i < a.size();) {
+        size_t j = i + 1;
+        while (j < a.size() && !flag(a[j])) ++j;
+        const std::string def = flag(a[i]) ? program::option_default(a[i].c_str()) : "";
+        bool same = false;
+        if (!def.empty() && j == i + 1) {
+            same = def == "on";   // a switch the engine has on anyway
+        } else if (!def.empty() && j == i + 2) {
+            const std::string& v = a[i + 1];
+            char* e1 = nullptr;
+            char* e2 = nullptr;
+            const double x = std::strtod(v.c_str(), &e1), y = std::strtod(def.c_str(), &e2);
+            same = v == def || (a[i] == "--prefill" && v == "auto") ||
+                   (e1 != v.c_str() && *e1 == '\0' && e2 != def.c_str() && *e2 == '\0' && x == y);
+        }
+        if (same) a.erase(a.begin() + (std::ptrdiff_t) i, a.begin() + (std::ptrdiff_t) j);
+        else i = j;
+    }
+    // the model as "model", the pictures as their section says
+    if (const auto v = value("--native"); v && (jstr(cfg, "model").empty() || jstr(cfg, "model") == *v)) {
+        cfg["model"] = *v;
+        erase("--native");
+    }
+    if (jget(cfg, "vision").is_object()) {
+        erase("--vision");
+        if (!jstr(cfg, "model").empty() && jstr(cfg["vision"], "model") == jstr(cfg, "model")) cfg["vision"].erase("model");
+    }
+    json list = json::array();
+    for (const std::string& w : a) list.push_back(w);
+    cfg["args"] = args_as_object(list).value_or(list);   // an empty one stays: a config without "args" is a preset's
+    // the model, its cards and its options first
+    json out = json::object();
+    for (const char* k : {"model", "gpu", "args"})
+        if (cfg.contains(k)) out[k] = cfg[k];
+    for (auto it = cfg.begin(); it != cfg.end(); ++it)
+        if (!out.contains(it.key())) out[it.key()] = it.value();
+    return out;
 }
 
 }  // namespace lamina

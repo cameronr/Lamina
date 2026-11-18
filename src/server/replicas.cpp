@@ -1,6 +1,8 @@
 // src/server/replicas.cpp - data-parallel replicas (replicas.hpp).
 #include "replicas.hpp"
 
+#include "config.hpp"
+
 #include "log.hpp"
 
 #include <algorithm>
@@ -117,9 +119,9 @@ json replica_cfg(const json& cfg, size_t i, const std::vector<int>& gpus) {
             env[it.key()] = it.value().is_string() ? it.value().get<std::string>() : py_dumps(it.value());
         c["env"] = env;
     }
-    if (truthy(jget(entry, "args"))) {
-        json args = jget(c, "args").is_array() ? c["args"] : json::array();
-        for (const auto& a : entry["args"]) args.push_back(a.is_string() ? a.get<std::string>() : py_dumps(a));
+    if (truthy(jget(entry, "args"))) {   // either form, as the config's own
+        json args = args_as_list(jget(c, "args"));
+        for (const auto& a : args_as_list(entry["args"])) args.push_back(a.is_string() ? a.get<std::string>() : py_dumps(a));
         c["args"] = args;
     }
     return c;

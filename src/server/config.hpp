@@ -30,8 +30,32 @@ void lift_reasoning_effort_arg(json& cfg);
 /// the args name a file or a folder of the earlier layout that is there, or the model is another (Qwen3.6-35B-A3B and
 /// Qwen3.8-27B draft with their files' own MTP block)
 std::string resolve_draft_layer(json& cfg, const std::string& arch);
-/// the config's "gpu": one card, or several ([0, 2] or "0,2"), numbered as nvidia-smi numbers them
+/// the config's "args" as the engine's words: a list as it is, an object's flags in its order (true a switch, false
+/// its --no- form, null left out, a list the flag's values; a value that is no text as JSON writes it)
+json args_as_list(const json& args);
+/// "args" as an object of flags when it reads back as the same words (each word after a flag its value, no flag twice,
+/// no value before the first flag; a value becomes a number when it writes back the same); nullopt otherwise
+std::optional<json> args_as_object(const json& args);
+/// "args" given as an object into its list: the server reads lists (read_config, runconfig::load and the presets do it)
+void args_to_list(json& cfg);
+/// the config's "gpu" in the earlier form: nvidia-smi's numbers alone (0, [0, 2], "0,2"), the cards the engine sees
+/// (CUDA_VISIBLE_DEVICES); empty for none, or for cards (gpu_cards)
 std::vector<int> gpu_list(const json& cfg);
+/// the config's "gpu" as --gpu's cards, in their order (program/gpu_cards.hpp): the first runs the model, the others
+/// are its tiers; each a number, a name, a UUID's start, a PCI bus id or auto, or an object of "id" and the card's
+/// settings ({"id": "GPU-f26e9ba6", "clocks": "1395-2100/9751"}).  nullopt for none, or numbers alone (gpu_list).
+/// ConfigError for a card the engine would refuse.
+std::optional<std::vector<std::string>> gpu_cards(const json& cfg);
+/// a "gpu" value as one list: its numbers ("0,2" as 0 and 2) or its cards, each an item
+json gpu_canonical(const json& gpu);
+/// the cards the engine works on, as --gpu takes them: "gpu"'s, else the args' --gpu, else their --main-gpu and
+/// --second-gpu (names alone); empty when none names one
+std::vector<std::string> engine_cards(const json& cfg);
+/// a config in the form --write-config writes: the older GPU flags (--main-gpu, --second-gpu and the per-tier lists) as
+/// the cards of "gpu", their other older names renamed (--clocks-hold, --tier-min ...), with `flash` (a
+/// Qwen3.8-Flash-Next config) the options at the engine's default left out, --native as "model", --vision as its
+/// section, and "args" as an object (an empty one too: a config without "args" is the preset's)
+json modern_config(json cfg, bool flash);
 struct GpuInfo {
     int index;
     std::string name, bus_id, uuid;

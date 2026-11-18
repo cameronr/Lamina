@@ -1107,30 +1107,20 @@ std::string detect_quant(const json& view) {
 }
 
 std::vector<int> gpu_selection(const json& cfg) {
-    auto parse = [](const json& v) {
-        std::vector<int> out;
-        if (v.is_null() || v == "") return out;
-        std::vector<std::string> items;
-        if (v.is_array())
-            for (const json& x : v) items.push_back(py_str(x));
-        else
-            items = split(py_str(v), ",");
-        for (const std::string& x : items) {
-            const std::string s(strip(x));
-            if (!s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); }))
-                out.push_back(std::atoi(s.c_str()));
-        }
-        return out;
-    };
-    std::vector<int> sel = parse(jget(cfg, "gpu"));
-    if (sel.empty()) {
-        const json& args = jget(cfg, "args");
-        for (size_t i = 0; args.is_array() && i + 1 < args.size(); ++i)
-            if (py_str(args[i]) == "--gpu") {
-                sel = parse(json(py_str(args[i + 1])));
-                break;
-            }
+    // the cards by number alone: "gpu"'s earlier form, else the args' --gpu numbers (cards by name: none here, the
+    // server's own names then pick them)
+    std::vector<int> sel;
+    try {
+        sel = gpu_list(cfg);
+    } catch (const std::exception&) {
     }
+    const json& args = jget(cfg, "args");
+    for (size_t i = 0; sel.empty() && args.is_array() && i + 1 < args.size(); ++i)
+        if (py_str(args[i]) == "--gpu") {
+            const std::string s(strip(py_str(args[i + 1])));
+            if (!s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); }))
+                sel.push_back(std::atoi(s.c_str()));
+        }
     return sel;
 }
 

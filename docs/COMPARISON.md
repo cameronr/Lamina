@@ -276,7 +276,7 @@ another quantization, not from the original weights, and the abliterated build d
 
 The engine's qwen35 path (`src/qwen35`, Strata's driver on Lamina's kernels) on unsloth's UD-Q4_K_XL (the MTP GGUF,
 22.9 GB). Lamina, measured on 2026-10-30, with its config (65,536 cells, 2 drafts) on the RTX 3090 alone and with
-the 5070 Ti (`--second-gpu`, the development PC's config: a layer split, layers 0-37 on the 3090, 38-39 with the head
+the 5070 Ti (its second card, the development PC's config: a layer split, layers 0-37 on the 3090, 38-39 with the head
 and the MTP block on the 5070 Ti, ~4.7 GiB there). Mainline llama.cpp build 11606, measured on 2026-10-29, on the
 same file with this PC's former Qwen3.6 preset (64K cells, 8-bit KV, 2048-token micro-batches, MTP drafts up to 3, the
 token embedding on the CPU): on the 3090 alone (`--fit`: the experts that do not fit in its VRAM on the CPU) and with the

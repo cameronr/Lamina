@@ -14,15 +14,18 @@ which takes the model file, the GPU, the draft layer, the projector and the file
 
 `lamina-server -m MODEL.gguf --write-config FILE` writes one with the PC's own files and GPUs. `run-<model>.bat.example`
 is a launcher for each: copied to `run-<model>.bat`, it starts the example from the clone's folder, the model's files
-where its paths say (`../Lamina-data`). Their engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's
-keys: [USING.md](../docs/USING.md#the-config).
+where its paths say (`../Lamina-data`). Each names its model (`"model"`), its GPUs (`"gpu"`: the main one, then
+`auto`) and in `"args"` the engine's options that differ from its defaults. Their engine options:
+[SETUP.md](../docs/SETUP.md#engine-options); the GPUs' cards: [SETUP.md](../docs/SETUP.md#the-gpus); the server's keys:
+[USING.md](../docs/USING.md#the-config).
 
 ## The development PC's own options
 
-The development PC's configs name their GPUs (`--main-gpu GPU-75af3083 --second-gpu "RTX 5070 Ti,GPU-f26e9ba6"`, its
-two RTX 3090s by their UUIDs' starts, where the examples take every other GPU with `auto`), and its Flash-Next configs add four options measured for its hardware, which the examples
-leave out. Each pays only where a PC has the same trait: measure it through the server before keeping it. Its
-Qwen3.8-27B config puts the RTX 5070 Ti first (`--main-gpu`, which `-m` sets to a PC's own choice): that card reads
+The development PC's configs name their GPUs as cards (`"gpu": ["GPU-75af3083", "RTX 5070 Ti", {"id": "GPU-f26e9ba6",
+"clocks": "1395-2100/9751"}]`, its two RTX 3090s by their UUIDs' starts, where the examples take every other GPU with
+`auto`), and its Flash-Next configs add options measured for its hardware, which the examples leave out. Each pays only
+where a PC has the same trait: measure it through the server before keeping it. Its Qwen3.8-27B config puts the RTX
+5070 Ti first (the first card, which `-m` sets to a PC's own choice): that card reads
 prompts ~1.44x as fast as the RTX 3090 and takes the first 26 layers, the 3090 the other 38 with the head, and the
 prompt chunks run on both at once, so the prompts read ~11% faster than in the other order.
 
@@ -57,9 +60,8 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
     its own link: UD-Q4_K_XL's parts of 2-4K tokens read 15-25% sooner and its prompts of 64K-128K 6% (the first
     tier streams fewer of its large experts), IQ3_S's 4-10% later (its small experts stream sooner than rows cross
     two x4 links). It takes ~0.65 GiB of that card's VRAM and keeps the card at work through a prompt (~140 W).
-- **`--second-gpu-clocks 0,1395-2100/9751`** (all three): a value per tier, here none for the first and, for the
-  second, its graphics clock locked at 1395-2100 MHz and its memory clock at 9,751 while the engine generates (NVML's
-  locks, the ones `nvidia-smi -lgc` and `-lmc` set). The engine sets them from a request's start, or from a long
+- **The third GPU's `clocks=1395-2100/9751`** (all three, on its card): its graphics clock locked at 1395-2100 MHz
+  and its memory clock at 9,751 while the engine generates (NVML's locks, the ones `nvidia-smi -lgc` and `-lmc` set). The engine sets them from a request's start, or from a long
   prompt's last chunk, until 5 s after the request (its own timing: the two switches below shorten it), so the card
   idles at ~12 W instead of the ~110 W it draws locked.
   It pays for a tier whose work is sparse: this PC's second RTX 3090, as the third GPU, gets only the verify windows'
@@ -76,10 +78,10 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
     for (it documents the graphics clock's from the RTX 20 series on and the memory clock's from the RTX 30 series
     on; a memory clock of `0`, as in `1395-2100/0`, leaves that one to the driver), the engine says so at the first
     request and runs at the driver's clocks.
-  - The values go to the tiers in their order, the last one to the tiers past it. With `--second-gpu auto` the order
-    is the one the start's log lists: name the tiers to give each card its own values.
+  - Each card has its own: with `auto` tiers every one takes the `auto` card's settings, so name the tiers to give
+    each card its own values.
   - An engine ended by force leaves its lock: the next engine's first release ends it, or `nvidia-smi -rgc -rmc`.
-  - `--second-gpu-clocks-hold 1 --second-gpu-clocks-lead 1.0` (this PC's configs set them with the lock): the lock
+  - `--clocks-hold 1s --clocks-lead 1s` (this PC's configs set them with the lock): the lock
     stays 1 s after a request instead of 5, and is asked for 1 s before a batched prompt part ends, by the part's
     progress, instead of from its last chunk on. Over an agent's session replayed here (60 requests, a third of its
     time in pauses of up to 12 s) that took 3.2-3.5% of the energy the GPUs and the CPU drew: the card's locked time
@@ -87,8 +89,8 @@ prompt chunks run on both at once, so the prompts read ~11% faster than in the o
     two runs of one arm differ by up to 2.2%. A lock is at speed ~0.6 s after it is asked for, so a shorter lead
     starts generation on a card still at its idle clocks; a short hold pays where the next request rarely comes
     within it (here 72% of an agent's come within a second).
-  - `--second-gpu-sleep-us T[,..]` (this PC's IQ3_S config sets `0,55`): a value per tier, none for the first. A later
-    tier sleeps (its experts go to the tiers before it and the CPU, its lock is released) while the CPU pool would
+  - A card's `sleep=TIME` (this PC's IQ3_S config gives the third GPU `sleep=55us`), on a tier after the first: it
+    sleeps (its experts go to the tiers before it and the CPU, its lock is released) while the CPU pool would
     need less than T microseconds a layer without it, averaged over a few seconds of generation, and wakes when the
     text turns heavy. It gives up speed for the card's awake power, by an amount that is the model file's and the
     PC's: here IQ3_S at 55 slept through 59-63% of a session's rounds for 10.5% fewer joules a token, its time a

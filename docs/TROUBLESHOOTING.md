@@ -51,8 +51,9 @@ model file stays in the OS file cache.
 
 **"not enough RAM: the model's experts take ...".** The experts stay locked in RAM while the model runs (the README's
 table), and this PC's RAM cannot hold them beside the ~4 GiB the system needs. Use a smaller quant: IQ3_S takes ~28 GB
-less than UD-Q4_K_XL. With GPUs of ample VRAM, `--vram-pin-gib` keeps some experts there instead of in RAM. Qwen3.6's
-experts take RAM only when they do not all fit in VRAM: more GPUs (`--second-gpu`) or a shorter context avoid it.
+less than UD-Q4_K_XL. With GPUs of ample VRAM, a card's `vram-only=auto` in `"gpu"` keeps as many experts there
+instead of in RAM as the RAM needs ([SETUP.md](SETUP.md#the-gpus)). Qwen3.6's experts take RAM only when they do not
+all fit in VRAM: more GPUs (cards in `"gpu"`) or a shorter context avoid it.
 
 **"RAM is tight: ...", or the PC pages heavily.** The model fits, but less than 6 GiB of RAM would stay available
 beside it: other programs hold the rest, or the model leaves little. Windows pages them out to disk while the model
@@ -115,7 +116,7 @@ the build, or a release's programs on a card other than the RTX 30, 40 and 50 se
 a tier it is left out.
 
 **"its compute capability is ..., and Lamina needs 8.0 or newer".** The card is older than the RTX 30 series: name
-another as `--main-gpu`.
+another first in `"gpu"`.
 
 **"no CUDA device is visible (CUDA driver version is insufficient for CUDA runtime version)".** The NVIDIA driver is
 older than the CUDA runtime the programs come with: install a driver for CUDA 13 or newer.
@@ -140,8 +141,9 @@ settings > Performance > Advanced > Virtual memory), and restart Windows: a page
 in time.
 
 **"MiB of VRAM free with everything loaded - LOW: requests may stall".** The expert cache and the K/V left the GPU
-almost no VRAM; Windows then pages the GPU's memory, and a request can stall. Raise `--vram-reserve-mib` in the config's
-`args` (default 700), or lower `--max-context`, and close what else uses that GPU.
+almost no VRAM; Windows then pages the GPU's memory, and a request can stall. Raise the main GPU's `reserve` in the
+config's `"gpu"` (its first card: `{"id": "...", "reserve": "1G"}`; default 700 MiB), or lower `--max-context`, and close
+what else uses that GPU.
 
 ## While it answers
 

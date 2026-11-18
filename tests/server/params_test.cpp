@@ -3,6 +3,7 @@
 // JSON), the engine's options apart, the errors, a section merged key by key, the config's keys the table lacks, and
 // --help naming every option.  (CPU only.)
 #include "params.hpp"
+#include "config.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -80,7 +81,16 @@ int main() {
     CHECK(s["lazy_load"] == true && s["answer_room"] == false && s["open_browser"] == true);
     CHECK((s["aliases"] == json{"a", "b", "c"}));
     CHECK((s["env"] == json{{"A", "1"}, {"B", "x=y"}}));
-    CHECK(s["gpu"] == "0,2" && s["replicas"] == 2);
+    CHECK((s["gpu"] == json{0, 2}) && s["replicas"] == 2);
+    {   // --gpu again for each card, a card's settings after its name: one item each, in order
+        const char* argv2[] = {"lamina-server", "--gpu", "GPU-75af3083", "--gpu", "RTX 5070 Ti",
+                               "--gpu", "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"};
+        const lamina::CommandLine c2 = lamina::parse_command_line(7, (char**) argv2);
+        CHECK((c2.settings["gpu"] == json{"GPU-75af3083", "RTX 5070 Ti", "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
+        CHECK((lamina::gpu_cards(c2.settings) ==
+               std::vector<std::string>{"GPU-75af3083", "RTX 5070 Ti", "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
+        CHECK(lamina::gpu_list(c2.settings).empty());
+    }
     CHECK((s["before_load"] == json{"a", "b"}));
     CHECK((s["scripts"] == json{"x, y", "z"}));
     CHECK((s["vision"] == json{{"mmproj", lamina::u8_str(std::filesystem::absolute("p.gguf").lexically_normal())}}));
