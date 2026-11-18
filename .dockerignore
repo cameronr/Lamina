@@ -1,0 +1,17 @@
+# Keep docker build's context to the source: the build trees, tooling venvs and scratch
+# folders are big and none of them belong in the image.
+.git/
+.worktrees/
+build*/
+dist/
+bin/
+.venv/
+.q6k/
+.playwright-mcp/
+.trash/
+plans/
+bench/
+configs/
+*.png
+.claude/
+__pycache__/
