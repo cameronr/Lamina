@@ -9,6 +9,9 @@
 #include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/qwen35/engine.hpp"
 #endif
+#if defined(LAMINA_HAVE_HY4)
+#include "lamina/hy4/engine.hpp"
+#endif
 #include "lamina/program/engine.hpp"
 #include "lamina/program/gpu_cards.hpp"
 #include "lamina/program/serve_io.hpp"
@@ -1693,6 +1696,7 @@ struct Qwen35Line {
     std::string skipped;   ///< --gpu cards whose settings this path has no use for
     std::vector<char*> rest;
     bool qwen35() const { return family == lamina::ModelFamily::Qwen35Moe || family == lamina::ModelFamily::Qwen35; }
+    bool hy4() const { return family == lamina::ModelFamily::HyV4Flash; }
 };
 Qwen35Line qwen35_line(int argc, char** argv) {
     Qwen35Line q;
@@ -1804,11 +1808,80 @@ int qwen35_switch(int argc, char** argv) {
                  more.empty() ? "" : "; a layer split may add ", more.c_str());
     return lamina::qwen35::run((int) rest.size(), rest.data());
 }
+
+#if defined(LAMINA_HAVE_HY4)
+/// Hy4-flash's switch: kNotQwen35 for another family, else the exit code of src/hy4's path, run on --main-gpu (the first
+/// --gpu card's), made current before its first CUDA call; the other cards' GPUs go to it as --tier-gpus (their order).
+int hy4_switch(int argc, char** argv) {
+    Qwen35Line q = qwen35_line(argc, argv);
+    if (!q.hy4()) return kNotQwen35;
+    if (!q.bad.empty()) {
+        std::fprintf(stderr, "lamina: %s\n", q.bad.c_str());
+        return 2;
+    }
+    const std::vector<lamina::core::GpuInfo> gpus = lamina::core::list_gpus();
+    std::string why;
+    const int dev = lamina::core::find_gpu(gpus, q.main_gpu, why);
+    if (dev < 0 || cudaSetDevice(dev) != cudaSuccess) {
+        std::fprintf(stderr, "lamina: --main-gpu %s: %s\n", q.main_gpu.c_str(), dev < 0 ? why.c_str() : "cannot use it");
+        return 2;
+    }
+    if (const std::string no = lamina::core::gpu_unusable(dev); !no.empty()) {
+        std::fprintf(stderr, "lamina: --main-gpu %s: GPU %d, %s: %s\n", q.main_gpu.c_str(), dev,
+                     gpus[(size_t) dev].name.c_str(), no.c_str());
+        return 2;
+    }
+    std::string list;
+    if (!q.second.empty() && q.second != "-1") {
+        for (size_t at = 0; at <= q.second.size();) {
+            const size_t comma = std::min(q.second.find(',', at), q.second.size());
+            const std::string name = q.second.substr(at, comma - at);
+            at = comma + 1;
+            if (name == "auto") {
+                for (const lamina::core::GpuInfo& gi : gpus)
+                    if (gi.ordinal != dev && lamina::core::gpu_unusable(gi.ordinal).empty())
+                        list += (list.empty() ? "" : ",") + std::to_string(gi.ordinal);
+                continue;
+            }
+            const int d = lamina::core::find_gpu(gpus, name, why);
+            if (d < 0 || d == dev) {
+                std::fprintf(stderr, "lamina: --second-gpu %s left out: %s\n", name.c_str(),
+                             d < 0 ? why.c_str() : "it is the main GPU");
+                continue;
+            }
+            if (const std::string no = lamina::core::gpu_unusable(d); !no.empty()) {
+                std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(), no.c_str());
+                continue;
+            }
+            list += (list.empty() ? "" : ",") + std::to_string(d);
+        }
+    }
+    cudaSetDevice(dev);
+    std::vector<char*>& rest = q.rest;
+    std::string flag = "--tier-gpus";
+    if (!list.empty()) {
+        rest.push_back(flag.data());
+        rest.push_back(list.data());
+    }
+    std::fprintf(stderr, "lamina: Hy4-flash (hy_v4_flash) on GPU %d, %s%s%s\n", dev, gpus[(size_t) dev].name.c_str(),
+                 list.empty() ? "" : "; expert tiers on GPUs ", list.c_str());
+    return lamina::hy4::run((int) rest.size(), rest.data());
+}
+#endif
 #endif
 
 }  // namespace
 
 int lamina::program::check_args(int argc, char** argv) {
+#if defined(LAMINA_HAVE_HY4)
+    if (Qwen35Line q = qwen35_line(argc, argv); q.hy4()) {
+        if (!q.bad.empty()) {
+            std::fprintf(stderr, "lamina: %s\n", q.bad.c_str());
+            return 2;
+        }
+        return lamina::hy4::check_args((int) q.rest.size(), q.rest.data());
+    }
+#endif
 #if defined(LAMINA_HAVE_QWEN35)
     if (Qwen35Line q = qwen35_line(argc, argv); q.qwen35()) {
         if (!q.bad.empty()) {
@@ -1879,6 +1952,9 @@ int lamina::program::run(int argc, char** argv) {
         setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0);
 #endif
     }
+#if defined(LAMINA_HAVE_HY4)
+    if (const int rc = hy4_switch(argc, argv); rc != kNotQwen35) return rc;
+#endif
 #if defined(LAMINA_HAVE_QWEN35)
     if (const int rc = qwen35_switch(argc, argv); rc != kNotQwen35) return rc;
 #endif

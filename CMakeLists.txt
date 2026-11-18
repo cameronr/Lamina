@@ -737,6 +737,19 @@ if(LAMINA_NATIVE_EXPERTS)
     add_executable(lamina-q36ref src/qwen35/q36ref.cu)
     target_include_directories(lamina-q36ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(lamina-q36ref PRIVATE lamina_kernels lamina_warnings CUDA::cudart)
+
+    # Hy4-flash (GGUF architecture hy_v4_flash): its own engine path, a library `lamina` switches to for such a model as
+    # it does for Qwen3.6, and lamina-hy4 wraps on its own.  Fast math as ggml-cuda (llama.cpp's PR, the reference).
+    add_library(lamina_hy4 STATIC src/hy4/hy4_engine.cu)
+    target_include_directories(lamina_hy4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(lamina_hy4 PRIVATE lamina_kernels lamina_kernels_cpu lamina_warnings lamina_serve_io
+                          CUDA::cudart)
+    target_compile_options(lamina_hy4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    add_executable(lamina-hy4 src/hy4/hy4_main.cpp)
+    target_link_libraries(lamina-hy4 PRIVATE lamina_hy4 CUDA::cudart)
+    target_link_libraries(lamina_program PUBLIC lamina_hy4)
+    target_compile_definitions(lamina_program PRIVATE LAMINA_HAVE_HY4=1)
   endif()
 endif()
 
