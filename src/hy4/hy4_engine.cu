@@ -148,6 +148,14 @@ struct Layer {
     C::NativeFmt fmt;
     uint8_t* arena = nullptr;   // n_expert blobs, `stride` bytes apart (host)
     size_t stride = 0;
+    // VRAM slots on the main GPU: the experts the routing uses most (Engine::place_slots, rebalance)
+    K::NativeExpertLayout gl;          // the GPU's view of a blob
+    uint8_t* slots = nullptr;          // n_slots blobs, `stride` apart (device)
+    int n_slots = 0;
+    std::vector<int32_t> slot_of;      // [n_expert]: its slot or -1 (host)
+    std::vector<int32_t> slot_expert;  // [n_slots]: its expert or -1
+    int32_t* slot_of_d = nullptr;      // slot_of on the device
+    std::vector<float> use;            // routing counts, halved at each rebalance
     // caches
     __half* kv = nullptr;       // latent rows: the context's cells (sparse) or the window's ring
     int64_t kv_cells = 0;
@@ -451,6 +459,14 @@ struct Engine {
     uint8_t* acts = nullptr;
     std::vector<C::ExpertJobMulti> jobs;
     cudaEvent_t ev = nullptr;
+    // the GPU's share of the routed experts: the entries grouped by slot, their input as q8_1, the kernels' scratch
+    unsigned long long* grp_ptr = nullptr;
+    int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr, *d_miss = nullptr;
+    int32_t* h_miss = nullptr;
+    uint8_t *rinq = nullptr, *escr = nullptr;
+    float* ecpu = nullptr;
+    int64_t hits = 0, lookups = 0;
+    std::string profile_path;
     // counters
     double cpu_ms = 0, table_ms = 0;
     int64_t forwards = 0;
@@ -545,6 +561,17 @@ struct Engine {
         h_raw = halloc<uint8_t>(n_mod * T * eh * ed);
         h_rows = halloc<uint32_t>(n_mod * T * eh);
         acts = (uint8_t*) heap_new(T * C::kNativeActBytes);
+        const size_t n_ent = T * (size_t) g.top_k;
+        grp_ptr = dalloc<unsigned long long>(n_ent + 1);
+        grp_start = dalloc<int32_t>(n_ent + 2);
+        n_groups = dalloc<int32_t>(1);
+        ent_dst = dalloc<int32_t>(n_ent);
+        ent_tok = dalloc<int32_t>(n_ent);
+        d_miss = dalloc<int32_t>(n_ent);
+        h_miss = halloc<int32_t>(n_ent);
+        rinq = dalloc<uint8_t>(T * (size_t) g.n_latent / 32 * q81);
+        escr = dalloc<uint8_t>(K::native_expert_scratch_bytes((int64_t) n_ent, g.n_ff_exp));
+        ecpu = dalloc<float>(n_ent * (size_t) g.n_latent);
         // the caches
         size_t kv_bytes = 0;
         for (Layer& l : m->layers) {
@@ -889,7 +916,15 @@ struct Engine {
         CK(cudaMemcpyAsync(h_rin, rin, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * Kk * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaEventRecord(ev, st));
-        // the shared expert on the GPU while the CPU runs the routed ones
+        // the experts with a slot on the GPU, then the shared expert, while the CPU runs the others
+        if (l.n_slots > 0) {
+            quant(rin, T, Ld, rinq);
+            hy4k::k_group_slots<<<1, 512, 0, st>>>(ids, T * Kk, Kk, E, l.slot_of_d, l.slots, l.stride, grp_ptr, grp_start,
+                                                  n_groups, ent_dst, ent_tok);
+            K::native_expert_grouped(l.gl, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                                     std::min<int64_t>((int64_t) T * Kk, E), (int64_t) T * Kk, rinq,
+                                     (int64_t) (Ld / 32) * 36, escr, parts, st);
+        }
         mmvq(l.s_gate, xq, sg, T);
         mmvq(l.s_up, xq, su, T);
         hy4k::k_swiglu<<<blocks((int64_t) T * F), hy4k::kThreads, 0, st>>>(sg, su, sh, (int64_t) T * F);
@@ -900,8 +935,13 @@ struct Engine {
         for (int t = 0; t < T; ++t) C::native_quant_act(l.fmt, h_rin + (size_t) t * Ld, acts + (size_t) t * C::kNativeActBytes);
         jobs.clear();
         std::map<int, size_t> open;
+        int n_miss = 0;
         for (int e = 0; e < T * Kk; ++e) {
             const int ex = h_ids[e], t = e / Kk;
+            l.use[(size_t) ex] += 1.f;
+            h_miss[e] = l.slot_of[(size_t) ex] < 0;
+            if (!h_miss[e]) continue;
+            ++n_miss;
             auto it = open.find(ex);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
@@ -914,13 +954,127 @@ struct Engine {
             j.out[j.nt] = h_out + (size_t) e * Ld;
             ++j.nt;
         }
-        pool->run_split_multi_native(l.fmt, jobs.data(), (int) jobs.size());
+        lookups += T * Kk;
+        hits += T * Kk - n_miss;
+        if (n_miss > 0) pool->run_split_multi_native(l.fmt, jobs.data(), (int) jobs.size());
         cpu_ms += ms_since(t0);
-        CK(cudaMemcpyAsync(parts, h_out, (size_t) T * Kk * Ld * 4, cudaMemcpyHostToDevice, st));
+        if (l.n_slots == 0) {
+            CK(cudaMemcpyAsync(parts, h_out, (size_t) T * Kk * Ld * 4, cudaMemcpyHostToDevice, st));
+        } else if (n_miss > 0) {
+            CK(cudaMemcpyAsync(ecpu, h_out, (size_t) T * Kk * Ld * 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) T * Kk * 4, cudaMemcpyHostToDevice, st));
+            hy4k::k_merge_cpu<<<T * Kk, hy4k::kThreads, 0, st>>>(parts, ecpu, d_miss, Ld);
+        }
         hy4k::k_moe_sum<<<T, hy4k::kThreads, 0, st>>>(parts, wts, moe, Kk, Ld);
         quant(moe, T, Ld, moeq);
         mmvq(l.r_up, moeq, y, T);
         hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(y, sy, (int64_t) T * N);
+    }
+
+    // ---- the routed experts in VRAM
+    /// Slots on the main GPU for every MoE layer, as many a layer as `gib` GiB hold (negative: the free VRAM less a
+    /// reserve), filled from the profile's counts (else experts 0..); the GPU's view of each layer's blobs.
+    void place_slots(double gib) {
+        const auto& g = m->g;
+        size_t row = 0;
+        for (const Layer& l : m->layers)
+            if (!l.dense) row += l.stride;
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const size_t reserve = (size_t) 1536 << 20;
+        const size_t budget = gib >= 0 ? (size_t) (gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
+        const int S = (int) std::min<size_t>((size_t) g.n_expert, row ? budget / row : 0);
+        load_profile();
+        for (Layer& l : m->layers) {
+            if (l.dense) continue;
+            l.gl = K::native_expert_layout(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp);
+            l.gl.swiglu_limit = l.fmt.swiglu_limit;
+            if (l.use.empty()) l.use.assign((size_t) g.n_expert, 0.f);
+            l.slot_of.assign((size_t) g.n_expert, -1);
+            l.slot_of_d = dalloc<int32_t>((size_t) g.n_expert);
+            if (S <= 0 || !K::native_expert_supported(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp)) continue;
+            l.n_slots = S;
+            l.slots = dalloc<uint8_t>((size_t) S * l.stride);
+            l.slot_expert.assign((size_t) S, -1);
+            std::vector<int32_t> order((size_t) g.n_expert);
+            for (int e = 0; e < (int) g.n_expert; ++e) order[(size_t) e] = e;
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
+            for (int k = 0; k < S; ++k) put_slot(l, k, order[(size_t) k]);
+            CK(cudaMemcpy(l.slot_of_d, l.slot_of.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice));
+        }
+        CK(cudaDeviceSynchronize());
+        std::fprintf(stderr, "lamina: %d of %lld routed experts a layer in VRAM (%.2f GiB)%s\n", std::max(S, 0),
+                     (long long) g.n_expert, (double) std::max(S, 0) * (double) row / (double) (1ull << 30),
+                     profile_loaded ? ", the profile's" : "");
+    }
+    void put_slot(Layer& l, int k, int32_t e) {
+        if (l.slot_expert[(size_t) k] >= 0) l.slot_of[(size_t) l.slot_expert[(size_t) k]] = -1;
+        CK(cudaMemcpyAsync(l.slots + (size_t) k * l.stride, l.arena + (size_t) e * l.stride, l.fmt.bytes,
+                           cudaMemcpyHostToDevice, st));
+        l.slot_expert[(size_t) k] = e;
+        l.slot_of[(size_t) e] = k;
+    }
+    /// The slots to the experts the routing used most: in each layer the most used experts without a slot take the slots
+    /// of the least used ones that are used less, at most `max_swaps` copies in all; then the counts are halved.
+    int rebalance(int max_swaps) {
+        const auto& g = m->g;
+        int swaps = 0;
+        for (Layer& l : m->layers) {
+            if (l.n_slots == 0) continue;
+            std::vector<int32_t> out, in;
+            for (int e = 0; e < (int) g.n_expert; ++e) (l.slot_of[(size_t) e] < 0 ? out : in).push_back(e);
+            std::sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
+            std::sort(in.begin(), in.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] < l.use[(size_t) b]; });
+            bool moved = false;
+            for (size_t i = 0; i < out.size() && i < in.size() && swaps < max_swaps; ++i) {
+                if (l.use[(size_t) out[i]] <= 1.25f * l.use[(size_t) in[i]] + 0.5f) break;
+                put_slot(l, l.slot_of[(size_t) in[i]], out[i]);
+                ++swaps;
+                moved = true;
+            }
+            if (moved) CK(cudaMemcpyAsync(l.slot_of_d, l.slot_of.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice, st));
+            for (float& u : l.use) u *= 0.5f;
+        }
+        CK(cudaStreamSynchronize(st));
+        return swaps;
+    }
+    // the profile: 'HY4P', n_layers, n_expert, then each MoE layer's counts (float)
+    bool profile_loaded = false;
+    void load_profile() {
+        if (profile_path.empty()) return;
+        FILE* f = std::fopen(profile_path.c_str(), "rb");
+        if (!f) return;
+        int32_t hdr[3] = {};
+        const auto& g = m->g;
+        if (std::fread(hdr, 4, 3, f) == 3 && hdr[0] == 0x50345948 && hdr[1] == (int32_t) g.n_layers &&
+            hdr[2] == (int32_t) g.n_expert) {
+            bool ok = true;
+            for (Layer& l : m->layers) {
+                if (l.dense) continue;
+                l.use.assign((size_t) g.n_expert, 0.f);
+                ok = ok && std::fread(l.use.data(), 4, l.use.size(), f) == l.use.size();
+            }
+            profile_loaded = ok;
+            if (!ok)
+                for (Layer& l : m->layers) l.use.clear();
+        }
+        std::fclose(f);
+    }
+    void save_profile() {
+        if (profile_path.empty()) return;
+        const std::string tmp = profile_path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) return;
+        const auto& g = m->g;
+        const int32_t hdr[3] = {0x50345948, (int32_t) g.n_layers, (int32_t) g.n_expert};
+        bool ok = std::fwrite(hdr, 4, 3, f) == 3;
+        for (const Layer& l : m->layers)
+            if (!l.dense) ok = ok && std::fwrite(l.use.data(), 4, l.use.size(), f) == l.use.size();
+        ok = std::fclose(f) == 0 && ok;
+        if (ok) {
+            std::remove(profile_path.c_str());
+            std::rename(tmp.c_str(), profile_path.c_str());
+        }
     }
 
     /// row r's logits on the host
@@ -1013,6 +1167,7 @@ struct Serve {
         }
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
+        const long long hits0 = E.hits, lookups0 = E.lookups;
         const auto d0 = Clock::now();
         long long produced = 0;
         const char* finish = "length";
@@ -1028,10 +1183,15 @@ struct Serve {
             const int32_t one = nx;
             E.forward(&one, 1);
             E.host_logits(0, lg);
+            if (produced % 128 == 0) E.rebalance(32);
         }
         const double decode_ms = ms_since(d0);
-        serve_print("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms, decode_ms,
-                    finish, reuse, (long long) fresh);
+        const long long hits = E.hits - hits0, lookups = E.lookups - lookups0;
+        serve_print("DONE %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
+                    decode_ms, finish, reuse, hits, lookups, (long long) fresh);
+        const int swaps = E.rebalance(512);
+        E.save_profile();
+        if (swaps > 0) std::fprintf(stderr, "lamina: %d experts moved into VRAM slots\n", swaps);
         std::fprintf(stderr, "lamina: %zu prompt tokens (%zu reused) in %.1f ms, %lld generated in %.1f ms (%.2f tok/s), "
                      "%s\n", ids.size(), reuse, prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, finish);
@@ -1082,6 +1242,8 @@ int run_engine(int argc, char** argv, bool check_only) {
     int64_t max_ctx = 8192;
     int n_gen = 64, threads = 0;
     bool serve = false;
+    double expert_vram = -1;
+    std::string profile;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -1107,6 +1269,9 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--dump-full-logits") dump_full = next();
         else if (a == "--cpu-threads" || a == "--pool-workers") threads = std::atoi(next());
         else if (a == "--serve") serve = true;
+        else if (a == "--expert-vram") expert_vram = std::atof(next());
+        else if (a == "--expert-profile") profile = next();
+        else if (a == "--tier-gpus") (void) next();   // the expert tiers' GPUs: not used yet (open item ey)
         else {
             std::fprintf(stderr, "lamina: Hy4-flash's path does not take %s\n", a.c_str());
             return 2;
@@ -1121,7 +1286,9 @@ int run_engine(int argc, char** argv, bool check_only) {
         return 1;
     }
     Engine E;
+    E.profile_path = profile;
     E.init(m, max_ctx, threads);
+    E.place_slots(expert_vram);
     if (serve) {
         Serve sv(E, m.eos);
         return sv.run();
@@ -1163,6 +1330,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         const int32_t nx = i < (int) forced.size() ? forced[(size_t) i] : a;
         E.forward(&nx, 1);
         E.host_logits(0, lg);
+        if ((i + 1) % 128 == 0) E.rebalance(32);
     }
     const double tg_ms = ms_since(t1);
     if (ff) std::fclose(ff);
@@ -1170,9 +1338,10 @@ int run_engine(int argc, char** argv, bool check_only) {
     for (int t : gen) serve_print(" %d", t);
     serve_print("\n");
     std::fprintf(stderr, "lamina: prompt %zu tokens in %.1f ms (%.1f tok/s), %zu generated in %.1f ms (%.2f tok/s); "
-                 "the CPU's experts %.1f ms, the table %.1f ms while generating\n", prompt.size(), pp_ms,
+                 "the CPU's experts %.1f ms, the table %.1f ms while generating; VRAM hits %.1f%%\n", prompt.size(), pp_ms,
                  prompt.size() / (pp_ms / 1000.0), gen.size(), tg_ms, gen.size() / (tg_ms / 1000.0), E.cpu_ms - cpu0,
-                 E.table_ms - tab0);
+                 E.table_ms - tab0, E.lookups ? 100.0 * (double) E.hits / (double) E.lookups : 0.0);
+    E.save_profile();
     return 0;
 }
 

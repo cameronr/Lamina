@@ -401,6 +401,45 @@ __global__ void k_moe_sum(const float* parts, const float* w, float* y, int k, i
     }
 }
 
+/// The routed entries (n_ent = T * K, ids[t * K + j]) whose expert holds a VRAM slot (slot_of[x] >= 0) grouped per
+/// expert in ascending id: group g's blob at slots + slot * stride, its entries [grp_start[g], grp_start[g + 1]) writing
+/// row ent_dst (the entry) from token ent_tok.  The others are the CPU pool's (k_merge_cpu).  One block of 512.
+__global__ void k_group_slots(const int32_t* ids, int n_ent, int K_, int n_expert, const int32_t* slot_of,
+                              const uint8_t* slots, unsigned long long stride, unsigned long long* grp_ptr,
+                              int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok) {
+    __shared__ int cnt[1024], off[1024];
+    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x)
+        if (slot_of[ids[e]] >= 0) atomicAdd(&cnt[ids[e]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int g = 0, pos = 0;
+        for (int x = 0; x < n_expert; ++x) {
+            off[x] = pos;
+            if (cnt[x] == 0) continue;
+            grp_ptr[g] = (unsigned long long) (slots + (size_t) slot_of[x] * stride);
+            grp_start[g] = pos;
+            pos += cnt[x];
+            ++g;
+        }
+        grp_start[g] = pos;
+        *n_groups = g;
+        for (int e = 0; e < n_ent; ++e) {
+            if (slot_of[ids[e]] < 0) continue;
+            const int p = off[ids[e]]++;
+            ent_dst[p] = e;
+            ent_tok[p] = e / K_;
+        }
+    }
+}
+/// The CPU pool's rows into the entries' rows: parts[e] = cpu[e] where miss[e].  A block per entry.
+__global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss, int n) {
+    const int e = blockIdx.x;
+    if (!miss[e]) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) parts[(size_t) e * n + i] = cpu[(size_t) e * n + i];
+}
+
 // ------------------------------------------------------------------------------------------------ Engram
 /// OCP FP8 E4M3 -> f32 (ggml_f8_e4m3_to_fp32: 0x7F / 0xFF NaN, subnormals M * 2^-9)
 __device__ __forceinline__ float e4m3(uint8_t x) {
