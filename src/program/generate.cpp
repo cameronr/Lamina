@@ -346,6 +346,9 @@ const char* const kTierName[lamina::core::kMaxGpuTiers] = {"second", "third", "f
 /// A per-tier option's value for tier `t` (--second-gpu's order): its list's t-th, the last one for the tiers past it.
 double tier_value(const std::vector<double>& v, size_t t) { return v.empty() ? 0.0 : v[std::min(t, v.size() - 1)]; }
 
+/// Whether tier `t` sleeps under its threshold (its card's sleep): a tier after the first, in a run whose experts move.
+bool tier_sleeps(const Options& o, size_t t) { return t > 0 && o.adapt_every > 0 && !o.deterministic_adapt; }
+
 /// --gpu's cards into the options the engine reads: the first card names the main GPU and gives its settings, the
 /// others name the tiers (tier_names, tier_cards).  A --main-gpu after the last --gpu names the main GPU in the first
 /// card's place (its settings stay), a --second-gpu after it the tiers in the later cards' place (-1: none), as a later
@@ -1945,9 +1948,10 @@ int lamina::program::run(int argc, char** argv) {
         kept_cards.push_back(card_of(i));
     }
     o.tier_cards = std::move(kept_cards);
-    // --second-gpu-pin-gib: the first tier's vram-only, unless its card gives one
-    if (o.second_gpu_pin_gib > 0 && !o.tier_cards.empty() && !o.tier_cards[0].has_vram_only())
-        o.tier_cards[0].vram_only = (uint64_t) (o.second_gpu_pin_gib * 1073741824.0);
+    // --second-gpu-pin-gib: the vram-only experts of the tier that comes first once the unusable ones are left out
+    // and auto's are ordered by their links (each tier's settings), unless its card gives its own
+    const uint64_t first_tier_pins = o.tier_cards.empty() || o.tier_cards[0].has_vram_only()
+                                         ? 0 : (uint64_t) (o.second_gpu_pin_gib * 1073741824.0);
     o.second_gpu = o.tier_gpus.empty() ? -1 : o.tier_gpus[0];
     if (!set_stack_limit(o.main_gpu, o.main_gpu)) {   // the second GPU's before its tier sizes itself
         std::fprintf(stderr, "lamina: cannot set the CUDA stack limit\n");
@@ -2399,10 +2403,13 @@ int lamina::program::run(int argc, char** argv) {
     std::vector<std::vector<std::pair<int32_t, int32_t>>> tier_pins;   // per tier (o.tier_gpus's order at the pins)
     std::vector<uint8_t> vram_only;   // per (layer, expert): 1 only in the main GPU's VRAM, 2 + t only in tier t's
     int pin_auto = -2;                // the card with vram-only=auto: -1 the main GPU, t a tier, -2 none
-    bool pinning = o.vram_pin_gib > 0 || o.vram_pin_auto;
+    bool pinning = o.vram_pin_gib > 0 || o.vram_pin_auto || first_tier_pins > 0;
     {
         std::string why;
         if (o.vram_pin_auto) pin_auto = -1;
+        if (first_tier_pins > 0 && o.no_prompt_offload)
+            why = "--second-gpu-pin-gib: the first tier's vram-only experts need the prompt path's share there (not "
+                  "--no-prompt-offload, nor --expert-math exact)";
         for (size_t t = 0; t < o.tier_cards.size() && why.empty(); ++t) {
             const lamina::program::GpuCard& c = o.tier_cards[t];
             if (!c.has_vram_only()) continue;
@@ -2413,7 +2420,8 @@ int lamina::program::run(int argc, char** argv) {
             else if (t >= 2) why = card + "vram-only on the fourth GPU: it computes no prompts, so they would have no home";
             else if (o.no_prompt_offload) why = card + "a tier's vram-only experts need the prompt path's share there "
                                                        "(not --no-prompt-offload, nor --expert-math exact)";
-            else if (sleep_us > 0) why = card + "a card with vram-only experts does not sleep (they have no other home)";
+            else if (sleep_us > 0 && tier_sleeps(o, t))
+                why = card + "a card with vram-only experts does not sleep (they have no other home)";
             else if (t == 1 && o.prompt_split > 0 && o.prompt_split2 > o.prompt_split)
                 why = card + "--prompt-split L,M runs the third GPU's own layers there: its vram-only experts of the "
                              "other layers would have no home in prompts";
@@ -2503,7 +2511,7 @@ int lamina::program::run(int argc, char** argv) {
     // then they load once the main GPU's cache is sized, as with any pins, and take() works out how many
     if (pin_auto != -2) {
         const lamina::kernels::cpu::ExpertLayout& lay = lamina::kernels::cpu::expert_layout();
-        uint64_t named = (uint64_t) (o.vram_pin_gib * 1073741824.0);
+        uint64_t named = (uint64_t) (o.vram_pin_gib * 1073741824.0) + first_tier_pins;
         for (const lamina::program::GpuCard& c : o.tier_cards) named += c.vram_only.value_or(0);
         const uint64_t in_ram = lay.total > named ? lay.total - named : 0;
         const uint64_t room = lamina::platform::ram_fit(0).room();
@@ -2511,7 +2519,7 @@ int lamina::program::run(int argc, char** argv) {
             std::fprintf(stderr, "lamina: vram-only=auto: the experts (%.1f GiB%s) fit the RAM, none only in VRAM\n",
                          (double) in_ram / 1073741824.0, ple_ram > 0 ? " and the PLE table" : "");
             pin_auto = -2;
-            bool named_pins = o.vram_pin_gib > 0;
+            bool named_pins = o.vram_pin_gib > 0 || first_tier_pins > 0;
             for (const lamina::program::GpuCard& c : o.tier_cards) named_pins = named_pins || c.vram_only.value_or(0) > 0;
             pinning = named_pins;
         } else if (pin_auto == 1 && o.prompt_tiers < 2) {
@@ -2665,7 +2673,7 @@ int lamina::program::run(int argc, char** argv) {
                      : o.second_gpu_clocks.empty() ? std::string()
                                                    : o.second_gpu_clocks[std::min(t, o.second_gpu_clocks.size() - 1)];
             s.sleep_us = c.sleep ? *c.sleep * 1e6 : tier_value(o.second_gpu_sleep_us, t);
-            s.vram_only = c.vram_only.value_or(0);
+            s.vram_only = c.vram_only.value_or(t == 0 && !c.has_vram_only() ? first_tier_pins : 0);
             s.vram_only_auto = c.vram_only_auto && pin_auto != -2;
         }
         for (size_t t = 0; t < devs.size(); ++t) {
@@ -3287,7 +3295,7 @@ int lamina::program::run(int argc, char** argv) {
                 drive.power[t].adapt = &ts.adapt;
                 work_pins[(size_t) t] = own;
                 if (const double us = set.sleep_us; us > 0) {
-                    if (t == 0 || o.adapt_every <= 0 || o.deterministic_adapt) {
+                    if (!tier_sleeps(o, (size_t) t)) {
                         std::fprintf(stderr, "lamina: the %s GPU does not sleep (%s)\n", kTierName[t],
                                      t == 0 ? "the first tier carries the prompts' share, the head's rows and the prefetch"
                                             : "--adapt-every 0 and --deterministic-adapt keep the experts in place");
