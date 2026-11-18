@@ -450,8 +450,8 @@ thread_local json* Service::trace = nullptr;
 
 Service::Service(std::shared_ptr<Engine> engine_, const Tokenizer& tok_, std::shared_ptr<ChatTemplate> tpl_,
                  std::string model_, std::shared_ptr<Vision> vision_, json sampling_defaults_, bool fit_max_tokens_)
-    : fit_max_tokens(fit_max_tokens_), sampling_defaults(std::move(sampling_defaults_)), engine(std::move(engine_)),
-      tok(tok_), tpl(std::move(tpl_)), model(std::move(model_)), vision(std::move(vision_)) {
+    : fit_max_tokens(fit_max_tokens_), engine(std::move(engine_)), tok(tok_), tpl(std::move(tpl_)),
+      model(std::move(model_)), vision(std::move(vision_)), sampling_defaults_(std::move(sampling_defaults_)) {
     literals = literal_tags(tok.control_tokens());
     for (const char* s : {"<|im_end|>", "<|endoftext|>"})
         for (const int32_t t : tok.encode(s, true)) stop_ids.insert(t);
@@ -529,10 +529,54 @@ void Service::set_aliases(const json& value) {
     } else if (!value.is_null()) {
         throw std::invalid_argument("aliases=" + py_repr_value(value) + ": expected a list of model names");
     }
-    aliases.clear();
+    std::vector<std::string> out;
     for (const auto& raw : items) {
         const std::string x(strip(raw));
-        if (!x.empty() && x != model && std::find(aliases.begin(), aliases.end(), x) == aliases.end()) aliases.push_back(x);
+        if (!x.empty() && x != model && std::find(out.begin(), out.end(), x) == out.end()) out.push_back(x);
+    }
+    std::lock_guard<std::mutex> lk(live_mu_);
+    aliases_ = std::move(out);
+}
+
+std::vector<std::string> Service::aliases_now() const {
+    std::lock_guard<std::mutex> lk(live_mu_);
+    return aliases_;
+}
+
+void Service::set_reasoning_budget_tokens(json v) {
+    std::lock_guard<std::mutex> lk(live_mu_);
+    reasoning_budget_tokens_ = std::move(v);
+}
+
+json Service::sampling_defaults_now() const {
+    std::lock_guard<std::mutex> lk(live_mu_);
+    return sampling_defaults_;
+}
+
+void Service::apply_setting(const std::string& key, const json& v) {
+    if (starts_with(key, "sampling.")) {
+        std::lock_guard<std::mutex> lk(live_mu_);
+        if (v.is_null()) sampling_defaults_.erase(key.substr(9));
+        else sampling_defaults_[key.substr(9)] = v;
+    } else if (key == "reasoning_budget_tokens") {
+        set_reasoning_budget_tokens(v.is_null() ? json(0) : v);
+    } else if (key == "fit_max_tokens") {
+        fit_max_tokens = v != false;
+    } else if (key == "anthropic_thinking") {
+        anthropic_think_unasked = v.is_null() || v == "model";
+    } else if (key == "aliases") {
+        set_aliases(v);
+    } else if (key == "idle_unload_s") {
+        idle_unload_s = v.is_number() ? v.get<double>() : 0.0;
+        start_idle_unload();
+    } else if (key == "engine_silence_s") {
+        engine->set_silence_s(v.is_number() ? v.get<double>() : 300.0);
+    } else if (key == "api_monitor") {
+        api_monitor = v == true;
+        if (!api_monitor) {   // the prompts and answers it kept go with it
+            std::lock_guard<std::mutex> lk(status_mu);
+            api_requests.clear();
+        }
     }
 }
 
@@ -548,14 +592,16 @@ void Service::note_client_disconnect(Cancel& cancel) {
 
 std::vector<std::string> Service::model_names() const {
     std::vector<std::string> out{model};
-    out.insert(out.end(), aliases.begin(), aliases.end());
+    const std::vector<std::string> a = aliases_now();
+    out.insert(out.end(), a.begin(), a.end());
     return out;
 }
 
 std::string Service::model_for(const json& req) const {
     // the request's own name when it is an alias (#297), else the model's; other names are still served
     const std::string asked = jstr(req, "model");
-    return std::find(aliases.begin(), aliases.end(), asked) != aliases.end() ? asked : model;
+    const std::vector<std::string> a = aliases_now();
+    return std::find(a.begin(), a.end(), asked) != a.end() ? asked : model;
 }
 
 int64_t Service::reported_ctx() {
@@ -566,7 +612,10 @@ int64_t Service::reported_ctx() {
 
 std::optional<int64_t> Service::reasoning_budget(const json& req) const {
     json value = req.is_object() ? jget(req, "reasoning_budget_tokens") : json(nullptr);
-    if (value.is_null()) value = reasoning_budget_tokens;
+    if (value.is_null()) {
+        std::lock_guard<std::mutex> lk(live_mu_);
+        value = reasoning_budget_tokens_;
+    }
     if (value.is_number_float() && value.get<double>() == std::floor(value.get<double>())) value = (int64_t) value.get<double>();
     if (!is_int(value))
         throw RequestError("reasoning_budget_tokens=" + py_repr_value(value) + ": expected a whole number of tokens (0: no budget)");
@@ -723,16 +772,20 @@ std::string Service::unload_waiting(double wait_s) {
 }
 
 void Service::start_idle_unload() {
-    if (idle_unload_s <= 0) return;
-    say("[lamina] the model unloads after " + std::to_string((int) idle_unload_s) + " s without requests");
+    // at the start, and again when the Settings view sets the time: one thread, which reads the time as it goes
+    const double idle = idle_unload_s;
+    if (idle > 0) say("[lamina] the model unloads after " + std::to_string((int) idle) + " s without requests");
+    if (idle <= 0 || idle_thread_.joinable()) return;
     idle_thread_ = std::thread([this] {
-        const double every = std::max(1.0, std::min(30.0, idle_unload_s / 4));
         while (!stopping_.load()) {
+            const double every = std::max(1.0, std::min(30.0, idle_unload_s / 4));
             for (double t = 0; t < every && !stopping_.load(); t += 0.25)
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             if (stopping_.load()) break;
+            const double now = idle_unload_s;
+            if (now <= 0) continue;   // turned off (0: never)
             try {
-                unload(idle_unload_s);
+                unload(now);
             } catch (const std::exception& e) {
                 say(std::string("[lamina] idle unload: ") + e.what());
             }

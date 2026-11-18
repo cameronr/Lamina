@@ -1,7 +1,7 @@
 """par_bench.py - aggregate decode throughput of N requests at once: lamina-q36 (--batch) and llama.cpp (llama-server -np N),
 same GGUF, same prompt ids, greedy, 128 new tokens each.  One JSON line per (engine, N, round).
 
-  python q36_par_bench.py lamina --exe E --args "--model M --max-context 8192 --batch 8 --mtp 0" --ns 1,2,4,8 --rounds 3 --out F
+  python q36_par_bench.py lamina --exe E --args "--model M --max-context 8192 --batch 8 --drafts-per-step 0" --ns 1,2,4,8 --rounds 3 --out F
   python q36_par_bench.py llama --server BIN --model M --ns 1,2,4,8 --rounds 3 --out F [--port 8197]
 
 The lamina wall time runs from the first BGEN to the last BDONE (admissions included); the llama one from the first request

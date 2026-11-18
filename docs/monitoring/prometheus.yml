@@ -4,7 +4,7 @@ scrape_configs:
   - job_name: lamina
     metrics_path: /metrics
     scrape_interval: 15s
-    # with an API key (lamina-<model>.json "api_key" or --api-key): sent as a bearer token
+    # with an API key (the config's "api_key" or --api-key): sent as a bearer token
     authorization:
       type: Bearer
       credentials_file: /etc/prometheus/lamina-api-key

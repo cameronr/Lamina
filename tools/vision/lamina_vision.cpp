@@ -91,6 +91,16 @@ int main(int argc, char** argv) {
                              "[--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]\n");
         return 2;
     }
+#if !LAMINA_VISION_CUDA
+    // Built without CUDA there is no GPU to run on: mtmd would fall back to the CPU, with its default threads and after
+    // the GPU path's warm-up (16.6 s at 1,024 tokens on an 8-core CPU, against 0.3-0.4 s on a GPU).  Said, not done.
+    if (gpu) {
+        std::printf("ERR this lamina-vision was built without CUDA and runs on the CPU alone: set the config's vision "
+                    "\"gpu\" to false, or put a CUDA build of lamina-vision beside lamina-server\n");
+        std::fflush(stdout);
+        return 2;
+    }
+#endif
     // On the CPU the GPU stays unseen: a CUDA build otherwise opens a context there (measured: 0.4-0.7 GB of VRAM,
     // 150-260 expert slots less for the engine beside it).  Before anything reaches the CUDA runtime.
     if (!gpu) {
@@ -103,6 +113,18 @@ int main(int argc, char** argv) {
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);
     llama_backend_init();
+    // --gpu where no GPU is visible (the config's "cuda_device" names a card that is not there: the server hands it to
+    // CUDA as CUDA_VISIBLE_DEVICES; or the driver gives none): said, not done.  mtmd would fall back to the CPU quietly,
+    // with its default threads and after the GPU path's warm-up, as a build without CUDA did.
+    if (gpu && ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr &&
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) == nullptr) {
+        const char* vis = std::getenv("CUDA_VISIBLE_DEVICES");
+        const std::string shown = vis != nullptr && *vis ? std::string(" (CUDA_VISIBLE_DEVICES=") + vis + ")" : "";
+        std::printf("ERR lamina-vision sees no GPU%s: name a card that is there in the config's vision \"cuda_device\" "
+                    "(nvidia-smi -L lists them), or set \"gpu\" to false\n", shown.c_str());
+        std::fflush(stdout);
+        return 2;
+    }
 
     const auto load_t0 = std::chrono::steady_clock::now();
 #if !defined(_WIN32)

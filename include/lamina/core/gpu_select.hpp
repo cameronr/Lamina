@@ -29,12 +29,17 @@ std::vector<GpuInfo> list_gpus();
 /// `device`: it is current after it, with its context, which goes again when the kernels do not run there.
 std::string gpu_unusable(int device);
 
+/// Whether the GPU at PCI bus id `bus_id` (nvidia-smi's "00000000:02:00.0") is in the desktop's use, as NVML sees it: a
+/// display active there, or a process's graphics context on it (dwm.exe and the desktop's apps on Windows: the display
+/// flag alone reads off while the monitor sleeps).  False where NVML cannot say.
+bool gpu_in_desktop_use(const std::string& bus_id);
+
 /// The ordinal `spec` names: an ordinal ("2"), a UUID or a prefix of it that only one card has ("GPU-f26e9ba6"), a PCI
 /// bus id ("10:00.0", "0000:10:00.0", nvidia-smi's "00000000:10:00.0"), or a name or a part of one that only one card
 /// has ("RTX 3090", case-insensitive; a whole name wins over a part of another; a number no ordinal is, as a word of
 /// one: "3090", not "7").  -1
-/// with `why` when none or several match (then each one's ordinal, name and UUID).  serve/server.py's find_gpu reads
-/// names the same way.
+/// with `why` when none or several match (then each one's ordinal, name and UUID).  lamina-server's find_gpu
+/// (src/server/config.cpp) reads names the same way.
 int find_gpu(const std::vector<GpuInfo>& gpus, const std::string& spec, std::string& why);
 
 /// A tier's GPU as a short probe saw it: the pinned host-to-device rate of 64 MiB copies (GB/s, the best of five

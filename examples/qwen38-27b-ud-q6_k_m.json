@@ -12,7 +12,7 @@
     "1536",
     "--kv",
     "q8_0",
-    "--mtp",
+    "--drafts-per-step",
     "7",
     "--spec-min-p",
     "0.3",
@@ -33,7 +33,6 @@
   "log": "./lamina-qwen38-27b-ud-q6_k_m.log",
   "lib_dirs": [],
   "vision": {
-    "exe": "./build-vision/bin/lamina-vision.exe",
     "mmproj": "../Lamina-data/models/qwen38-27b-UD-Q6_K_M/mmproj-F16.gguf",
     "model": "../Lamina-data/models/qwen38-27b-UD-Q6_K_M/Qwen3.8-27B-UD-Q6_K_M.gguf",
     "gpu": false,

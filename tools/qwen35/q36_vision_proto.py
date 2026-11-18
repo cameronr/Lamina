@@ -8,7 +8,7 @@ together (BGENI / BGEN) give each the tokens of its solo run; 3. the conversatio
 longer one (the first, its answer and more text) reuse the held state, a different picture does not; a text request after
 a picture request is not disturbed (the rotary offset is back at 0).
 
-Start the engine without --mtp for the cache check: the held tokens of a request that ran with drafts include the drafts accepted past
+Start the engine without --drafts-per-step for the cache check: the held tokens of a request that ran with drafts include the drafts accepted past
 its last emitted token, so a prompt that does not repeat them reads from the start (correct, but the check wants the reuse)."""
 from pathlib import Path
 import argparse, json, os, shlex, sys

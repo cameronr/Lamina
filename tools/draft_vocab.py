@@ -1,7 +1,9 @@
-"""The draft head's token subset (rt/draft_vocab.bin): the vocabulary rows the MTP draft layer may propose.
+"""The draft head's token subset (data/draft_vocab*.bin): the vocabulary rows the MTP draft layer may propose.
 
-The engine reads rt/draft_vocab.bin (int32 token ids) when the draft layer binds and computes the draft logits over
-those rows only: a smaller head is faster and takes less VRAM, but a token outside the subset can never be drafted.
+The draft layer's file holds its subset (the tensor draft_vocab, int32 token ids), which the engine reads when the
+layer binds, and computes the draft logits over those rows only: a smaller head is faster and takes less VRAM, but a
+token outside the subset can never be drafted.  This writes a subset as a file of int32 ids;
+`tools/mtp_rt.py --gguf <layer> --draft-vocab <it> --out <new layer>` puts it into a layer's file.
 The shipped subset was built from English and code and had 27 of the vocabulary's 55,328 Han tokens, so an answer in
 Chinese drafted almost nothing (#137).  This adds whole scripts to a subset:
 

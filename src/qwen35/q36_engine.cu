@@ -1045,8 +1045,8 @@ struct Model {
     bool kv_q8 = false;                        // --kv q8_0: K and V in q8_0 rows (kKvQ8Row), else FP16
     /// A KV head's cell of K or V, in bytes
     size_t kv_row() const { return kv_q8 ? (size_t) kKvQ8Row : (size_t) g.head_dim * sizeof(__half); }
-    // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
-    // attention + MoE layer, shared_head_norm, the main head
+    // the GGUF-native MTP block (blk.<n_layers>, drafting with --drafts-per-step): eh_proj over [enorm(e) | hnorm(h)],
+    // then an attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
     Layer mtp;
     Mat eh_proj;
@@ -1337,8 +1337,8 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
     m.layers.resize((size_t) g.n_layers);
-    // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
-    // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
+    // the MTP block whenever the file has one, with or without drafts (--drafts-per-step): the VRAM it takes is then
+    // the same either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on drafts
     (void) want_mtp;
     m.has_mtp = g.n_mtp_layers > 0;
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
@@ -1392,8 +1392,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
             return false;
         }
         if (!K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff)) {
-            err = L(l, "experts are ") + tg->type_name() + "/" + td->type_name() + ", which the native expert kernels " +
-                  "do not take (build with -DLAMINA_Q6K_EXPERTS=ON for Q6_K)";
+            err = L(l, "experts are ") + tg->type_name() + "/" + td->type_name() + ", which the native expert kernels do not take";
             return false;
         }
         y.L = K::native_expert_layout((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
@@ -2639,7 +2638,7 @@ struct Engine {
     /// rejected draft and nothing else - the answer is the plain greedy answer whatever draft_n is.  0 = the whole vocabulary.
     int draft_n = 0;
     // --spec-min-p: a draft whose probability under the draft head (p_draft, from head_draft) is below this ends the
-    // step's drafts before it (0: every step makes --mtp drafts)
+    // step's drafts before it (0: every step makes --drafts-per-step drafts)
     float draft_min_p = 0.f;
     float* p_draft = nullptr;
     void head_draft(const float* hn) {
@@ -3728,7 +3727,7 @@ struct Slot {
     long long offered = 0, accepted = 0;
 };
 
-/// The engine protocol (serve/server.py).  One request at a time on the control lines: GEN / GENI (alone: speculative
+/// The engine protocol (lamina-server's).  One request at a time on the control lines: GEN / GENI (alone: speculative
 /// steps with the MTP block), or with --batch N BGEN / BGENI <slot> (the request's prompt is read into that slot's
 /// session - the decode windows of the other slots go on between its chunks - then its tokens come as BT lines, one
 /// window for every slot decoding, until BDONE).  BSTOP <slot> ends a slot at its next window; STOP the request on the
@@ -4311,7 +4310,8 @@ int serve(Engine& E) {
 
 }  // namespace
 
-static int run_engine(int argc, char** argv) {
+/// The engine's run, or with `check_only` its command line's parse alone (no CUDA call, nothing loaded).
+static int run_engine(int argc, char** argv, bool check_only) {
     std::string model, tokens, force, dump_full, emb_file, kv = "fp16";
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
@@ -4364,16 +4364,23 @@ static int run_engine(int argc, char** argv) {
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-graph") graph = false;
         else if (a == "--no-warmup") warm = false;
+        else if (a == "--drafts-per-step") mtp_d = std::atoi(next().c_str());   // the GGUF's own MTP block's drafts
         else if (a == "--mtp") {
-            // a number of drafts; Flash-Next's "--mtp <draft layer dir>" means nothing for this family
+            // Flash-Next's draft layer file, which this family has no use for; a number is the earlier releases'
+            // --drafts-per-step, taken with a warning so their configs still start
             const std::string v = next();
-            if (!v.empty() && std::isdigit((unsigned char) v[0])) mtp_d = std::atoi(v.c_str());
-            else std::fprintf(stderr, "lamina: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N "
-                                      "drafts)\n", v.c_str());
+            if (!v.empty() && std::isdigit((unsigned char) v[0])) {
+                mtp_d = std::atoi(v.c_str());
+                std::fprintf(stderr, "lamina: --mtp %s is --drafts-per-step %s on this path (--mtp names Flash-Next's "
+                                     "draft layer)\n", v.c_str(), v.c_str());
+            } else {
+                std::fprintf(stderr, "lamina: ignoring --mtp %s (this family drafts with the GGUF's own MTP block: "
+                                     "--drafts-per-step N)\n", v.c_str());
+            }
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--kv") kv = next();                                        // the K / V cache's format: fp16 or q8_0
-        else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next().c_str());   // drafts while this sure (0: --mtp of them)
+        else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next().c_str());   // drafts while this sure (0: all of them)
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is lamina-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
@@ -4386,7 +4393,7 @@ static int run_engine(int argc, char** argv) {
         else if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // not a skip: it steers
             std::fprintf(stderr, "lamina: %s: control vectors run on Qwen3.8-Flash-Next's engine only\n", a.c_str());
             return 2;
-        } else if (serve_mode && a.rfind("--", 0) == 0) {
+        } else if (serve_mode && !check_only && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
             const bool val = i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0;
@@ -4394,6 +4401,7 @@ static int run_engine(int argc, char** argv) {
                          val ? " " : "", val ? argv[i + 1] : "");
             if (val) ++i;
         } else {
+            std::fprintf(stderr, "lamina: unknown argument for Qwen3.6-35B-A3B and Qwen3.8-27B: %s\n", a.c_str());
             std::fprintf(stderr,
                          "usage: lamina-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
@@ -4402,13 +4410,18 @@ static int run_engine(int argc, char** argv) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "lamina: --model is required\n"); return 2; }
+    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "lamina: --drafts-per-step takes 0 .. 7\n"); return 2; }
+    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "lamina: bad --chunk / --max-context\n"); return 2; }
+    if (kv != "fp16" && kv != "q8_0") {
+        std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n");
+        return 2;
+    }
+    if (check_only) return 0;
 #if !defined(_WIN32)
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
 #else
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
-    if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "lamina: --mtp takes 0 .. 7 drafts\n"); return 2; }
-    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "lamina: bad --chunk / --max-context\n"); return 2; }
     if (stage_gpus.empty()) {
         int cur = 0;
         CK(cudaGetDevice(&cur));
@@ -4417,10 +4430,6 @@ static int run_engine(int argc, char** argv) {
     if (stage_gpus.size() > 1 && batch > 1) {
         std::fprintf(stderr, "lamina: the batch slots (\"parallel\" / --batch) run on one GPU: drop --second-gpu or "
                      "--batch\n");
-        return 2;
-    }
-    if (kv != "fp16" && kv != "q8_0") {
-        std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n");
         return 2;
     }
     Model m;
@@ -4539,7 +4548,7 @@ static int run_engine(int argc, char** argv) {
         S->draft_min_p = spec_min_p;
     }
     E.bmtp = (batch_mtp || (std::getenv("LAMINA_BATCH_MTP") != nullptr && std::string(std::getenv("LAMINA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
-    if (batch_mtp && !E.bmtp) std::fprintf(stderr, "lamina: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
+    if (batch_mtp && !E.bmtp) std::fprintf(stderr, "lamina: --batch-mtp needs --batch N (2 or more) and --drafts-per-step N: ignored\n");
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
@@ -4655,11 +4664,19 @@ int lamina::qwen35::run(int argc, char** argv) {
         ~Unset() { g_owned = nullptr; }
     } unset;
     try {
-        return run_engine(argc, argv);
+        return run_engine(argc, argv, false);
     } catch (const Fatal& f) {
         return f.code;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "lamina: %s\n", e.what());
         return 1;
+    }
+}
+
+int lamina::qwen35::check_args(int argc, char** argv) {
+    try {
+        return run_engine(argc, argv, true);
+    } catch (const Fatal& f) {
+        return f.code;
     }
 }

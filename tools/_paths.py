@@ -1,6 +1,6 @@
 """tools/_paths.py - where the tools find llama.cpp's gguf-py (for the MTP packer and the fixtures).
 
-Order: $LAMINA_GGUF_PY, then <engine>/third_party/llama.cpp/gguf-py (what setup.py clones), then the development
+Order: $LAMINA_GGUF_PY, then <engine>/third_party/llama.cpp/gguf-py (the build's llama.cpp download), then the development
 tree's ../../.ref/llama.cpp/gguf-py.
 """
 from __future__ import annotations
@@ -18,8 +18,8 @@ def gguf_py() -> str:
     for c in cands:
         if c and (Path(c) / "gguf").is_dir():
             return str(c)
-    sys.exit("llama.cpp's gguf-py was not found: run setup.py (it clones llama.cpp into third_party/), "
-             "or set LAMINA_GGUF_PY")
+    sys.exit("llama.cpp's gguf-py was not found: configure the build once (build.bat or build.sh: its first "
+             "configure downloads llama.cpp into third_party/), or set LAMINA_GGUF_PY")
 
 
 def add_gguf_py() -> None:

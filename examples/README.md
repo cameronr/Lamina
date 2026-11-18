@@ -1,8 +1,9 @@
 # Example configs
 
 The configs Lamina is developed with, on a PC with two RTX 3090s, an RTX 5070 Ti and 160 GB of RAM
-(their speeds: [COMPARISON.md](../docs/COMPARISON.md)). Setup writes each PC's own configs from them, with its GPUs
-and data folder ([SETUP.md](../docs/SETUP.md)):
+(their speeds: [COMPARISON.md](../docs/COMPARISON.md)). They are built into `lamina-server` as the presets of `-m`,
+which takes the model file, the GPU, the draft layer, the projector and the files a run writes from the PC instead
+([SETUP.md](../docs/SETUP.md#a-model-file)); their paths are placeholders:
 
 - `iq3_s.json`: Qwen3.8-Flash-Next, ISTA-DASLab's GSQ-RCO IQ3_S (~53 GB of RAM taken).
 - `ud-q4_k_xl.json`: Qwen3.8-Flash-Next, unsloth's UD-Q4_K_XL (~81 GB of RAM taken).
@@ -11,15 +12,17 @@ and data folder ([SETUP.md](../docs/SETUP.md)):
 - `qwen38-27b-ud-q6_k_m.json`: Qwen3.8-27B, unsloth's UD-Q6_K_M, on the same path, its layers split over the fewest
   GPUs that hold it at the full 262,144 cells, K and V in q8_0 (~36 GB of VRAM: a 24 GB and a 16 GB GPU).
 
-`run-<model>.bat` starts each from the clone's folder, for models in setup's data folder (`../Lamina-data`). Their
-engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's keys: [USING.md](../docs/USING.md#the-config).
+`lamina-server -m MODEL.gguf --write-config FILE` writes one with the PC's own files and GPUs. `run-<model>.bat.example`
+is a launcher for each: copied to `run-<model>.bat`, it starts the example from the clone's folder, the model's files
+where its paths say (`../Lamina-data`). Their engine options: [SETUP.md](../docs/SETUP.md#engine-options); the server's
+keys: [USING.md](../docs/USING.md#the-config).
 
 ## The development PC's own options
 
 The development PC's configs name their GPUs (`--main-gpu GPU-75af3083 --second-gpu "RTX 5070 Ti,GPU-f26e9ba6"`, its
 two RTX 3090s by their UUIDs' starts, where the examples take every other GPU with `auto`), and its Flash-Next configs add four options measured for its hardware, which the examples
 leave out. Each pays only where a PC has the same trait: measure it through the server before keeping it. Its
-Qwen3.8-27B config puts the RTX 5070 Ti first (`--main-gpu`, which setup sets to a PC's own choice): that card reads
+Qwen3.8-27B config puts the RTX 5070 Ti first (`--main-gpu`, which `-m` sets to a PC's own choice): that card reads
 prompts ~1.44x as fast as the RTX 3090 and takes the first 26 layers, the 3090 the other 38 with the head, and the
 prompt chunks run on both at once, so the prompts read ~11% faster than in the other order.
 

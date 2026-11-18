@@ -1,4 +1,4 @@
-// src/server/config.hpp - the run config (lamina-<model>.json) as the server reads it: the engine's arguments and what
+// src/server/config.hpp - the run config as the server reads it: the engine's arguments and what
 // the config's other keys add to them, the GPUs it names, the environment the engine runs in, the offline policy.
 #pragma once
 
@@ -23,17 +23,33 @@ json read_config(const std::string& path);
 void split_joined_args(json& cfg);
 /// #1641: "--reasoning-effort X" in the args is the config's reasoning_effort, not an engine option (said once)
 void lift_reasoning_effort_arg(json& cfg);
+/// Qwen3.8-Flash-Next's draft layer (`arch` "qwen4exp"), which no model file holds: args that name none (--mtp FILE)
+/// take kDraftLayerFile (artifact/draft_layer.hpp) beside the model, else beside the program; a named file that is not
+/// there, or a folder without the earlier layout's files, is taken out of them: the engine starts and generates without
+/// drafts.  The line for the server's window: the file found, or the warning with the download's command; empty when
+/// the args name a file or a folder of the earlier layout that is there, or the model is another (Qwen3.6-35B-A3B and
+/// Qwen3.8-27B draft with their files' own MTP block)
+std::string resolve_draft_layer(json& cfg, const std::string& arch);
 /// the config's "gpu": one card, or several ([0, 2] or "0,2"), numbered as nvidia-smi numbers them
 std::vector<int> gpu_list(const json& cfg);
 struct GpuInfo {
     int index;
     std::string name, bus_id, uuid;
+    int64_t memory_mib = 0;   ///< its VRAM
+    int cc = 0;               ///< compute capability x 10 (86: 8.6), 0 when nvidia-smi does not say
+    bool display = false;     ///< a display is active on it
+    std::string driver{};     ///< the NVIDIA driver's version
 };
 /// the NVIDIA cards as nvidia-smi lists them (empty without nvidia-smi)
 std::vector<GpuInfo> nvidia_gpus();
-/// the card `spec` names, read as the engine reads --main-gpu / --second-gpu; -1 when none or several match
-int find_gpu(const std::string& spec, const std::vector<GpuInfo>& gpus);
-/// the cards the engine works on (the config's "gpu", else --main-gpu and --second-gpu), the first its main one
+/// the card `spec` names, read as the engine reads --main-gpu / --second-gpu; -1 when none or several match, with
+/// the reason in `why` when given
+int find_gpu(const std::string& spec, const std::vector<GpuInfo>& gpus, std::string* why = nullptr);
+/// the cards the engine works on (the config's "gpu", else --main-gpu and --second-gpu), the first its main one, among
+/// `gpus` (nvidia-smi's list; a number is taken as given when it is empty); empty, with the reason in `why` when
+/// given, when --main-gpu names no card or several, where the engine stops
+std::vector<int> engine_gpus(const json& cfg, const std::vector<GpuInfo>& gpus, std::string* why = nullptr);
+/// the same over nvidia-smi's list, read when the args name a GPU
 std::vector<int> engine_gpus(const json& cfg);
 /// #458: --tail-role-token for "effort_position": "end" (nullopt: the effort stays at the top); ConfigError for a
 /// value other than "start" / "end"
@@ -42,6 +58,13 @@ std::optional<std::vector<std::string>> effort_end_args(const json& cfg, const T
 double engine_silence_s(const json& cfg);
 /// the engine's arguments: the config's, with what "vision", "parallel" and "expert_profile_save" ask for
 std::vector<std::string> engine_args(const json& cfg);
+/// An engine option on lamina-server's command line: the flag ("--max-context") and the values that follow it.
+using EngineOption = std::vector<std::string>;
+/// `opts` into the config's args, each in place of the args' own instances of its flag (with their values: the words
+/// after a flag that do not start with "--") and of its other form ("--kv-grow" for "--no-kv-grow" and back), at the
+/// end in their order.  The engine takes an option's last value, so the command line's wins either way; the args stay
+/// without the old ones for a config that is written.
+void apply_engine_options(json& cfg, const std::vector<EngineOption>& opts);
 /// the model file of the engine's arguments (--native), relative ones the config's cwd's
 std::string model_file(const json& cfg);
 /// the engine's environment, set in this process before the engine starts: "gpu" (CUDA_DEVICE_ORDER and

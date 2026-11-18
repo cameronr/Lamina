@@ -1,10 +1,30 @@
 ﻿# Lamina Engine - top-level build.
 #
-# The engine (`lamina`) and its GPU tools need LAMINA_ENABLE_CUDA and NVIDIA GPUs of compute capability 8.0 or
-# newer; without CUDA only the CPU-side libraries, their tools and tests build.
-cmake_minimum_required(VERSION 3.24)
-project(lamina VERSION 0.1.43.1 LANGUAGES CXX)
+# The engine (`lamina`), the server (`lamina-server`), the image encoder (tools/vision, an external project here) and
+# the GPU tools need LAMINA_ENABLE_CUDA and NVIDIA GPUs of compute capability 8.0 or newer; without CUDA only the
+# CPU-side libraries, their tools and tests build. CMakePresets.json has the two builds: `native` (this PC's GPUs and
+# CPU, in build/) and `portable` (the releases': RTX 30, 40 and 50, any AVX2 CPU, in build-portable/); build.bat and
+# build.sh run one. The programs run from the build folder; `cmake --install <build> --prefix <folder>` puts them,
+# with the CUDA runtime, into a folder of their own as a release lays them out.
+# CMake 3.22 (Ubuntu 22.04's) or newer, with 3.24's policies where CMake has them
+cmake_minimum_required(VERSION 3.22...3.24)
+project(lamina VERSION 0.2 LANGUAGES CXX)
 add_compile_definitions(LAMINA_VERSION="${PROJECT_VERSION}")
+
+# cmake --install: flat, as a release's two downloads extract into one folder. Component lamina: the programs, the
+# draft layer's download script and the licenses; component cudart: the CUDA runtime and cuBLAS the programs load.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "the folder cmake --install fills (--prefix names another)" FORCE)
+endif()
+if(UNIX AND NOT APPLE)
+  # installed, a program loads the CUDA runtime from its own folder, and from the toolkit's in the build folder;
+  # RUNPATH, so LD_LIBRARY_PATH can name others
+  set(CMAKE_INSTALL_RPATH "$ORIGIN")
+  add_link_options(-Wl,--enable-new-dtags)
+endif()
+# every compile and link in one job pool: half the logical cores (LAMINA_JOBS sets another number)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/lamina_jobs.cmake)
+lamina_job_pool()
 
 # x86-64 or arm64.  The CPU expert kernels (AVX-512, AVX2, AVX: expert.cpp and the *_avx*.cpp files) exist on x86-64
 # only; on arm64 the experts run on ggml-cpu's dot products (include/lamina/platform/cpu_arch.hpp).
@@ -16,13 +36,18 @@ else()
   message(FATAL_ERROR "Lamina builds for x86-64 and arm64 CPUs, not '${CMAKE_SYSTEM_PROCESSOR}'")
 endif()
 
-# A build for other PCs (the release binaries, the Docker image): ggml's CPU backend for any AVX2 CPU (arm64: any
+# A build for other PCs (the release binaries): ggml's CPU backend for any AVX2 CPU (arm64: any
 # Armv8.2 CPU with the dot product and FP16 instructions) instead of this machine's (the engine's own AVX-512 kernels
-# are per-file and chosen at run time either way), and the MSVC runtime linked in, so no Visual C++ redistributable is
-# needed.
-option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static MSVC runtime" OFF)
+# are per-file and chosen at run time either way), and the C++ runtime linked in: on Windows the MSVC runtime, so no
+# Visual C++ redistributable is needed; on Linux GCC's libstdc++ and libgcc, so the programs run where the system's
+# libstdc++ is older than the build machine's (RHEL 9's and its rebuilds' are GCC 11's).
+option(LAMINA_PORTABLE "build for other PCs: AVX2 (arm64: Armv8.2 + dotprod + fp16) baseline, static C++ runtime" OFF)
 if(LAMINA_PORTABLE AND MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+elseif(LAMINA_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The CUDA runtime loads the system's libstdc++ beside it: the archives' symbols (libstdc++'s among them) stay
+  # unexported, so its calls and the system library's own stay there instead of binding to the programs' copy
+  add_link_options(-static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -37,18 +62,68 @@ option(LAMINA_BUILD_TESTS "Build the test suite" OFF)
 option(LAMINA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(LAMINA_ENABLE_CUDA)
-  enable_language(CUDA)
-  # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
-  # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
-  find_package(CUDAToolkit REQUIRED)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  # nvcc: CMAKE_CUDA_COMPILER or CUDACXX, else the PATH's, CUDA_PATH's or NVIDIA's Linux install's
+  if(NOT CMAKE_CUDA_COMPILER AND "$ENV{CUDACXX}" STREQUAL "")
+    find_program(_lamina_nvcc nvcc PATHS "$ENV{CUDA_PATH}/bin" /usr/local/cuda/bin NO_CACHE)
+    if(_lamina_nvcc)
+      set(CMAKE_CUDA_COMPILER "${_lamina_nvcc}" CACHE FILEPATH "the CUDA compiler")
+    endif()
   endif()
+  # nvcc compiles host code with the C++ compiler (CXX=g++-14 makes it nvcc's too; CUDAHOSTCXX names another); on
+  # Windows it takes MSVC's cl alone, the PATH's
+  if(NOT WIN32 AND NOT CMAKE_CUDA_HOST_COMPILER AND "$ENV{CUDAHOSTCXX}" STREQUAL "")
+    set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}" CACHE FILEPATH "nvcc's host compiler")
+  endif()
+  # The GPUs the kernels are built for. native, the default: this PC's, as nvidia-smi names them at each configure (a
+  # card added later is built for at the next build), without those older than compute capability 8.0: the kernels'
+  # tf32 mma and bf16 math need it.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "the CUDA architectures (native: this PC's GPUs)")
+  endif()
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+    find_program(_lamina_smi nvidia-smi NO_CACHE)
+    set(_smi "")
+    if(_lamina_smi)
+      execute_process(COMMAND "${_lamina_smi}" --query-gpu=name,compute_cap --format=csv,noheader
+                      OUTPUT_VARIABLE _smi ERROR_QUIET)
+    endif()
+    string(REPLACE "\n" ";" _smi "${_smi}")
+    set(_archs "")
+    foreach(_g IN LISTS _smi)
+      if(_g MATCHES "^(.*), *([0-9]+)\\.([0-9]+)")
+        if("${CMAKE_MATCH_2}${CMAKE_MATCH_3}" LESS 80)
+          message(STATUS "Lamina: ${CMAKE_MATCH_1} left out (compute capability ${CMAKE_MATCH_2}.${CMAKE_MATCH_3}: "
+                         "Lamina needs 8.0 or newer)")
+        else()
+          list(APPEND _archs "${CMAKE_MATCH_2}${CMAKE_MATCH_3}-real")
+        endif()
+      endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _archs)
+    list(SORT _archs COMPARE NATURAL)
+    if(NOT _archs)
+      message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES is native, and nvidia-smi names no NVIDIA GPU of compute "
+                          "capability 8.0 or newer (RTX 30 series or newer) on this PC. Name the GPUs to build for "
+                          "(-DCMAKE_CUDA_ARCHITECTURES=86;120), or build the portable preset: RTX 30, 40 and 50.")
+    endif()
+    set(CMAKE_CUDA_ARCHITECTURES "${_archs}")   # this configure's list, over the cache's native
+  endif()
+  enable_language(CUDA)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)   # #220, #224: crashes in long prompts on RTX 50 GPUs with 12.8
+    message(FATAL_ERROR "Lamina builds with the CUDA toolkit 13.0 or newer, and ${CMAKE_CUDA_COMPILER} is "
+                        "${CMAKE_CUDA_COMPILER_VERSION}. Name another nvcc with CUDACXX or -DCMAKE_CUDA_COMPILER, in a "
+                        "fresh build folder (cmake --fresh).")
+  endif()
+  # The .cu files are C++20 too (CUDA_STANDARD falls back to CXX_STANDARD), and CMake learnt nvcc's flag for it in
+  # 3.25.2: what that release sets, for the older ones (Ubuntu 22.04's 3.22, Debian 12's 3.25.1)
+  if(CMAKE_VERSION VERSION_LESS 3.25.2 AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "-std=c++20")
+    set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "-std=c++20")
+  endif()
+  set(_lamina_newest 0)
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
-    # Plan v0.3 P6: developed and measured on sm_120 (RTX 50); the kernels need sm_80 or newer (tf32 mma in
-    # the attention scorer, bf16 math), so RTX 30 (86) and RTX 40 (89) build too.  Older cards are refused.
-    if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
+    string(REGEX REPLACE "[^0-9].*$" "" _base "${_a}")     # 120-real, 120-virtual, 120a: 120
+    if(_base STREQUAL "")   # all, all-major
       continue()
     endif()
     if(_base LESS 80)
@@ -56,13 +131,21 @@ if(LAMINA_ENABLE_CUDA)
         "Lamina needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
-    # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
-    if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
-      message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
-                      "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
+    if(_base GREATER _lamina_newest)
+      set(_lamina_newest ${_base})
     endif()
   endforeach()
-  message(STATUS "Lamina: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  # upstream #892, #968: 13.2.0's and 13.2.1's nvcc (builds below V13.2.86) made garbage answers on RTX 50 GPUs
+  if(_lamina_newest GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.2 AND
+     CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.2.86)
+    message(FATAL_ERROR "CUDA ${CMAKE_CUDA_COMPILER_VERSION} (13.2.0 or 13.2.1) compiles some of the engine's kernels "
+                        "wrong for RTX 50 GPUs (sm_120): their answers are garbage. Use CUDA 13.0, 13.1 or 13.2.2 and "
+                        "newer (CUDACXX or -DCMAKE_CUDA_COMPILER, in a fresh build folder), or build for older GPUs only.")
+  endif()
+  # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
+  # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
+  find_package(CUDAToolkit REQUIRED)
+  message(STATUS "Lamina: CUDA ${CMAKE_CUDA_COMPILER_VERSION}, architectures ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
@@ -94,6 +177,17 @@ if(LAMINA_WERROR)
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<BOOL:${MSVC}>>:/WX>
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:${MSVC}>>>:-Werror>)
 endif()
+
+# Files built into a program (cmake/embed_files.cmake, include/lamina/embedded.hpp): `out`, a source of the build tree,
+# defines lamina::<func>(path) for the files that `glob` matches below `dir`.
+function(lamina_embed out dir glob func comment)
+  file(GLOB_RECURSE _files CONFIGURE_DEPENDS ${dir}/${glob})
+  add_custom_command(OUTPUT ${out}
+    COMMAND ${CMAKE_COMMAND} -DDIR=${dir} -DGLOB=${glob} -DOUT=${out} -DFUNC=${func}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake
+    DEPENDS ${_files} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_files.cmake
+    COMMENT "${comment}" VERBATIM)
+endfunction()
 
 # ---- lamina_artifact -------------------------------------------------------
 # Header-only, and that is a deliberate property rather than an unfinished split: the GGUF reader and the
@@ -195,11 +289,14 @@ if(LAMINA_ENABLE_CUDA)
   # already links `lamina_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+  # Qwen3.8-Flash-Next's expert profile, --expert-profile builtin (the default under --serve)
+  lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/embedded_profile.cpp ${CMAKE_CURRENT_SOURCE_DIR}/data expert-profile.bin
+               profile_file "Embedding the expert profile")
   add_library(lamina_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/prompt_cache.cpp src/core/adaptive_tier.cpp src/core/second_gpu.cpp src/core/arena_place.cpp
     src/core/split_head.cpp src/core/vmm.cpp src/core/gpu_select.cpp src/core/gpu_usable.cu src/core/pack_image.cpp
-    src/core/control_vector.cpp)
+    src/core/control_vector.cpp ${CMAKE_CURRENT_BINARY_DIR}/embedded_profile.cpp)
   # the architectures a GPU the build has no kernels for is told of (a definition's value cannot hold a ';')
   string(REPLACE ";" "," _lamina_archs "${CMAKE_CUDA_ARCHITECTURES}")
   set_source_files_properties(src/core/gpu_usable.cu PROPERTIES
@@ -223,7 +320,8 @@ if(LAMINA_ENABLE_CUDA)
   add_library(lamina_program STATIC src/program/generate.cpp)
   target_include_directories(lamina_program PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(lamina_program PUBLIC lamina_engine lamina_prefill lamina_spec lamina_serve_io CUDA::cudart)
-  add_executable(lamina src/program/main.cpp)
+  # src/platform/cpu_floor.cpp: the CPU check before anything else of the program runs
+  add_executable(lamina src/program/main.cpp src/platform/cpu_floor.cpp)
   target_link_libraries(lamina PRIVATE lamina_program)
   # the hyper-connection read's fused up projection + mix against cuBLAS + gr_mix_r at every sub-chunk size (--bench)
   add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cu)
@@ -417,9 +515,11 @@ target_link_libraries(pool_test PRIVATE lamina_kernels_cpu)
 #
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
-# with -DLAMINA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
+# with -DLAMINA_GGML_DIR=..., otherwise third_party/llama.cpp at the pinned commit (cmake/lamina_llama.cmake
+# downloads it when it is not there).
 option(LAMINA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
-set(LAMINA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
+set(LAMINA_GGML_DIR "" CACHE PATH
+    "llama.cpp checkout to take ggml from (empty: third_party/llama.cpp at the pinned commit, downloaded when missing)")
 if(LAMINA_NATIVE_EXPERTS)
   enable_language(C)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -429,6 +529,9 @@ if(LAMINA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  # no compiler launcher of ggml's choosing for every target (it sets one when it finds ccache):
+  # CMAKE_<LANG>_COMPILER_LAUNCHER names one
+  set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
   if(LAMINA_PORTABLE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/lamina_ggml_portable.cmake)
     lamina_ggml_portable()
@@ -436,27 +539,17 @@ if(LAMINA_NATIVE_EXPERTS)
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
   if(LAMINA_GGML_DIR)
-    add_subdirectory(${LAMINA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+    set(_lamina_llama_root ${LAMINA_GGML_DIR})
   else()
-    include(FetchContent)
-    FetchContent_Declare(lamina_llamacpp
-      GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-      GIT_SHALLOW FALSE)
-    FetchContent_GetProperties(lamina_llamacpp)
-    if(NOT lamina_llamacpp_POPULATED)
-      FetchContent_Populate(lamina_llamacpp)
-    endif()
-    add_subdirectory(${lamina_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/lamina_llama.cmake)
+    lamina_llama_cpp(_lamina_llama_root)
   endif()
+  # llama.cpp's install rules are its libraries' and headers', none of Lamina's
+  set(CMAKE_SKIP_INSTALL_RULES ON)
+  add_subdirectory(${_lamina_llama_root}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   # lamina-server's parts from the same checkout (its root skips the ggml added above): libllama for the tokenizer
   # (the vocabulary of the model's GGUF, loaded without its tensors), llama-common for the Jinja chat templates,
   # and the vendored cpp-httplib, nlohmann/json, stb and sheredom/subprocess
-  if(LAMINA_GGML_DIR)
-    set(_lamina_llama_root ${LAMINA_GGML_DIR})
-  else()
-    set(_lamina_llama_root ${lamina_llamacpp_SOURCE_DIR})
-  endif()
   set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
   # lamina-server's outgoing HTTPS: WinHTTP on Windows (no OpenSSL DLLs beside it), OpenSSL through cpp-httplib elsewhere
   if(WIN32)
@@ -467,6 +560,7 @@ if(LAMINA_NATIVE_EXPERTS)
     set(${_o} OFF CACHE BOOL "" FORCE)
   endforeach()
   add_subdirectory(${_lamina_llama_root} ${CMAKE_BINARY_DIR}/llama EXCLUDE_FROM_ALL)
+  set(CMAKE_SKIP_INSTALL_RULES OFF)
   # part of lamina_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(lamina_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/tq_cpu.cpp)
@@ -499,6 +593,11 @@ if(LAMINA_NATIVE_EXPERTS)
     target_compile_definitions(ple_reader_test PRIVATE LAMINA_NATIVE_EXPERTS=1)
   endif()
   if(LAMINA_CPU_X86)
+    # the programs' CPU check at their start (src/platform/cpu_floor.cpp): this CPU meets the build's floor, and
+    # LAMINA_FORCE_ISA, which caps the engine's own probes, leaves it alone
+    add_executable(cpu_floor_test tests/core/cpu_floor_test.cpp)
+    target_link_libraries(cpu_floor_test PRIVATE lamina_kernels_cpu)
+    add_test(NAME cpu_floor_test COMMAND cpu_floor_test)
     # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp; with AVX-VNNI where the CPU has it) bit for bit
     # against each other at 1..8 tokens and against ggml-cpu's dot, on random blocks; --bench: ms per expert on one
     # thread, the weights streamed from DRAM
@@ -514,11 +613,7 @@ if(LAMINA_NATIVE_EXPERTS)
     # llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, from the same checkout as ggml: mmq.cuh's
     # instances for the expert types of ISTA-DASLab's and unsloth's files and the quantizer, with the few host
     # symbols of ggml-cuda.cu they use in src/prefill/ggml_cuda_host.cu
-    if(LAMINA_GGML_DIR)
-      set(_lamina_gg ${LAMINA_GGML_DIR}/ggml)
-    else()
-      set(_lamina_gg ${lamina_llamacpp_SOURCE_DIR}/ggml)
-    endif()
+    set(_lamina_gg ${_lamina_llama_root}/ggml)
     set(_lamina_mmq ${_lamina_gg}/src/ggml-cuda)
     # Gyro-L's trellis types: an overlay of the pinned ggml-cuda headers, written at configure time
     # (cmake/lamina_ggml_tq_overlay.cmake); off with a message on another llama.cpp tree (its prompts then read in FP16)
@@ -704,19 +799,22 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
   target_link_libraries(tool_args_test PRIVATE lamina_text)
   add_test(NAME tool_args_test COMMAND tool_args_test)
   if(TARGET lamina_program)
-    # the web app inside the binary (cmake/embed_web.cmake)
-    file(GLOB_RECURSE _lamina_web CONFIGURE_DEPENDS src/server/web/*)
-    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp
-      COMMAND ${CMAKE_COMMAND} -DWEB_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/server/web
-              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_web.cmake
-      DEPENDS ${_lamina_web} cmake/embed_web.cmake
-      COMMENT "Embedding the web app")
-    add_library(lamina_server_core STATIC src/server/api.cpp src/server/config.cpp src/server/engine.cpp
-                src/server/engine_batch.cpp src/server/http_client.cpp src/server/http_server.cpp src/server/images.cpp
-                src/server/keepawake.cpp src/server/mcp.cpp src/server/net.cpp src/server/process.cpp
-                src/server/prometheus.cpp src/server/replicas.cpp src/server/responses.cpp src/server/runconfig.cpp
-                src/server/service.cpp src/server/service_run.cpp src/server/structured.cpp src/server/telemetry.cpp
-                src/server/vision.cpp ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp)
+    # the web app and the presets (examples/*.json: lamina-server -m) inside the binary
+    lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/server/web * web_asset
+                 "Embedding the web app")
+    lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/presets.cpp ${CMAKE_CURRENT_SOURCE_DIR}/examples *.json preset_file
+                 "Embedding the presets")
+    # --bench's agent session: the clone's README and docs as the Python benchmark read them, frozen
+    lamina_embed(${CMAKE_CURRENT_BINARY_DIR}/bench_files.cpp ${CMAKE_CURRENT_SOURCE_DIR}/data bench-agent-files.json
+                 bench_file "Embedding the benchmark's texts")
+    add_library(lamina_server_core STATIC src/server/api.cpp src/server/bench.cpp src/server/config.cpp
+                src/server/engine.cpp src/server/engine_batch.cpp src/server/http_client.cpp src/server/http_server.cpp
+                src/server/images.cpp src/server/keepawake.cpp src/server/mcp.cpp src/server/model_config.cpp
+                src/server/net.cpp src/server/params.cpp src/server/process.cpp src/server/prometheus.cpp
+                src/server/replicas.cpp src/server/responses.cpp
+                src/server/runconfig.cpp src/server/service.cpp src/server/service_run.cpp src/server/structured.cpp
+                src/server/telemetry.cpp src/server/vision.cpp ${CMAKE_CURRENT_BINARY_DIR}/web_assets.cpp
+                ${CMAKE_CURRENT_BINARY_DIR}/presets.cpp ${CMAKE_CURRENT_BINARY_DIR}/bench_files.cpp)
     target_include_directories(lamina_server_core PUBLIC src/server ${_lamina_llama_root}/vendor
                                ${_lamina_llama_root}/vendor/cpp-httplib)
     target_link_libraries(lamina_server_core PUBLIC lamina_text cpp-httplib vendor-hash lamina_program lamina_warnings)
@@ -726,23 +824,125 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
       find_package(Threads REQUIRED)
       target_link_libraries(lamina_server_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
     endif()
-    add_executable(lamina-server src/server/main.cpp)
+    add_executable(lamina-server src/server/main.cpp src/platform/cpu_floor.cpp)
     target_link_libraries(lamina-server PRIVATE lamina_server_core)
-    # cmake --install <build> --component lamina --prefix <dir>: the programs in <dir>/bin, on Windows with the CUDA
-    # runtime beside them (lamina-vision installs from tools/vision's own build; the component leaves out the install
-    # rules of llama.cpp's libraries)
-    install(TARGETS lamina lamina-server RUNTIME DESTINATION bin COMPONENT lamina)
+    # -m's config pieces: the presets, the main GPU, the command line's engine options, projectors (CPU only)
+    add_executable(model_config_test tests/server/model_config_test.cpp)
+    target_link_libraries(model_config_test PRIVATE lamina_server_core)
+    add_test(NAME model_config_test COMMAND model_config_test)
+    # the settings table: the command line's options into the config's keys, over the file's (CPU only)
+    add_executable(params_test tests/server/params_test.cpp)
+    target_link_libraries(params_test PRIVATE lamina_server_core)
+    add_test(NAME params_test COMMAND params_test)
+    # --bench against a scripted server of its own: the suite, the report, the redaction, the comparison (CPU only)
+    add_executable(bench_test tests/server/bench_test.cpp)
+    target_link_libraries(bench_test PRIVATE lamina_server_core)
+    add_test(NAME bench_test COMMAND bench_test)
+    install(TARGETS lamina lamina-server RUNTIME DESTINATION . COMPONENT lamina)
+    if(WIN32)
+      install(PROGRAMS download-draft-layer.bat DESTINATION . COMPONENT lamina)
+    else()
+      install(PROGRAMS download-draft-layer.sh DESTINATION . COMPONENT lamina)
+    endif()
+    install(FILES LICENSE DESTINATION . COMPONENT lamina)
+    install(FILES ${_lamina_llama_root}/LICENSE DESTINATION . RENAME LICENSE-llama.cpp COMPONENT lamina)
+    install(FILES ${_lamina_llama_root}/vendor/cpp-httplib/LICENSE DESTINATION . RENAME LICENSE-cpp-httplib
+            COMPONENT lamina)
+    install(FILES ${_lamina_llama_root}/licenses/LICENSE-jsonhpp DESTINATION . COMPONENT lamina)
+    install(FILES src/server/web/fonts/OFL.txt DESTINATION . RENAME LICENSE-Outfit COMPONENT lamina)
+
+    # The CUDA runtime and cuBLAS the programs load: component cudart, with NVIDIA's license. On Windows also copied
+    # beside the programs in the build folder, which then runs as it is (on Linux they find the toolkit's by their
+    # RUNPATH there).
     if(WIN32)
       if(LAMINA_CPU_X86)
         set(_lamina_dll_dir x64)
       else()
         set(_lamina_dll_dir arm64)
       endif()
-      file(GLOB _lamina_cuda_dlls "${CUDAToolkit_BIN_DIR}/cudart64_*.dll" "${CUDAToolkit_BIN_DIR}/cublas64_*.dll"
+      # CUDA 13 keeps them in bin/x64 (bin/arm64), CUDA 12 in bin
+      file(GLOB _lamina_cuda_runtime "${CUDAToolkit_BIN_DIR}/cudart64_*.dll" "${CUDAToolkit_BIN_DIR}/cublas64_*.dll"
            "${CUDAToolkit_BIN_DIR}/cublasLt64_*.dll" "${CUDAToolkit_BIN_DIR}/${_lamina_dll_dir}/cudart64_*.dll"
            "${CUDAToolkit_BIN_DIR}/${_lamina_dll_dir}/cublas64_*.dll"
            "${CUDAToolkit_BIN_DIR}/${_lamina_dll_dir}/cublasLt64_*.dll")
-      install(FILES ${_lamina_cuda_dlls} DESTINATION bin COMPONENT lamina)
+      set(_lamina_copies "")
+      foreach(_f IN LISTS _lamina_cuda_runtime)
+        get_filename_component(_n "${_f}" NAME)
+        add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/${_n}
+                           COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_f} ${CMAKE_BINARY_DIR}/${_n}
+                           DEPENDS ${_f} VERBATIM)
+        list(APPEND _lamina_copies ${CMAKE_BINARY_DIR}/${_n})
+      endforeach()
+      add_custom_target(lamina_cuda_runtime ALL DEPENDS ${_lamina_copies})
+      add_dependencies(lamina lamina_cuda_runtime)
+      add_dependencies(lamina-server lamina_cuda_runtime)
+      install(FILES ${_lamina_cuda_runtime} DESTINATION . COMPONENT cudart)
+    else()
+      foreach(_l cudart cublas cublasLt)   # under the sonames the programs ask for
+        set(_so "${CUDAToolkit_LIBRARY_DIR}/lib${_l}.so.${CUDAToolkit_VERSION_MAJOR}")
+        if(EXISTS "${_so}")
+          file(REAL_PATH "${_so}" _real)
+          install(FILES "${_real}" DESTINATION . RENAME "lib${_l}.so.${CUDAToolkit_VERSION_MAJOR}" COMPONENT cudart)
+        else()
+          message(WARNING "${_so} is not there: cmake --install's component cudart leaves it out")
+        endif()
+      endforeach()
+    endif()
+    get_filename_component(_lamina_cuda_root "${CUDAToolkit_BIN_DIR}" DIRECTORY)
+    foreach(_f LICENSE EULA.txt)   # NVIDIA's redistributable archives hold LICENSE, its installer EULA.txt
+      if(EXISTS "${_lamina_cuda_root}/${_f}")
+        install(FILES "${_lamina_cuda_root}/${_f}" DESTINATION . RENAME LICENSE-cuda COMPONENT cudart)
+        break()
+      endif()
+    endforeach()
+
+    # The image encoder (tools/vision: llama.cpp's mtmd), a CMake project of its own, as its ggml differs from the
+    # engine's: with ggml-cuda, its CPU code for any AVX2 CPU (arm64: Armv8.2 with dotprod and fp16; a native build
+    # on an AVX-512 CPU runs without flash attention, about half as fast). Built for the same GPUs, after the engine's
+    # programs so that their CUDA compiles and its do not run at once, into this folder: the server starts the
+    # lamina-vision in its own folder and no other, on the CPU or a GPU as a config's vision section says.
+    option(LAMINA_BUILD_VISION "build the image encoder (tools/vision) beside the server" ON)
+    if(LAMINA_BUILD_VISION)
+      include(ExternalProject)
+      set(_lamina_vision_args
+          -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
+          -DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
+          -DLLAMA_DIR:PATH=${_lamina_llama_root}
+          -DLAMINA_VISION_CUDA:BOOL=ON
+          -DLAMINA_PORTABLE:BOOL=ON
+          -DLAMINA_VISION_OUTPUT_DIR:PATH=${CMAKE_BINARY_DIR}
+          -DLAMINA_JOBS:STRING=${LAMINA_JOBS_USED}
+          -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
+          # the engine's toolkit: ggml-cuda looks for one before CUDA is enabled, where FindCUDAToolkit takes neither
+          # CUDACXX nor CMAKE_CUDA_COMPILER (only the PATH, CUDA_PATH and /usr/local/cuda)
+          -DCUDAToolkit_ROOT:PATH=${_lamina_cuda_root})
+      foreach(_v CMAKE_C_COMPILER CMAKE_CXX_COMPILER CMAKE_CUDA_COMPILER CMAKE_CUDA_HOST_COMPILER
+                 CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER CMAKE_CUDA_COMPILER_LAUNCHER)
+        if(${_v})
+          list(APPEND _lamina_vision_args "-D${_v}:STRING=${${_v}}")
+        endif()
+      endforeach()
+      # Windows paths with forward slashes: the encoder's initial cache file sets each value in quotes, where a
+      # backslash starts an escape (a build folder an earlier setup.py configured holds its Ninja as ...\ninja.exe)
+      if(CMAKE_HOST_WIN32)
+        string(REPLACE "\\" "/" _lamina_vision_args "${_lamina_vision_args}")
+      endif()
+      ExternalProject_Add(lamina-vision
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision
+        BINARY_DIR ${CMAKE_BINARY_DIR}/vision
+        CMAKE_CACHE_ARGS ${_lamina_vision_args}
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target lamina-vision
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS ON
+        USES_TERMINAL_CONFIGURE ON
+        USES_TERMINAL_BUILD ON
+        DEPENDS lamina lamina-server)
+      install(CODE "
+        if(NOT EXISTS \"${CMAKE_BINARY_DIR}/vision/cmake_install.cmake\")
+          message(FATAL_ERROR \"the image encoder is not built: cmake --build ${CMAKE_BINARY_DIR} first\")
+        endif()
+        execute_process(COMMAND \"${CMAKE_COMMAND}\" --install \"${CMAKE_BINARY_DIR}/vision\" --component lamina
+                                --prefix \"\${CMAKE_INSTALL_PREFIX}\" COMMAND_ERROR_IS_FATAL ANY)" COMPONENT lamina)
     endif()
   endif()
 endif()
@@ -752,16 +952,30 @@ if(LAMINA_BUILD_TESTS)
   foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
              q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
              conversation_cache_test control_vector_test deterministic_adapt_help platform_memory_test
-             ple_reader_selftest)
+             ple_reader_selftest model_config_test params_test bench_test cpu_floor_test)
     if(TEST ${_t})
       set_tests_properties(${_t} PROPERTIES LABELS cpu)
     endif()
   endforeach()
 endif()
 
+# Without LAMINA_BUILD_TESTS the default target builds the programs a release holds (lamina, lamina-server, the image
+# encoder): the tests, parity checks, benches and tools build by name (cmake --build <build> --target <name>)
+get_property(_lamina_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_t IN LISTS _lamina_targets)
+  get_target_property(_type ${_t} TYPE)
+  if(NOT _type STREQUAL "EXECUTABLE" OR _t MATCHES "^lamina(-server)?$")
+    continue()
+  elseif(NOT LAMINA_BUILD_TESTS)
+    set_target_properties(${_t} PROPERTIES EXCLUDE_FROM_ALL ON)
+  elseif(TARGET lamina-vision)
+    # with the tests every program is built, and the image encoder after them all (its jobs and theirs not at once)
+    add_dependencies(lamina-vision ${_t})
+  endif()
+endforeach()
+
 # Windows: every program here runs with UTF-8 as its code page (cmake/utf8.manifest)
 if(MSVC)
-  get_property(_lamina_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
   foreach(_t IN LISTS _lamina_targets)
     get_target_property(_type ${_t} TYPE)
     if(_type STREQUAL "EXECUTABLE")

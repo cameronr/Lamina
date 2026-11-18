@@ -55,6 +55,10 @@ private:
 class ReplicaEngine : public Engine {
 public:
     explicit ReplicaEngine(std::vector<std::shared_ptr<LaminaEngine>> engines, int64_t load_tokens);
+    void set_silence_s(double s) override {
+        silence_s = s;
+        for (auto& e : engines_) e->silence_s = s;
+    }
     void generate(const std::vector<int32_t>& ids, int64_t max_new, const json& sampling, Cancel& cancel,
                   const std::string& embeddings, const std::function<bool(int32_t)>& on_token,
                   const std::function<bool()>& on_beat) override;

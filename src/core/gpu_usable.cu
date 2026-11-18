@@ -35,10 +35,15 @@ std::string gpu_unusable(int device) {
     }
     (void) cudaGetLastError();
     if (e == cudaSuccess) return {};
+#ifdef _WIN32
+#define LAMINA_BUILD_SCRIPT "build.bat"
+#else
+#define LAMINA_BUILD_SCRIPT "./build.sh"
+#endif
     if (e == cudaErrorNoKernelImageForDevice || e == cudaErrorInvalidDeviceFunction)
         return "this build has no kernels for its compute capability, " + cc + " (built for " LAMINA_CUDA_ARCHS
-               "): build Lamina for it (setup builds for this PC's GPUs; CMAKE_CUDA_ARCHITECTURES with " +
-               std::to_string(p.major * 10 + p.minor) + ")";
+               "): build Lamina for it (" LAMINA_BUILD_SCRIPT " in a clone builds for this PC's GPUs; "
+               "CMAKE_CUDA_ARCHITECTURES with " + std::to_string(p.major * 10 + p.minor) + ")";
     if (e == cudaErrorUnsupportedPtxVersion || e == cudaErrorInsufficientDriver)
         return std::string("its driver cannot load this build's kernels (") + cudaGetErrorString(e) +
                "): update the NVIDIA driver";

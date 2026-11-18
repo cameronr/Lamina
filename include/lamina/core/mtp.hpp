@@ -16,8 +16,8 @@
 //   * the attention is DENSE over every cell the layer has seen - identical to the model's sparse selection
 //     below 2,051 cells - so speculative cells (draft steps, rejected window rows) never touch indexer state and
 //     are simply overwritten when their positions are processed again;
-//   * all 512 routed experts live in VRAM and run through the grouped kernels: raw GGUF blocks in the formats
-//     `experts.txt` names, through the main model's native expert kernels, or else the Q2_0 blob layout (708 MB);
+//   * all 512 routed experts live in VRAM and run through the grouped kernels: Q2_0 in its blob layout (708 MB),
+//     other formats as their GGUF blocks through the main model's native expert kernels;
 //   * the K/V of a prompt's cells come from the batched prompt path (`prompt_kv`), in its GEMM arithmetic, as the
 //     model's own layers there.
 #pragma once
@@ -58,9 +58,10 @@ public:
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
-    /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
-    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
-    bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+    /// Loads the layer (`path`: its file, the GGUF tools/mtp_rt.py writes, artifact/draft_layer.hpp; or a folder of its
+    /// earlier layout) and allocates the layer's K/V and buffers for up to `max_t` rows.  Call before the VRAM expert
+    /// tier is sized: this takes ~0.9 GB.
+    bool load(const std::string& path, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// The prompt's length: the prompt's K/V skip the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
@@ -111,6 +112,11 @@ public:
     int64_t rounds = 0;
 
 private:
+    /// load's readers, which leave the same dense buffer, expert blobs and draft vocabulary: the layer's file, or a
+    /// folder of the earlier layout (dense.txt with dense.bin, experts.bin, experts.txt when the experts are GGUF
+    /// blocks, draft_vocab.bin), as earlier setups downloaded it and scratch/bg's training writes it
+    bool load_file(const std::string& path, const ModelGeometry& g, uint64_t& dense_bytes, std::string& err);
+    bool load_folder(const std::string& dir, const ModelGeometry& g, uint64_t& dense_bytes, std::string& err);
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
@@ -151,7 +157,7 @@ private:
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
     uint64_t blob_ = 0;                               // bytes per expert
-    lamina::kernels::NativeExpertLayout nat_;         // gu_type >= 0: GGUF blocks (experts.txt); else the Q2_0 blobs
+    lamina::kernels::NativeExpertLayout nat_;         // gu_type >= 0: GGUF blocks; else the Q2_0 blobs
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;
@@ -162,13 +168,13 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
-    // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
+    // the draft head: the main head's rows for a token subset (the file's draft_vocab), or the whole head
+    std::vector<int32_t> dvocab_ids_;   ///< the subset as the file holds it, read at load
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     uint8_t* proxy_ = nullptr;   ///< the draft head's 2-bit copy (draft_proxy.hpp); null: the exact head over every row
     void* proxy_scratch_ = nullptr;
-    std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;

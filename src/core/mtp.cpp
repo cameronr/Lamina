@@ -1,6 +1,8 @@
 // src/core/mtp.cpp - see include/lamina/core/mtp.hpp.
 #include "lamina/core/mtp.hpp"
 
+#include "lamina/artifact/draft_layer.hpp"
+#include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/core/cuda_host.hpp"
 #include "lamina/core/draft_pass.hpp"
 #include "lamina/core/native_head.hpp"
@@ -32,7 +34,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <vector>
 
@@ -50,6 +54,32 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
     f.seekg(0);
     out.resize((size_t) n);
     return (bool) f.read((char*) out.data(), n);
+}
+
+/// One Q2_0 expert's GGUF blocks -> its blob (cpu/expert.hpp; tools/mtp_rt.py's blob_of).  `gu`: 2*FF rows of H/64
+/// blocks, the gate's rows then the up's; `dn`: H rows of FF/64 blocks; a block is its fp16 scale and 16 bytes of
+/// codes.  The blob interleaves the gate/up rows (2r = gate r, 2r + 1 = up r) and keeps every row's codes in one plane,
+/// its scales in another: [gate/up codes | down codes | gate/up scales | down scales].
+void q2_blob(const uint8_t* gu, const uint8_t* dn, uint8_t* blob) {
+    namespace X = lamina::kernels::cpu;
+    uint8_t* codes = blob + X::O_GU_CODES;
+    uint8_t* scales = blob + X::O_GU_SCALES;
+    for (int r = 0; r < 2 * X::FF; ++r) {
+        const uint8_t* row = gu + (size_t) ((r & 1) ? X::FF + r / 2 : r / 2) * X::SC_GU * X::BB;
+        for (int b = 0; b < X::SC_GU; ++b, codes += X::BB - 2, scales += 2) {
+            std::memcpy(codes, row + b * X::BB + 2, X::BB - 2);
+            std::memcpy(scales, row + b * X::BB, 2);
+        }
+    }
+    codes = blob + X::O_D_CODES;
+    scales = blob + X::O_D_SCALES;
+    for (int r = 0; r < X::H; ++r) {
+        const uint8_t* row = dn + (size_t) r * X::SC_D * X::BB;
+        for (int b = 0; b < X::SC_D; ++b, codes += X::BB - 2, scales += 2) {
+            std::memcpy(codes, row + b * X::BB + 2, X::BB - 2);
+            std::memcpy(scales, row + b * X::BB, 2);
+        }
+    }
 }
 
 }  // namespace
@@ -89,75 +119,18 @@ const void* MtpDrafter::q8(const char* name) const {
     return nullptr;
 }
 
-bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
+bool MtpDrafter::load(const std::string& path, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window) {
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
-    rt_dir_ = rt_dir;
     if (max_t < 1 || max_t > lamina::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
-    // ---- the index and the dense weights
-    {
-        std::ifstream idx(rt_dir + "/dense.txt");
-        if (!idx) { err = "mtp: cannot open " + rt_dir + "/dense.txt (run tools/mtp_rt.py)"; return false; }
-        std::string line;
-        while (std::getline(idx, line)) {
-            if (line.empty()) continue;
-            std::istringstream is(line);
-            Tensor t;
-            is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
-            if (!is) { err = "mtp: malformed dense.txt line: " + line; return false; }
-            tensors_.push_back(t);
-        }
-        std::vector<uint8_t> blob;
-        if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        // each entry of its kind's size, aligned, inside dense.bin: a broken folder is refused, not read past
-        for (const Tensor& t : tensors_) {
-            const uint64_t n = t.rows > 0 && t.cols > 0 ? (uint64_t) t.rows * (uint64_t) t.cols : 0;
-            const uint64_t want = t.kind == "f32" ? n * 4 : t.kind == "bf16" ? n * 2
-                                  : t.kind == "q8_0" && t.cols % 32 == 0 ? n / 32 * 34 : 0;
-            if (want == 0 || t.bytes != want || t.off % 4 != 0 || t.off > blob.size() || t.bytes > blob.size() - t.off) {
-                err = "mtp: dense.txt's " + t.name + " (" + t.kind + " " + std::to_string(t.rows) + " x " +
-                      std::to_string(t.cols) + ", " + std::to_string(t.bytes) + " bytes at " + std::to_string(t.off) +
-                      ") is not a tensor of dense.bin's " + std::to_string(blob.size()) + " bytes";
-                return false;
-            }
-        }
-        if (cudaMalloc((void**) &dense_, blob.size()) != cudaSuccess) { err = "mtp: dense weights do not fit"; return false; }
-        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
-        vram_ += blob.size();
-    }
-    // ---- the 512 routed experts, one blob each: raw GGUF blocks [gate | up | down] in the formats experts.txt names
-    //      (the ggml type ids of gate/up and down), or without it the Q2_0 blob layout of cpu/expert.hpp
-    {
-        blob_ = lamina::kernels::cpu::BLOB;
-        if (std::ifstream fmt(rt_dir + "/experts.txt"); fmt) {
-            int gu = -1, dn = -1;
-            fmt >> gu >> dn;
-            if (!lamina::kernels::native_expert_supported(gu, dn, g.n_embd, g.n_ff)) {
-                err = "mtp: experts.txt names formats the GPU expert kernels lack";
-                return false;
-            }
-            // the fast kernels under either --expert-math: drafts are verified, and both runs of a comparison
-            // compute them here
-            nat_ = lamina::kernels::native_expert_layout(gu, dn, g.n_embd, g.n_ff);
-            blob_ = nat_.bytes;
-        }
-        const uint64_t bytes = (uint64_t) g.n_expert * blob_;
-        std::ifstream f(rt_dir + "/experts.bin", std::ios::binary | std::ios::ate);
-        if (!f) { err = "mtp: cannot open experts.bin"; return false; }
-        if ((uint64_t) f.tellg() != bytes) { err = "mtp: experts.bin does not match its format"; return false; }
-        f.seekg(0);
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (!f.read((char*) chunk.data(), (std::streamsize) n)) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            off += n;
-        }
-        vram_ += bytes;
-    }
+    const Clock::time_point t_load = Clock::now();
+    uint64_t dense_bytes = 0;
+    std::error_code ec;
+    if (!(std::filesystem::is_directory(path, ec) ? load_folder(path, g, dense_bytes, err)
+                                                  : load_file(path, g, dense_bytes, err)))
+        return false;
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
@@ -248,9 +221,198 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     char fmts[48] = "Q2_0 blobs";
     if (nat_.gu_type >= 0) std::snprintf(fmts, sizeof fmts, "ggml types %d/%d", nat_.gu_type, nat_.d_type);
-    std::fprintf(stderr, "lamina mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f as %s, dense %.0f)\n",
-                 (double) vram_ / 1048576.0, (double) g.n_expert * blob_ / 1048576.0, fmts,
-                 (double) tensors_.back().off / 1048576.0);
+    std::fprintf(stderr, "lamina mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f as %s, dense %.0f), in %.2f s\n",
+                 (double) vram_ / 1048576.0, (double) g.n_expert * blob_ / 1048576.0, fmts, (double) dense_bytes / 1048576.0,
+                 std::chrono::duration<double>(Clock::now() - t_load).count());
+    return true;
+}
+
+bool MtpDrafter::load_file(const std::string& path, const ModelGeometry& g, uint64_t& dense_bytes, std::string& err) {
+    std::unique_ptr<GgufFile> f;   // mapped while its tensors go to VRAM
+    try {
+        f = std::make_unique<GgufFile>(path);
+    } catch (const std::exception& e) {
+        err = "mtp: " + path + ": " + e.what();
+        return false;
+    }
+    const MetaValue* arch = f->get("general.architecture");
+    const MetaValue* ver = f->get("lamina.mtp.version");
+    if (arch == nullptr || arch->s != kDraftLayerArch || ver == nullptr || !ver->is_num() || ver->u != kDraftLayerVersion) {
+        err = "mtp: " + path + " is not a draft layer this engine reads (general.architecture " + kDraftLayerArch +
+              ", lamina.mtp.version " + std::to_string(kDraftLayerVersion) + ": tools/mtp_rt.py writes one)";
+        return false;
+    }
+    const uint64_t payload = f->file_size() - f->data_start();
+    auto bytes_of = [&](const TensorInfo& t) -> uint64_t {   // 0: not a whole tensor of a known type inside the file
+        const uint64_t b = tensor_payload_bytes(t);
+        return b != 0 && t.offset <= payload && b <= payload - t.offset ? b : 0;
+    };
+    const TensorInfo* gu = f->find("mlp.experts.gate_up_proj");
+    const TensorInfo* dn = f->find("mlp.experts.down_proj");
+    const TensorInfo* dv = f->find("draft_vocab");
+    // ---- the dense weights in one VRAM buffer, in the file's order, each at a 256-byte offset (zeros between)
+    {
+        std::vector<const TensorInfo*> dense;
+        for (const TensorInfo& t : f->tensors())
+            if (&t != gu && &t != dn && &t != dv) dense.push_back(&t);
+        std::sort(dense.begin(), dense.end(), [](const TensorInfo* a, const TensorInfo* b) { return a->offset < b->offset; });
+        for (const TensorInfo* t : dense) {
+            const char* kind = t->type == 0 ? "f32" : t->type == 30 ? "bf16" : t->type == GGML_Q8_0 ? "q8_0" : nullptr;
+            const uint64_t b = bytes_of(*t);
+            if (kind == nullptr || t->shape.size() > 2 || b == 0) {
+                err = "mtp: " + path + ": " + t->name + " (" + t->type_name() + ") is not a dense tensor the layer "
+                      "takes (F32, BF16 or Q8_0, one or two dimensions, inside the file)";
+                return false;
+            }
+            dense_bytes = (dense_bytes + 255) / 256 * 256;
+            tensors_.push_back({t->name, kind, t->shape.size() > 1 ? (int64_t) t->shape[1] : 1, (int64_t) t->shape[0],
+                                dense_bytes, b});
+            dense_bytes += b;
+        }
+        if (dense.empty() || cudaMalloc((void**) &dense_, dense_bytes) != cudaSuccess) {
+            err = "mtp: dense weights do not fit";
+            return false;
+        }
+        cudaMemset(dense_, 0, dense_bytes);
+        for (size_t i = 0; i < dense.size(); ++i)
+            cudaMemcpy(dense_ + tensors_[i].off, f->tensor_data(*dense[i]), tensors_[i].bytes, cudaMemcpyHostToDevice);
+        vram_ += dense_bytes;
+    }
+    // ---- the 512 routed experts, one blob each: Q2_0 in the blob layout of cpu/expert.hpp (q2_blob), other formats
+    //      as their GGUF blocks [gate | up | down] for the native expert kernels
+    {
+        const uint64_t E = (uint64_t) g.n_expert, N = (uint64_t) g.n_embd, F = (uint64_t) g.n_ff;
+        if (gu == nullptr || dn == nullptr || gu->shape != std::vector<uint64_t>{N, 2 * F, E} ||
+            dn->shape != std::vector<uint64_t>{F, N, E} || bytes_of(*gu) == 0 || bytes_of(*dn) == 0) {
+            err = "mtp: " + path + " has no mlp.experts.gate_up_proj [" + std::to_string(N) + ", " + std::to_string(2 * F) +
+                  ", " + std::to_string(E) + "] and mlp.experts.down_proj [" + std::to_string(F) + ", " + std::to_string(N) +
+                  ", " + std::to_string(E) + "] of a known format";
+            return false;
+        }
+        const bool q2 = gu->type == 42 && dn->type == 42;
+        if (q2) {
+            blob_ = lamina::kernels::cpu::BLOB;
+        } else {
+            if (!lamina::kernels::native_expert_supported((int) gu->type, (int) dn->type, g.n_embd, g.n_ff)) {
+                err = std::string("mtp: the experts' formats, ") + gu->type_name() + " / " + dn->type_name() +
+                      ", have no GPU expert kernels";
+                return false;
+            }
+            // the fast kernels under either --expert-math: drafts are verified, and both runs of a comparison
+            // compute them here
+            nat_ = lamina::kernels::native_expert_layout((int) gu->type, (int) dn->type, g.n_embd, g.n_ff);
+            blob_ = nat_.bytes;
+        }
+        const uint64_t gu_e = bytes_of(*gu) / E, dn_e = bytes_of(*dn) / E;   // an expert's bytes of each
+        if (blob_ != gu_e + dn_e) { err = "mtp: the experts' blocks do not make the expert layout's blobs"; return false; }
+        const uint64_t bytes = E * blob_;
+        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        const uint8_t* gsrc = f->tensor_data(*gu);
+        const uint8_t* dsrc = f->tensor_data(*dn);
+        constexpr uint64_t kPer = 32;   // experts a copy
+        std::vector<uint8_t> chunk((size_t) (kPer * blob_));
+        for (uint64_t e0 = 0; e0 < E; e0 += kPer) {
+            const uint64_t n = std::min(kPer, E - e0);
+            for (uint64_t e = 0; e < n; ++e) {
+                uint8_t* blob = chunk.data() + e * blob_;
+                const uint8_t *ge = gsrc + (e0 + e) * gu_e, *de = dsrc + (e0 + e) * dn_e;
+                if (q2) {
+                    q2_blob(ge, de, blob);
+                } else {
+                    std::memcpy(blob, ge, gu_e);
+                    std::memcpy(blob + gu_e, de, dn_e);
+                }
+            }
+            cudaMemcpy(experts_ + e0 * blob_, chunk.data(), n * blob_, cudaMemcpyHostToDevice);
+        }
+        vram_ += bytes;
+    }
+    // ---- the draft head's token ids (bind_head gathers their rows of the main head); without them the whole head
+    if (dv != nullptr) {
+        if (dv->type != 26 || dv->shape.size() != 1 || bytes_of(*dv) == 0) {
+            err = "mtp: " + path + "'s draft_vocab is not a one-dimensional I32 tensor";
+            return false;
+        }
+        dvocab_ids_.resize((size_t) dv->shape[0]);
+        std::memcpy(dvocab_ids_.data(), f->tensor_data(*dv), dvocab_ids_.size() * sizeof(int32_t));
+    }
+    f.reset();
+    return true;
+}
+
+bool MtpDrafter::load_folder(const std::string& dir, const ModelGeometry& g, uint64_t& dense_bytes, std::string& err) {
+    // ---- the index and the dense weights, dense.bin as it is (its offsets are the VRAM buffer's)
+    {
+        std::ifstream idx(dir + "/dense.txt");
+        if (!idx) {
+            err = "mtp: " + dir + " is a folder without dense.txt: --mtp takes the draft layer's file, " + kDraftLayerFile +
+                  " (" + kDraftLayerScript + " downloads it), or a folder of its earlier layout (dense.txt, dense.bin, "
+                  "experts.bin, draft_vocab.bin)";
+            return false;
+        }
+        std::string line;
+        while (std::getline(idx, line)) {
+            if (line.empty()) continue;
+            std::istringstream is(line);
+            Tensor t;
+            is >> t.name >> t.kind >> t.rows >> t.cols >> t.off >> t.bytes;
+            if (!is) { err = "mtp: malformed dense.txt line: " + line; return false; }
+            tensors_.push_back(t);
+        }
+        std::vector<uint8_t> blob;
+        if (!read_file(dir + "/dense.bin", blob)) { err = "mtp: cannot read " + dir + "/dense.bin"; return false; }
+        // each entry of its kind's size, aligned, inside dense.bin: a broken folder is refused, not read past
+        for (const Tensor& t : tensors_) {
+            const uint64_t n = t.rows > 0 && t.cols > 0 ? (uint64_t) t.rows * (uint64_t) t.cols : 0;
+            const uint64_t want = t.kind == "f32" ? n * 4 : t.kind == "bf16" ? n * 2
+                                  : t.kind == "q8_0" && t.cols % 32 == 0 ? n / 32 * 34 : 0;
+            if (want == 0 || t.bytes != want || t.off % 4 != 0 || t.off > blob.size() || t.bytes > blob.size() - t.off) {
+                err = "mtp: dense.txt's " + t.name + " (" + t.kind + " " + std::to_string(t.rows) + " x " +
+                      std::to_string(t.cols) + ", " + std::to_string(t.bytes) + " bytes at " + std::to_string(t.off) +
+                      ") is not a tensor of dense.bin's " + std::to_string(blob.size()) + " bytes";
+                return false;
+            }
+        }
+        if (cudaMalloc((void**) &dense_, blob.size()) != cudaSuccess) { err = "mtp: dense weights do not fit"; return false; }
+        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        dense_bytes = blob.size();
+        vram_ += blob.size();
+    }
+    // ---- the 512 routed experts, one blob each: raw GGUF blocks [gate | up | down] in the formats experts.txt names
+    //      (the ggml type ids of gate/up and down), or without it the Q2_0 blob layout of cpu/expert.hpp
+    {
+        blob_ = lamina::kernels::cpu::BLOB;
+        if (std::ifstream fmt(dir + "/experts.txt"); fmt) {
+            int gu = -1, dn = -1;
+            fmt >> gu >> dn;
+            if (!lamina::kernels::native_expert_supported(gu, dn, g.n_embd, g.n_ff)) {
+                err = "mtp: experts.txt names formats the GPU expert kernels lack";
+                return false;
+            }
+            nat_ = lamina::kernels::native_expert_layout(gu, dn, g.n_embd, g.n_ff);
+            blob_ = nat_.bytes;
+        }
+        const uint64_t bytes = (uint64_t) g.n_expert * blob_;
+        std::ifstream f(dir + "/experts.bin", std::ios::binary | std::ios::ate);
+        if (!f) { err = "mtp: cannot open " + dir + "/experts.bin"; return false; }
+        if ((uint64_t) f.tellg() != bytes) { err = "mtp: experts.bin does not match its format"; return false; }
+        f.seekg(0);
+        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        std::vector<uint8_t> chunk(64u << 20);
+        for (uint64_t off = 0; off < bytes;) {
+            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
+            if (!f.read((char*) chunk.data(), (std::streamsize) n)) { err = "mtp: experts.bin is truncated"; return false; }
+            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            off += n;
+        }
+        vram_ += bytes;
+    }
+    // ---- the draft head's token ids, when tools/draft_vocab.py wrote them (none: the whole head)
+    std::vector<uint8_t> raw;
+    if (read_file(dir + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
+        dvocab_ids_.resize(raw.size() / 4);
+        std::memcpy(dvocab_ids_.data(), raw.data(), raw.size());
+    }
     return true;
 }
 
@@ -280,30 +442,27 @@ bool MtpDrafter::bind_head(const NativeHead* head, std::string& err) {
         err = "mtp: the draft layer needs the native head (--native)";
         return false;
     }
-    // the draft head's token subset, when tools/draft_vocab.py wrote one
+    // the draft head's token subset, when the layer's file holds one (tools/draft_vocab.py, tools/mtp_rt.py)
     if (dhead_ == nullptr) {
-        std::vector<uint8_t> raw;
-        if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
-            n_dvocab_ = (int64_t) (raw.size() / 4);
-            for (int64_t i = 0; i < n_dvocab_; ++i) {   // the head's rows they are gathered from
-                int32_t id = 0;
-                std::memcpy(&id, raw.data() + 4 * (size_t) i, 4);
+        if (!dvocab_ids_.empty()) {
+            n_dvocab_ = (int64_t) dvocab_ids_.size();
+            for (const int32_t id : dvocab_ids_)   // the head's rows they are gathered from
                 if (id < 0 || id >= head->rows()) {
-                    err = "mtp: draft_vocab.bin holds the token " + std::to_string(id) + ", outside the head's " +
+                    err = "mtp: the draft vocabulary holds the token " + std::to_string(id) + ", outside the head's " +
                           std::to_string(head->rows()) + " rows";
                     return false;
                 }
-            }
+            const size_t ids_bytes = dvocab_ids_.size() * sizeof(int32_t);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
+            if (cudaMalloc((void**) &dvocab_, ids_bytes) != cudaSuccess ||
                 cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
                 err = "mtp: the draft head does not fit";
                 return false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(dvocab_, dvocab_ids_.data(), ids_bytes, cudaMemcpyHostToDevice);
             lamina::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
+            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + ids_bytes;
             std::fprintf(stderr, "lamina mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             // its 2-bit copy finds each draft's row (LAMINA_DRAFT_PROXY=0: the exact head over every row)

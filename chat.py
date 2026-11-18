@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A tiny terminal chat for a running Lamina server (start it with run-<model>.bat / run-<model>.sh first).
+"""A tiny terminal chat for a running Lamina server (start lamina-server first).
 
     python chat.py [--port 8081] [--think none|low|medium|high]
 

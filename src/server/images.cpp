@@ -649,7 +649,7 @@ ImageGen::ImageGen(const json& cfg_, std::string log_) : cfg(cfg_), log(std::mov
         const json& v = jget(cfg, k);
         if (!v.is_string() || v.get_ref<const std::string&>().empty())
             throw std::invalid_argument(std::string("the config's \"images\" section needs \"") + k +
-                                        "\" (run setup with --images again)");
+                                        "\" (docs/USING.md, Image generation)");
     }
     policy = pol.get<std::string>();
     reload = rel.get<std::string>();

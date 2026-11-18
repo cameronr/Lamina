@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Lamina's CI (.github/workflows/build.yml), runnable on a PC the same way: the CUDA toolkit from NVIDIA's
-redistributable archives, the engine with its tests and the CPU image encoder built by setup.py's own functions, the
-tests that need no GPU, and the release archives.
+redistributable archives, the portable preset built by build.bat or build.sh with the tests, the tests that need no
+GPU, and the release archives from cmake --install.
 
     python .github/ci.py toolkit --dest DIR     the toolkit for this OS and CPU into DIR (in GitHub Actions also
-                                                 CUDA_PATH and PATH for the later steps; elsewhere LAMINA_NVCC names it)
-    python .github/ci.py build                  llama.cpp at the pinned commit, build/ (every program, the release's CUDA
-                                                 architectures, for other PCs) and build-vision/ (the CPU encoder)
+                                                 CUDA_PATH and PATH for the later steps; elsewhere CUDACXX names it)
+    python .github/ci.py build                  build-portable/: every program and test, and the image encoder (the
+                                                 portable preset: the release's GPUs, for other PCs)
     python .github/ci.py test                   the tests that need no GPU: ctest -L cpu, the tools' unit tests
     python .github/ci.py package [--version V]  dist/lamina-V-bin-<os>-cuda-<x.y>-<cpu>.zip (.tar.gz on Linux): the
-                                                 programs, and dist/cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>.zip: the CUDA
-                                                 runtime and cuBLAS; both flat, for one folder (bin/ in a clone, which
-                                                 setup --no-build runs)
+                                                 programs, the script that downloads Flash-Next's draft layer and the
+                                                 licenses (cmake --install's component lamina), and
+                                                 dist/cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>.zip: the CUDA runtime and
+                                                 cuBLAS (component cudart); both flat, for one folder. On Linux the
+                                                 programs' libraries are checked first (GLIBC_MAX, SYSTEM_LIBS)
 """
 from __future__ import annotations
 
@@ -19,32 +21,73 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import setup as S  # noqa: E402  (the checkout's setup.py)
-
+ROOT = Path(__file__).resolve().parent.parent
+WIN = os.name == "nt"
+EXE = ".exe" if WIN else ""
+ARM = platform.machine().lower() in ("arm64", "aarch64")
+BUILD = ROOT / "build-portable"   # the portable preset's (CMakePresets.json)
 # NVIDIA's redistributable CUDA 13.4.1 (redistrib_13.4.1.json): nvcc 13.4.59, cuBLAS 13.7.0.27, the toolkit build.cmd
 # uses on the PC Lamina is developed on.  The parts the engine's build takes, nothing else.
 CUDA_REDIST = "13.4.1"
 REDIST_URL = "https://developer.download.nvidia.com/compute/cuda/redist"
 COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cccl")
 SKIP = {"libcublas_static.a", "libcublasLt_static.a"}   # ~1 GB the engine does not link
-# The release's GPUs: RTX 30 (86), 40 (89) and 50 (120, with its PTX for newer ones), as the Dockerfile's
-CUDA_ARCHS = "86-real;89-real;120-real;120-virtual"
+# What each archive holds (cmake --install's components): checked before it is written
+EXECUTABLES = [f"lamina-server{EXE}", f"lamina{EXE}", f"lamina-vision{EXE}"]
+PROGRAMS = [*EXECUTABLES, "download-draft-layer.bat" if WIN else "download-draft-layer.sh", "LICENSE",
+            "LICENSE-llama.cpp", "LICENSE-cpp-httplib", "LICENSE-jsonhpp", "LICENSE-Outfit"]
+# What the Linux programs may take from the system (docs/SETUP.md, Release binaries): glibc 2.34 at most (Ubuntu
+# 22.04, Debian 12, RHEL 9, Amazon Linux 2023), OpenSSL 3 and the NVIDIA driver's libcuda.so.1 (the image encoder's
+# ggml-cuda links it); the C++ runtime is linked in (the portable preset) and the CUDA runtime is the archive's,
+# beside them (RUNPATH $ORIGIN)
+GLIBC_MAX = (2, 34)
+SYSTEM_LIBS = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "ld-linux-x86-64.so.2",
+               "ld-linux-aarch64.so.1", "libssl.so.3", "libcrypto.so.3", "libcuda.so.1"}
 
 
-def redist_platform() -> str:
-    if S.WIN:
-        return "windows-arm64" if S.ARM else "windows-x86_64"
-    return "linux-sbsa" if S.ARM else "linux-x86_64"
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def fail(msg):
+    say(f"\nci stopped: {msg}")
+    sys.exit(1)
+
+
+def env() -> dict:
+    """This environment without a PYTHONPATH or PIP_TARGET meant for another Python, with this Python's scripts
+    folder first on the PATH (CMake and Ninja from pip, as in the workflow, in a virtual environment not activated)."""
+    e = dict(os.environ)
+    for k in ("PYTHONPATH", "PIP_TARGET"):
+        e.pop(k, None)
+    here = Path(sys.executable).parent
+    e["PATH"] = os.pathsep.join([str(d) for d in ([here, here / "Scripts"] if WIN else [here])] + [e.get("PATH", "")])
+    return e
+
+
+def run(cmd, **kw):
+    cmd = [str(c) for c in cmd]
+    say("  $ " + " ".join(cmd))
+    if subprocess.run(cmd, **kw).returncode != 0:
+        fail(f"{Path(cmd[0]).name} failed (above)")
+
+
+def tool(name: str) -> str:
+    found = shutil.which(name, path=env()["PATH"])
+    if not found:
+        fail(f"{name} is not on the PATH")
+    return found
 
 
 def export(name: str, value: str):
@@ -53,6 +96,34 @@ def export(name: str, value: str):
     if os.environ.get("GITHUB_ENV"):
         with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
             f.write(f"{name}={value}\n")
+
+
+def download(url: str, dst: Path, size: int, sha256: str):
+    """url into dst, checked by its size and SHA-256; three tries."""
+    for attempt in range(3):
+        h, done = hashlib.sha256(), 0
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r, open(dst, "wb") as f:
+                while b := r.read(8 << 20):
+                    f.write(b)
+                    h.update(b)
+                    done += len(b)
+            if done == size and h.hexdigest() == sha256:
+                return
+            why = f"{done} bytes, SHA-256 {h.hexdigest()}"
+        except OSError as e:
+            why = str(e)
+        dst.unlink(missing_ok=True)
+        if attempt == 2:
+            fail(f"{url}: {why}, not the archive NVIDIA's manifest names")
+        say(f"  {dst.name}: {why}; trying again")
+        time.sleep(10)
+
+
+def redist_platform() -> str:
+    if WIN:
+        return "windows-arm64" if ARM else "windows-x86_64"
+    return "linux-sbsa" if ARM else "linux-x86_64"
 
 
 def extract(arc: Path, dest: Path):
@@ -82,46 +153,32 @@ def extract(arc: Path, dest: Path):
 def toolkit(dest: Path, version: str):
     plat = redist_platform()
     mark, key = dest / ".lamina-redist", f"{version} {plat} {' '.join(COMPONENTS)}"
-    if mark.exists() and mark.read_text().strip() == key:
-        S.ok(f"CUDA {version} ({plat}) in {dest}")
-    else:
+    if not (mark.exists() and mark.read_text().strip() == key):
         with urllib.request.urlopen(f"{REDIST_URL}/redistrib_{version}.json", timeout=60) as r:
             manifest = json.loads(r.read())
         dest.mkdir(parents=True, exist_ok=True)
         for c in COMPONENTS:
             e = manifest[c][plat]
             arc = dest.parent / Path(e["relative_path"]).name
-            h = S.get(f"{REDIST_URL}/{e['relative_path']}", arc, f"{c} {manifest[c]['version']}", int(e["size"]),
-                      hashlib.sha256())
-            if h.hexdigest() != e["sha256"]:
-                arc.unlink()
-                S.fail(f"{arc.name}: not the archive NVIDIA's manifest names (SHA-256)")
+            say(f"  {c} {manifest[c]['version']} ({int(e['size']) / 1e6:.0f} MB)")
+            download(f"{REDIST_URL}/{e['relative_path']}", arc, int(e["size"]), e["sha256"])
             extract(arc, dest)
             arc.unlink()
-        if not S.WIN and not (dest / "lib64").exists():   # nvcc.profile links from lib64, the archives hold lib
+        if not WIN and not (dest / "lib64").exists():   # nvcc.profile links from lib64, the archives hold lib
             (dest / "lib64").symlink_to("lib")
         mark.write_text(key + "\n")
-        S.ok(f"CUDA {version} ({plat}) in {dest}")
+    say(f"  ok: CUDA {version} ({plat}) in {dest}")
     export("CUDA_PATH", str(dest))
-    nvcc = dest / "bin" / ("nvcc" + S.EXE)
     if os.environ.get("GITHUB_PATH"):
         with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as f:
             f.write(f"{dest / 'bin'}\n")
     else:
-        S.say(f"  for the next steps: LAMINA_NVCC={nvcc}")
-
-
-def checked_toolchain() -> S.Toolchain:
-    tc = S.toolchain()
-    problems = tc.problems() + ([] if tc.cmake and tc.ninja else ["CMake and Ninja (pip install -r requirements-build.txt)"])
-    if problems:
-        S.fail("missing for the build: " + "; ".join(problems))
-    return tc
+        say(f"  for the next steps: CUDACXX={dest / 'bin' / ('nvcc' + EXE)}")
 
 
 def engine_version() -> str:
     """The version the programs report (CMakeLists.txt's project VERSION, LAMINA_VERSION)."""
-    m = re.search(r"^project\(lamina VERSION ([0-9.]+)", (S.ROOT / "CMakeLists.txt").read_text(encoding="utf-8-sig"),
+    m = re.search(r"^project\(lamina VERSION ([0-9.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8-sig"),
                   re.MULTILINE)
     return m.group(1) if m else "?"
 
@@ -129,102 +186,128 @@ def engine_version() -> str:
 def build():
     tag = os.environ.get("GITHUB_REF_NAME", "") if os.environ.get("GITHUB_REF_TYPE") == "tag" else ""
     if tag and tag != f"v{engine_version()}":   # before an hour of building
-        S.fail(f"the tag {tag} is not the version the programs report, v{engine_version()}",
-               "set project(lamina VERSION ...) in CMakeLists.txt to the release's and tag that commit")
-    tc = checked_toolchain()
-    S.say(f"CUDA {tc.cuda[0]}.{tc.cuda[1]} ({tc.nvcc}), {CUDA_ARCHS}")
-    S.fetch_llama()
-    env = S.vs_environment(tc.vcvars) if S.WIN else S.clean_env()
+        fail(f"the tag {tag} is not the version the programs report, v{engine_version()}: set project(lamina "
+             "VERSION ...) in CMakeLists.txt to the release's and tag that commit")
+    e = env()
     ccache = shutil.which("ccache")
-    if ccache:   # read by CMake at a build folder's first configure, the image encoder's too
+    if ccache:   # read at a build folder's first configure; the image encoder's build takes them from it
         for lang in ("C", "CXX", "CUDA"):
-            env[f"CMAKE_{lang}_COMPILER_LAUNCHER"] = ccache
-    # Linux: the programs look for the CUDA runtime beside them (the runtime archive), not in this machine's toolkit
-    extra = () if S.WIN else ("-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON", "-DCMAKE_INSTALL_RPATH=$ORIGIN")
-    S.build_engine(tc, CUDA_ARCHS, True, env, tests=True, extra=extra)
-    S.build_vision(tc, env)
+            e[f"CMAKE_{lang}_COMPILER_LAUNCHER"] = ccache
+    script = [ROOT / "build.bat"] if WIN else ["sh", ROOT / "build.sh"]
+    # LAMINA_JOBS, else on a runner, which does nothing else, every core (a PC's build leaves half to the desktop)
+    jobs = os.environ.get("LAMINA_JOBS") or (str(os.cpu_count() or 4) if os.environ.get("GITHUB_ACTIONS") else "")
+    jobs = [f"-DLAMINA_JOBS={jobs}"] if jobs else []
+    run([*script, "portable", "-DLAMINA_BUILD_TESTS=ON", *jobs], env=e, cwd=ROOT)
     if ccache:
         subprocess.run([ccache, "--show-stats"])
 
 
-def toolkit_root(tc: S.Toolchain) -> Path:
-    return Path(tc.nvcc).resolve().parent.parent
-
-
 def test():
-    tc = checked_toolchain()
-    env = S.clean_env()
-    tk = toolkit_root(tc)
-    if S.WIN:   # build/ holds the CUDA DLLs (build_engine), the toolkit's are the same
-        env["PATH"] = os.pathsep.join([str(tk / "bin" / ("arm64" if S.ARM else "x64")), env.get("PATH", "")])
-    else:       # the programs' RUNPATH is their own folder ($ORIGIN, build())
-        lib = S.cuda_lib_dir(tc.nvcc) or str(tk / "lib")
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(x for x in (lib, env.get("LD_LIBRARY_PATH", "")) if x)
-    ctest = Path(tc.cmake).with_name("ctest" + S.EXE)
-    S.run([ctest, "--test-dir", S.ROOT / "build", "-L", "cpu", "--output-on-failure", "--timeout", "900"], env=env)
+    run([tool("ctest"), "--test-dir", BUILD, "-L", "cpu", "--output-on-failure", "--timeout", "900"], env=env())
     # the tools' tests (requirements.txt), from the checkout's folder as CONTRIBUTING.md runs them
-    S.say("  $ python -m unittest discover -s tools -p test_*.py")
-    if subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_*.py"], cwd=S.ROOT,
-                      env=S.clean_env()).returncode != 0:
-        S.fail("the tools' tests failed (above)")
+    run([sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_*.py"], cwd=ROOT, env=env())
 
 
-def write_archive(base: Path, files: dict) -> Path:
-    """files ({name in the archive: file}) into base.zip on Windows, base.tar.gz elsewhere (programs executable)."""
-    if S.WIN:
+def write_archive(base: Path, folder: Path) -> Path:
+    """folder's files into base.zip on Windows, base.tar.gz elsewhere (programs executable), flat."""
+    files = sorted(p for p in folder.iterdir() if p.is_file())
+    if WIN:
         out = base.with_name(base.name + ".zip")
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-            for name, src in files.items():
-                z.write(src, name)
+            for src in files:
+                z.write(src, src.name)
     else:
         out = base.with_name(base.name + ".tar.gz")
         with tarfile.open(out, "w:gz") as t:
-            for name, src in files.items():
-                info = t.gettarinfo(str(src), name)
+            for src in files:
+                info = t.gettarinfo(str(src), src.name)
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
                 with open(src, "rb") as f:
                     t.addfile(info, f)
-    S.ok(f"{out.relative_to(S.ROOT)}: {out.stat().st_size / 1e6:.0f} MB")
+    say(f"  ok: {out.relative_to(ROOT)}: {out.stat().st_size / 1e6:.0f} MB, {len(files)} files")
     return out
 
 
+def readelf(*args: str) -> str:
+    r = subprocess.run([tool("readelf"), "-W", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail(f"readelf {' '.join(args)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def check_linux_floor(folder: Path, runtime: list[str]):
+    """The programs in `folder` against SYSTEM_LIBS, GLIBC_MAX and RUNPATH $ORIGIN, and the C++ runtime they link in
+    unexported (the CUDA runtime's libstdc++ would bind to it), as readelf reads them."""
+    problems, libs, newest = [], set(), (0, 0)
+    for name in EXECUTABLES:
+        exe = str(folder / name)
+        # the runtime's own definitions (GLOBAL, UNIQUE); a template the program instantiates is WEAK, exported where
+        # a library calls it (C++20 code instantiates std::string itself), as in any C++ program
+        leaked = []
+        for line in readelf("--dyn-syms", exe).splitlines():   # Num: Value Size Type Bind Vis Ndx Name
+            f = line.split()
+            if (len(f) >= 8 and f[6] != "UND" and f[4] != "WEAK"
+                    and re.match(r"_ZN?K?St|__cxa_|__gxx_|_Unwind_", f[7])):
+                leaked.append(f[7])
+        if leaked:
+            problems.append(f"{name} exports {len(leaked)} symbols of the C++ runtime it links in ({leaked[0]}, ...)")
+        dynamic = readelf("-d", exe)
+        for lib in re.findall(r"\(NEEDED\)\s+Shared library: \[(.+?)\]", dynamic):
+            libs.add(lib)
+            if lib not in SYSTEM_LIBS and lib not in runtime:
+                problems.append(f"{name} needs {lib}")
+        paths = re.findall(r"\((?:RUNPATH|RPATH)\)\s+Library r(?:un)?path: \[(.*?)\]", dynamic)
+        if paths != ["$ORIGIN"]:
+            problems.append(f"{name}'s RUNPATH is {', '.join(paths) or 'not set'}, not $ORIGIN")
+        lib = "?"
+        for line in readelf("-V", exe).splitlines():   # the version needs: "File: libc.so.6", "Name: GLIBC_2.34"
+            if m := re.search(r"File: (\S+)", line):
+                lib = m.group(1)
+            elif m := re.search(r"Name: GLIBC_(\d+)\.(\d+)", line):
+                v = (int(m.group(1)), int(m.group(2)))
+                newest = max(newest, v)
+                if v > GLIBC_MAX:
+                    problems.append(f"{name} needs GLIBC_{v[0]}.{v[1]} ({lib})")
+    if problems:
+        fail("the Linux programs need more than the systems they are for (GLIBC_MAX, SYSTEM_LIBS): "
+             + "; ".join(sorted(set(problems))))
+    say(f"  ok: the programs need glibc {newest[0]}.{newest[1]} and " + ", ".join(sorted(libs)))
+
+
 def package(version: str):
-    tc = checked_toolchain()
-    tk = toolkit_root(tc)
-    name = f"{'win' if S.WIN else 'linux'}-cuda-{tc.cuda[0]}.{tc.cuda[1]}-{'arm64' if S.ARM else 'x64'}"
-    dist = S.ROOT / "dist"
+    cache = (BUILD / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    nvcc = re.search(r"^CMAKE_CUDA_COMPILER:\w+=(.+)$", cache, re.MULTILINE)
+    v = re.search(r"release (\d+)\.(\d+)", subprocess.run([nvcc.group(1).strip(), "--version"], capture_output=True,
+                                                          text=True).stdout) if nvcc else None
+    if not v:
+        fail(f"{BUILD} names no CUDA compiler that reports its version")
+    major = v.group(1)
+    name = f"{'win' if WIN else 'linux'}-cuda-{major}.{v.group(2)}-{'arm64' if ARM else 'x64'}"
+    stage = BUILD / "package"
+    shutil.rmtree(stage, ignore_errors=True)
+    for component in ("lamina", "cudart"):
+        run([tool("cmake"), "--install", BUILD, "--component", component, "--prefix", stage / component])
+    runtime = ([f"cudart64_{major}.dll", f"cublas64_{major}.dll", f"cublasLt64_{major}.dll"] if WIN else
+               [f"libcudart.so.{major}", f"libcublas.so.{major}", f"libcublasLt.so.{major}"])
+    for component, names in (("lamina", PROGRAMS), ("cudart", runtime)):
+        missing = [n for n in names if not (stage / component / n).is_file()]
+        if missing:
+            fail(f"cmake --install's component {component} lacks " + ", ".join(missing))
+    if not WIN:
+        check_linux_floor(stage / "lamina", runtime)
+    dist = ROOT / "dist"
     dist.mkdir(exist_ok=True)
-    files = {f"lamina-server{S.EXE}": S.ROOT / "build" / f"lamina-server{S.EXE}",
-             f"lamina{S.EXE}": S.ROOT / "build" / f"lamina{S.EXE}",
-             f"lamina-vision{S.EXE}": S.ROOT / "build-vision" / "bin" / f"lamina-vision{S.EXE}",
-             "LICENSE": S.ROOT / "LICENSE",
-             "LICENSE-llama.cpp": S.LLAMA / "LICENSE",
-             "LICENSE-cpp-httplib": S.LLAMA / "vendor" / "cpp-httplib" / "LICENSE",
-             "LICENSE-jsonhpp": S.LLAMA / "licenses" / "LICENSE-jsonhpp",
-             "LICENSE-Outfit": S.ROOT / "src" / "server" / "web" / "fonts" / "OFL.txt"}
-    missing = [str(f) for f in files.values() if not f.is_file()]
-    if missing:
-        S.fail("not built or not there: " + ", ".join(missing))
-    write_archive(dist / f"lamina-{version}-bin-{name}", files)
-    if S.WIN:
-        runtime = {d.name: d for d in S.cuda_dlls(tc.nvcc)}
-    else:   # the sonames the programs ask for, as files
-        lib = Path(S.cuda_lib_dir(tc.nvcc) or tk / "lib")
-        runtime = {n: (lib / n).resolve()
-                   for n in (f"libcudart.so.{tc.cuda[0]}", f"libcublas.so.{tc.cuda[0]}", f"libcublasLt.so.{tc.cuda[0]}")}
-    if len(runtime) != 3 or not all(f.is_file() for f in runtime.values()):
-        S.fail(f"the CUDA runtime and cuBLAS of {tk}: {sorted(runtime)}")
-    if (tk / "LICENSE").is_file():
-        runtime["LICENSE-cuda"] = tk / "LICENSE"
-    write_archive(dist / f"cudart-lamina-bin-{name}", runtime)
+    write_archive(dist / f"lamina-{version}-bin-{name}", stage / "lamina")
+    write_archive(dist / f"cudart-lamina-bin-{name}", stage / "cudart")
 
 
 def default_version() -> str:
     """A tag's name, else the commit's (8 digits)."""
     if os.environ.get("GITHUB_REF_TYPE") == "tag":
         return os.environ["GITHUB_REF_NAME"]
-    return S.out(["git", "-C", S.ROOT, "rev-parse", "--short=8", "HEAD"]).strip() or "local"
+    r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short=8", "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() or "local"
 
 
 def main() -> int:

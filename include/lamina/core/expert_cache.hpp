@@ -19,13 +19,14 @@
 // **WHAT THIS FILE IS.** The SLOT STORAGE and the RESIDENCY TABLE: it allocates the VRAM, fills it from the host
 // arena, and answers `(layer, expert) -> slot or -1`. It computes nothing itself: the GPU computes the experts it
 // holds in the verify window's grouped kernels and the prompt path (the hit/miss split), and the CPU pool the rest.
-// (Written when nothing consumed the slots yet and `--expert-cache` defaulted to 0; setup's configs use `auto`.)
+// (Written when nothing consumed the slots yet and `--expert-cache` defaulted to 0; the presets use `auto`.)
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "lamina/core/vmm.hpp"
@@ -36,6 +37,12 @@ namespace lamina::core {
 /// needs, and a table that has to be re-derived from a bitmask is a table that will be re-derived differently
 /// in the two places that use it.
 inline constexpr int32_t kNotResident = -1;
+
+/// --expert-profile builtin: Qwen3.8-Flash-Next's profile built into the programs (data/expert-profile.bin, the
+/// configs' file), the one --serve starts from when no profile is named.
+inline constexpr const char* kBuiltinExpertProfile = "builtin";
+/// Its bytes (a profile file's).
+std::string_view builtin_expert_profile();
 
 /// **THE STATIC RESIDENCY PLAN, READ BACK FROM THE FILE `tools/make_profile.py` WROTE.**
 ///
@@ -50,7 +57,7 @@ inline constexpr int32_t kNotResident = -1;
 /// ANOTHER, which is the only way to know whether it transfers.
 ///
 /// The frequency table is not returned: it is the profile's own working, and the engine measures `h` by
-/// running rather than by re-deriving what the file claims.
+/// running rather than by re-deriving what the file claims.  `path` kBuiltinExpertProfile reads the built-in one.
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
 

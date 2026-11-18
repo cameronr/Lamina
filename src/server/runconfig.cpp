@@ -39,17 +39,17 @@ const std::vector<Editable> kEditable = {
     {"anthropic_thinking", "enum", "", {"model", "on_request"},
      "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"},
     {"effort_position", "enum", "", {"start", "end"},
-     "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"},
+     "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)", false},
     {"aliases", "names", "", {}, "Other model names the server lists and answers to (comma-separated)"},
     {"idle_unload_s", "num>=0", "", {},
      "Unload the model after this many seconds without requests (0 or empty: never)"},
-    {"lazy_load", "bool", "", {}, "Start without loading the model; the first request loads it (text only)"},
+    {"lazy_load", "bool", "", {}, "Start without loading the model; the first request loads it (text only)", false},
     {"engine_silence_s", "num>=0", "", {},
      "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"},
     {"api_monitor", "bool", "", {}, "Keep the last 100 requests' prompts and answers in memory for /api-monitor"},
-    {"open_browser", "bool", "", {}, "Open the chat page in the browser when the model is ready"},
+    {"open_browser", "bool", "", {}, "Open the chat page in the browser when the model is ready", false},
     {"vram_reserve_mib", "arg", "--vram-reserve-mib", {},
-     "VRAM in MiB the engine leaves free for other programs (engine default 700)"},
+     "VRAM in MiB the engine leaves free for other programs (engine default 700)", false},
 };
 
 namespace {
@@ -409,7 +409,54 @@ json number(const std::string& key, const json& v, bool whole = false, double lo
 
 json as_float(const json& v) { return v.get<double>(); }
 
+/// `e`'s entry in `cfg` (a null one too), or nullptr when it has none; not for an engine option
+const json* entry(const json& cfg, const Editable& e) {
+    const bool sampling = e.kind == "sampling";
+    const json& in = sampling ? jget(cfg, "sampling") : cfg;
+    if (!in.is_object()) return nullptr;
+    const auto it = in.find(std::string(sampling ? e.key.substr(e.key.find('.') + 1) : e.key));
+    return it == in.end() ? nullptr : &*it;
+}
+
+/// `e` set to `v` in `cfg`: null takes the entry out, or with `keep_null` writes it as null (over a preset's value,
+/// which that clears); whether `cfg` changed
+bool put(json& cfg, const Editable& e, const json& v, bool keep_null) {
+    const std::string key(e.key);
+    if (e.kind == "arg") {
+        if (py_eq(arg_value(cfg, e.rule), v)) return false;
+        json a = list_of(jget(cfg, "args"));
+        const size_t i = flag_at(a, e.rule);
+        if (i != npos) {
+            if (v.is_null()) a.erase(a.begin() + (std::ptrdiff_t) i, a.begin() + (std::ptrdiff_t) i + 2);
+            else a[i + 1] = py_str(v);
+        } else if (!v.is_null()) {
+            a.push_back(e.rule);
+            a.push_back(py_str(v));
+        }
+        cfg["args"] = std::move(a);
+        return true;
+    }
+    const json* at = entry(cfg, e);
+    const bool kept = !v.is_null() || keep_null;   // the entry stays
+    if (kept ? at != nullptr && py_eq(*at, v) : at == nullptr) return false;
+    if (e.kind == "sampling") {
+        json s = jget(cfg, "sampling").is_object() ? cfg["sampling"] : json::object();
+        const std::string sub = key.substr(key.find('.') + 1);
+        if (kept) s[sub] = v;
+        else s.erase(sub);
+        if (!s.empty()) cfg["sampling"] = std::move(s);
+        else cfg.erase("sampling");
+    } else if (kept) {
+        cfg[key] = v;
+    } else {
+        cfg.erase(key);
+    }
+    return true;
+}
+
 }  // namespace
+
+const Editable* editable(std::string_view key) { return spec(key); }
 
 json value_of(const json& cfg, std::string_view key) {
     const Editable* e = spec(key);
@@ -422,17 +469,49 @@ json value_of(const json& cfg, std::string_view key) {
     return jget(cfg, key);
 }
 
-json view(const json& cfg, const std::string& path) {
+bool savable(const Editable& e, const FileSettings* file) {
+    return file != nullptr && (e.kind != "arg" || file->engine_options);
+}
+
+json view(const json& live, const json& started, const std::vector<std::string>& command_line,
+          const FileSettings* file) {
     json keys = json::array();
     for (const auto& e : kEditable) {
         const bool numeric = e.kind == "sampling" || e.kind == "arg" || e.kind == "int>=0" || e.kind == "num>=0";
-        json k = {{"key", e.key}, {"value", value_of(cfg, e.key)}, {"help", e.help},
-                  {"kind", numeric ? std::string_view("number") : e.kind}};
+        const json v = value_of(live, e.key);
+        const bool keeps = savable(e, file);
+        json k = {{"key", e.key}, {"value", v}, {"help", e.help},
+                  {"kind", numeric ? std::string_view("number") : e.kind}, {"engine_option", e.kind == "arg"},
+                  {"live", e.live}, {"savable", keeps},
+                  {"command_line", std::find(command_line.begin(), command_line.end(), e.key) != command_line.end()},
+                  {"pending", !e.live && !py_eq(v, value_of(started, e.key))},
+                  {"unsaved", keeps && !py_eq(v, value_of(file->gives, e.key))}};
         if (e.kind == "enum") k["choices"] = e.choices;
         keys.push_back(std::move(k));
     }
-    return {{"file", path_name(parse_path(path))}, {"keys", std::move(keys)},
-            {"note", "Saved to the run config; used from the next start of the model."}};
+    return {{"file", file != nullptr ? json(path_name(parse_path(file->path))) : json(nullptr)},
+            {"keys", std::move(keys)},
+            {"note", file != nullptr
+                         ? "Apply uses a change in this session at once; a start-up setting waits for the server's "
+                           "next start, once Save configuration has written it into the config file."
+                         : "This session runs without a config file: Apply's changes last until the server stops, "
+                           "and the start-up settings come from the command line."}};
+}
+
+json saved(const json& live, const FileSettings& file, std::vector<std::string>& changed,
+           std::vector<std::string>& skipped) {
+    json out = file.file;
+    for (const auto& e : kEditable) {
+        const json v = value_of(live, e.key);   // the session's: checked when applied, or read at the start
+        if (py_eq(v, value_of(file.gives, e.key))) continue;
+        if (!savable(e, &file)) {
+            skipped.push_back(std::string(e.key));
+            continue;
+        }
+        const bool presets = py_eq(v, value_of(file.preset, e.key));
+        if (put(out, e, presets ? json(nullptr) : v, !presets && v.is_null())) changed.push_back(std::string(e.key));
+    }
+    return out;
 }
 
 json check(const std::string& key, const json& v, const json& cfg) {
@@ -491,34 +570,8 @@ std::pair<json, std::vector<std::string>> apply(const json& cfg, const json& cha
         checked.emplace_back(it.key(), check(it.key(), *it, cfg));
     json out = cfg;   // a deep copy: the caller's config is left alone
     std::vector<std::string> changed;
-    for (const auto& [key, v] : checked) {
-        if (py_eq(value_of(out, key), v)) continue;
-        const Editable& e = *spec(key);
-        if (e.kind == "sampling") {
-            json s = jget(out, "sampling").is_object() ? out["sampling"] : json::object();
-            const std::string sub = key.substr(key.find('.') + 1);
-            if (v.is_null()) s.erase(sub);
-            else s[sub] = v;
-            if (!s.empty()) out["sampling"] = std::move(s);
-            else out.erase("sampling");
-        } else if (e.kind == "arg") {
-            json a = list_of(jget(out, "args"));
-            const size_t i = flag_at(a, e.rule);
-            if (i != npos) {
-                if (v.is_null()) a.erase(a.begin() + (std::ptrdiff_t) i, a.begin() + (std::ptrdiff_t) i + 2);
-                else a[i + 1] = py_str(v);
-            } else if (!v.is_null()) {
-                a.push_back(e.rule);
-                a.push_back(py_str(v));
-            }
-            out["args"] = std::move(a);
-        } else if (v.is_null()) {
-            out.erase(key);
-        } else {
-            out[key] = v;
-        }
-        changed.push_back(key);
-    }
+    for (const auto& [key, v] : checked)
+        if (put(out, *spec(key), v, false)) changed.push_back(key);
     return {std::move(out), std::move(changed)};
 }
 
@@ -535,7 +588,7 @@ std::string save(const std::string& path, const json& cfg) {
     const std::string bak = with_name(pp, pp.tail.back() + ".bak");
     copy_file(target, bak);
     const std::string tmp = with_name(pp, pp.tail.back() + ".tmp");
-    write_text(tmp, py_dumps(cfg, true, false, 2) + "\n");   // the form setup writes: LF, a final line end
+    write_text(tmp, py_dumps(cfg, true, false, 2) + "\n");   // the form --write-config writes: LF, a final line end
     replace_file(tmp, target);
     return bak;
 }

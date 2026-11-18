@@ -178,6 +178,35 @@ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
 }
 }  // namespace
 
+const char* cpu_floor_missing() {
+    // cpu_avx2_ok's and cpu_avx1_ok's reading, without LAMINA_FORCE_ISA's cap
+    unsigned r[4];
+    cpuid_regs(0, 0, r);
+    const unsigned max_leaf = r[0];
+    cpuid_regs(1, 0, r);
+    const unsigned ecx = r[2];
+    bool avx = false;
+    if (((ecx >> 27) & 1u) && ((ecx >> 28) & 1u)) {   // OSXSAVE and AVX: XGETBV may run
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
+        unsigned lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+        avx = (xcr0 & 0x6) == 0x6;                     // the OS saves the SSE and AVX state
+    }
+    bool avx2 = avx && ((ecx >> 12) & 1u) && ((ecx >> 29) & 1u) && max_leaf >= 7;   // FMA, F16C
+    if (avx2) {
+        cpuid_regs(7, 0, r);
+        avx2 = ((r[1] >> 5) & 1u) != 0;
+    }
+    const char* floor = isa_floor_build();
+    if (std::strcmp(floor, "sse4.2") == 0) return ((ecx >> 20) & 1u) ? nullptr : "SSE4.2";
+    if (std::strcmp(floor, "avx") == 0) return avx ? nullptr : "AVX";
+    return avx2 ? nullptr : "AVX2 (with FMA and F16C)";
+}
+
 bool cpu_gather_fast() {
     static const bool ok = [] {
         if (cpu_isa_cap() < 3) return false;   // LAMINA_FORCE_ISA: as on a CPU that stops at AVX2
@@ -310,6 +339,7 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 bool cpu_avx512_ok() { return false; }
 bool cpu_avx2_ok() { return false; }
 bool cpu_avx1_ok() { return false; }
+const char* cpu_floor_missing() { return nullptr; }
 bool cpu_gather_fast() { return false; }
 bool cpu_gather_fast_here() { return false; }
 bool cpu_avxvnni_ok() { return false; }

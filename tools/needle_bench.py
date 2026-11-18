@@ -1,6 +1,6 @@
 """tools/needle_bench.py - needle-in-a-haystack recall through a running Lamina server.
 
-A long text is built from files in this repository (its docs and source code, and the llama.cpp docs setup downloads
+A long text is built from files in this repository (its docs and source code, and the llama.cpp docs the build downloads
 into third_party/), a code word is hidden in it at a chosen depth, and the model is asked for it through the normal
 API (thinking off, greedy). One line per test: length, depth, found or not, prompt tokens, time.
 

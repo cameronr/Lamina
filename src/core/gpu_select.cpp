@@ -134,6 +134,11 @@ bool desktop(void* h, bool& known) {
 
 }  // namespace
 
+bool gpu_in_desktop_use(const std::string& bus_id) {
+    bool known = false;
+    return desktop(Nvml::get().handle(bus_id), known);
+}
+
 std::vector<GpuInfo> list_gpus() {
     std::vector<GpuInfo> out;
     int n = 0;

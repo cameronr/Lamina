@@ -192,11 +192,16 @@
       </div>
       <div class="st-card cfg-card" id="cfg-card" hidden>
         <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
-        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
-          take effect the next time the model starts (close Lamina's window and start it again).</p>
+        <p class="muted small">For every client of this server. An empty field is the default. <span id="cfg-note"></span></p>
         <form class="cfg-form" id="cfg-form"></form>
-        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
-          <span class="muted small" id="cfg-msg" role="status"></span></div>
+        <div class="cfg-actions">
+          <button class="st-btn st-btn--secondary" id="cfg-reset" type="button">Reset</button>
+          <button class="st-btn st-btn--primary" id="cfg-apply" type="button">Apply</button>
+        </div>
+        <div class="cfg-actions" id="cfg-save-row" hidden>
+          <button class="st-btn st-btn--secondary" id="cfg-save" type="button">Save configuration</button>
+        </div>
+        <span class="muted small" id="cfg-msg" role="status"></span>
       </div>
     </div>
   </section>

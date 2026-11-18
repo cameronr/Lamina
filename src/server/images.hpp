@@ -15,7 +15,7 @@
 //   auto    - (default) keep when there is room for the image job next to it (need_mib), else unload
 // The process per request keeps nothing on the GPU between images: when the job ends, all of its memory is free again.
 //
-// The config's "images" section (written by setup --images, tools/image/install.py):
+// The config's "images" section (docs/USING.md, Image generation):
 //   {"exe": "engine-image/sd-cli", "backend": "vulkan", "diffusion_model": "...Q8_0.gguf", "vae": "...",
 //    "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "args": ["--diffusion-fa"],
 //    "gpu_policy": "auto", "reload": "lazy"|"eager", "max_n": 4, "max_side": 2048, "timeout_s": 3600,
@@ -82,7 +82,7 @@ Job parse_request(const json& req, const json& cfg);
 /// the sd-cli command for one job: the model card's stable-diffusion.cpp command (8 steps, CFG 1, euler, Turbo's
 /// sigmas, --diffusion-fa from the config's args), the size, seed and batch count, and the config's other args
 std::vector<std::string> sd_cli_args(const json& cfg, const Job& job, const std::string& out_pattern);
-/// sd-cli's environment (`base`: this process's when null): the libraries its backend needs (ROCm's, setup's
+/// sd-cli's environment (`base`: this process's when null): the libraries its backend needs (the section's
 /// lib_dirs) first on the search path, the GPU to use when the config names one, and the config's own "env"
 Environment image_env(const json& cfg, const Environment* base = nullptr);
 /// the GPU memory (MiB) an image job is planned with: the three model files plus the working buffers (about 2 GiB plus
