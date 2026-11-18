@@ -22,6 +22,16 @@
 namespace lamina::kernels {
 namespace {
 
+/// silu(g) * u, with the clamp (swiglu_limit > 0: silu(min(g, L)) * clamp(u, -L, L)); without it the expression as the
+/// kernels had it
+__device__ __forceinline__ float swiglu_l(float g, float u, float lim) {
+    if (lim > 0.f) {
+        g = fminf(g, lim);
+        u = fminf(fmaxf(u, -lim), lim);
+    }
+    return (g / (1.0f + __expf(-g))) * u;
+}
+
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
@@ -133,7 +143,7 @@ __global__ void __launch_bounds__(GUS_WARPS * 32, gus_min_blocks<TG>()) native_g
 #pragma unroll
             for (int i = 0; i < GUS_ROWS; ++i) {
                 const float gv = warp_sum(sg[i]), uv = warp_sum(su[i]);
-                if (lane == 0) sh[e - b0][GUS_ROWS * warp + i] = (gv / (1.0f + __expf(-gv))) * uv;
+                if (lane == 0) sh[e - b0][GUS_ROWS * warp + i] = swiglu_l(gv, uv, L.swiglu_limit);
             }
         }
         __syncthreads();
@@ -259,7 +269,7 @@ __device__ __forceinline__ void rows_sub(const uint8_t* const (&w)[R], const blo
 template<int TG, int NE>
 __device__ __forceinline__ void gus80_pass(const uint8_t* wg, const uint8_t* wu, const block_q8_1* __restrict__ xq,
                                            const int32_t* __restrict__ tok, int t, const void* lut, float (*sh)[32],
-                                           int col) {
+                                           int col, float lim) {
     const uint8_t* const w[2] = {wg, wu};
     const block_q8_1* x[NE];
 #pragma unroll
@@ -268,7 +278,7 @@ __device__ __forceinline__ void gus80_pass(const uint8_t* wg, const uint8_t* wu,
     rows_sub<TG, 16, 80, 2, NE>(w, x, t, lut, v);
     if (t == 0)
 #pragma unroll
-        for (int c = 0; c < NE; ++c) sh[c][col] = (v[0][c] / (1.0f + __expf(-v[0][c]))) * v[1][c];
+        for (int c = 0; c < NE; ++c) sh[c][col] = swiglu_l(v[0][c], v[1][c], lim);
 }
 
 // native_gus_kernel for gate/up rows of 80 calls (n_embd 2560): a half-warp takes a column of h (its gate and up rows),
@@ -304,8 +314,8 @@ __global__ void __launch_bounds__(GUS_WARPS * 32, 2) native_gus80_kernel(const u
     for (int b0 = e0; b0 < e1; b0 += GUS_BATCH) {
         const int b1 = min(e1, b0 + GUS_BATCH);
         for (int e = b0; e < b1; e += 2) {
-            if (b1 - e == 1) gus80_pass<TG, 1>(wg, wu, xq, ent_tok + e, t, lut, sh + (e - b0), col);
-            else gus80_pass<TG, 2>(wg, wu, xq, ent_tok + e, t, lut, sh + (e - b0), col);
+            if (b1 - e == 1) gus80_pass<TG, 1>(wg, wu, xq, ent_tok + e, t, lut, sh + (e - b0), col, L.swiglu_limit);
+            else gus80_pass<TG, 2>(wg, wu, xq, ent_tok + e, t, lut, sh + (e - b0), col, L.swiglu_limit);
         }
         __syncthreads();
         for (int e = b0 + warp; e < b1; e += GUS_WARPS) {   // as native_gus_kernel
@@ -385,7 +395,8 @@ __global__ void __launch_bounds__(DOWN_WARPS * 32) native_down_sub_kernel(const 
 // The gate and up rows of h's column `col` for the NE entries from `e` on, SwiGLU into their rows of h
 template<int TG, int NE>
 __device__ __forceinline__ void gu_h_pass(const uint8_t* wg, const uint8_t* wu, const block_q8_1* __restrict__ xq,
-                                          const int32_t* __restrict__ tok, int t, const void* lut, float* h, int n_ff) {
+                                          const int32_t* __restrict__ tok, int t, const void* lut, float* h, int n_ff,
+                                          float lim) {
     const uint8_t* const w[2] = {wg, wu};
     const block_q8_1* x[NE];
 #pragma unroll
@@ -394,7 +405,7 @@ __device__ __forceinline__ void gu_h_pass(const uint8_t* wg, const uint8_t* wu, 
     rows_sub<TG, 16, 160, 2, NE>(w, x, t, lut, v);
     if (t == 0)
 #pragma unroll
-        for (int c = 0; c < NE; ++c) h[(size_t) c * n_ff] = (v[0][c] / (1.0f + __expf(-v[0][c]))) * v[1][c];
+        for (int c = 0; c < NE; ++c) h[(size_t) c * n_ff] = swiglu_l(v[0][c], v[1][c], lim);
 }
 
 template<int TG>
@@ -419,8 +430,8 @@ __global__ void __launch_bounds__(GUS_WARPS * 32, 2) native_gu_h_kernel(const un
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     for (int e = e0; e < e1; e += 2) {
         float* h = hf + (size_t) e * n_ff + col;
-        if (e1 - e == 1) gu_h_pass<TG, 1>(wg, wu, xq, ent_tok + e, t, s_grid, h, n_ff);
-        else gu_h_pass<TG, 2>(wg, wu, xq, ent_tok + e, t, s_grid, h, n_ff);
+        if (e1 - e == 1) gu_h_pass<TG, 1>(wg, wu, xq, ent_tok + e, t, s_grid, h, n_ff, L.swiglu_limit);
+        else gu_h_pass<TG, 2>(wg, wu, xq, ent_tok + e, t, s_grid, h, n_ff, L.swiglu_limit);
     }
 }
 
@@ -567,7 +578,9 @@ __global__ void __launch_bounds__(GUS_WARPS * 32) native_gus_contract_kernel(
             if (lane == 0) {
 #pragma unroll
                 for (int i = 0; i < GUS_ROWS; ++i) {
-                    const float gd = sg[i], ud = su[i];
+                    const float lim = L.swiglu_limit;
+                    const float gd = lim > 0.f ? fminf(sg[i], lim) : sg[i];
+                    const float ud = lim > 0.f ? fminf(fmaxf(su[i], -lim), lim) : su[i];
                     const float ee = expf_contract(-gd);
                     const float den = __fadd_rn(1.0f, ee);
                     const float sil = __fdiv_rn(gd, den);

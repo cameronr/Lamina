@@ -52,6 +52,7 @@ struct NativeExpertLayout {
     size_t bytes = 0;                   // the whole blob
     int had_block = 0;                  // Hadamard-folded down weights: h is rotated before it is quantized (hadamard.hpp)
     const float* d_signs = nullptr;     // their sign vector, n_ff floats on this device, or null
+    float swiglu_limit = 0.f;           // SwiGLU's clamp: silu(min(g, L)) * clamp(u, -L, L) (Hy4-flash); 0: none
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
                                         int gu_act = -1, int d_act = -1);
