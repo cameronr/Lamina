@@ -90,18 +90,42 @@ void PromptCache::enforce_cap(Seq& seq) {
     }
 }
 
-void* PromptCache::save(int64_t pos) {
-    void* h = take_buffer();
+void* PromptCache::save(int64_t pos, void* filled) {
+    void* h = filled != nullptr ? filled : take_buffer();
     if (h == nullptr) return nullptr;
-    cudaDeviceSynchronize();
     const bool split = split_from > 0 && split_save;
-    if (!(split ? session_ckpt_save_layers(ss_, g_, pos, h, stream_, 0, split_from, 0)
-                : session_ckpt_save(ss_, g_, pos, h, stream_))) {
-        give_back(h);
-        return nullptr;
+    if (filled != nullptr) {   // the run copied the device state in: the token window is the host's
+        session_ckpt_put_window(ss_, g_, h);
+    } else {
+        cudaDeviceSynchronize();
+        if (!(split ? session_ckpt_save_layers(ss_, g_, pos, h, stream_, 0, split_from, 0)
+                    : session_ckpt_save(ss_, g_, pos, h, stream_))) {
+            give_back(h);
+            return nullptr;
+        }
     }
     if (split) split_save(pos, h);
     return h;
+}
+
+void* PromptCache::prepare() {
+    drop_prepared();
+    if (!enabled()) return nullptr;
+    void* h = take_buffer();
+    if (h == nullptr) return nullptr;
+    const auto o = std::find_if(owned_.begin(), owned_.end(), [&](const auto& b) { return b.first == h; });
+    if (o == owned_.end() || !o->second) {   // pageable: a copy into it waits for the run (checkpoint copies then)
+        give_back(h);
+        return nullptr;
+    }
+    prepared_ = h;
+    return h;
+}
+
+void PromptCache::drop_prepared() {
+    if (prepared_ == nullptr) return;
+    give_back(prepared_);
+    prepared_ = nullptr;
 }
 
 std::vector<PromptCache::Part> PromptCache::kv_parts(int64_t cells) const {
@@ -195,6 +219,7 @@ bool PromptCache::restore(const Seq& seq, int64_t pos, bool prefix) {
 }
 
 int64_t PromptCache::begin(const std::vector<int64_t>& ids, const std::vector<ImgKey>& imgs) {
+    drop_prepared();
     const int64_t L = (int64_t) live_.tokens.size();
     auto zero = [&]() -> int64_t {
         release(live_, 0);
@@ -279,15 +304,21 @@ void PromptCache::set(int64_t pos, const int32_t* tokens, int64_t n) {
     for (int64_t i = 0; i < n; ++i) live_.tokens.push_back(tokens[i]);
 }
 
-void PromptCache::checkpoint(int64_t pos) {
-    if (!enabled() || pos <= 0 || pos != (int64_t) live_.tokens.size() || live_.find(pos) != nullptr) return;
-    void* h = save(pos);
+void PromptCache::checkpoint(int64_t pos, void* filled) {
+    if (filled != nullptr && filled == prepared_) prepared_ = nullptr;   // this call takes it, or gives it back
+    else filled = nullptr;
+    if (!enabled() || pos <= 0 || pos != (int64_t) live_.tokens.size() || live_.find(pos) != nullptr) {
+        if (filled != nullptr) give_back(filled);
+        return;
+    }
+    void* h = save(pos, filled);
     if (h == nullptr) return;
     live_.ckpts.push_back({pos, h});   // the newest: positions stay ascending
     enforce_cap(live_);
 }
 
 void PromptCache::clear() {
+    drop_prepared();
     release(live_, -1);
     live_.tokens.clear();
     live_.imgs.clear();

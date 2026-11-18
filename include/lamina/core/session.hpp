@@ -77,6 +77,12 @@ bool session_ckpt_save(const SessionState& s, const ModelGeometry& g, int64_t po
 /// other stage saves the rest of the same buffer).
 bool session_ckpt_save_layers(const SessionState& s, const ModelGeometry& g, int64_t pos, void* host, void* stream,
                               int64_t lo, int64_t hi, int64_t first);
+/// session_ckpt_save_layers' copies of the device state alone, queued on `stream` and not waited for (a pinned
+/// `host`); the token window, which lives on the host, is session_ckpt_put_window's.
+bool session_ckpt_queue_layers(const SessionState& s, const ModelGeometry& g, int64_t pos, void* host, void* stream,
+                               int64_t lo, int64_t hi, int64_t first);
+/// The PLE token window into a checkpoint's buffer (the part the host holds).
+void session_ckpt_put_window(const SessionState& s, const ModelGeometry& g, void* host);
 /// The inverse: the session continues at `pos`.  The K/V cells [0, pos) must still hold the same prefix.
 bool session_ckpt_load(SessionState& s, const ModelGeometry& g, int64_t pos, const void* host, void* stream);
 /// After a failed copy of a checkpoint or of K/V cells: waits for the copies queued before it and clears the

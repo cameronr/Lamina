@@ -101,6 +101,16 @@ int64_t prompt_chunk(int64_t len, int64_t cap, bool second_gpu) {
     return second_gpu ? even_chunk(len, cap) : std::min(len, cap);
 }
 
+/// --prefill-profile: a stage's GPU ms per section since `before` (null: since the start)
+void print_sections(const char* stage, const lamina::prefill::PrefillStats& now,
+                    const lamina::prefill::PrefillStats* before) {
+    std::fprintf(stderr, "lamina: prefill GPU ms by section%s:", stage);
+    for (int i = 0; i < lamina::prefill::kPsCount; ++i)
+        std::fprintf(stderr, "%s %s %.1f", i ? ";" : "", lamina::prefill::prefill_section_name(i),
+                     now.ms_section[i] - (before != nullptr ? before->ms_section[i] : 0.0));
+    std::fprintf(stderr, "\n");
+}
+
 using Clock = std::chrono::steady_clock;
 
 struct Options {
@@ -517,7 +527,8 @@ void usage() {
                  "                       drafts (scratch/bg; the prompt read in batches whatever --feed-max)\n"
                  "  --window-profile     with --stats: the GPU time of each stage of the verify window (timestamps\n"
                  "                       inside the graph; each costs ~2 us)\n"
-                 "  --prefill-profile    the GPU time of each section of the batched prompt path (not --serve)\n"
+                 "  --prefill-profile    the GPU time of each section of the batched prompt path (--serve: each\n"
+                 "                       batched part's)\n"
                  "  --expert-profile P   fill the VRAM tiers from this profile (data/expert-profile.bin, or what\n"
                  "                       --expert-profile-save wrote) instead of admitting experts on first use\n"
                  "  --expert-profile-save P  --serve: save what the run learned (the routing counted since\n"
@@ -4252,6 +4263,13 @@ int lamina::program::run(int argc, char** argv) {
                     pcache.split_save = [&psplit](int64_t pos, void* host) { psplit.checkpoint(pos, host); };
                 }
                 prefill.clear_routed();
+                // --prefill-profile: this part's sections (the stats count from the start)
+                prefill.profile = o.prefill_profile;
+                if (pbuf.split != nullptr) psplit.set_profile(o.prefill_profile);
+                const lamina::prefill::PrefillStats prof0 = prefill.stats();
+                std::vector<lamina::prefill::PrefillStats> prof0_st;
+                for (int st = 0; o.prefill_profile && split_on && st < psplit.stages(); ++st)
+                    prof0_st.push_back(psplit.stats(st));
                 if (kvg.on && pbuf.lend && pbuf.loan.first >= 0 && pbuf.loan.first < kvg.top && kvg.lo < kvg.top) {
                     report("the prompt path's loan reached the slots the elastic K/V took (a bug: --no-kv-grow)");
                     return 1;
@@ -4267,16 +4285,23 @@ int lamina::program::run(int argc, char** argv) {
                     pp_at = a0;
                     pp_chunks = 0;
                     lead_seg = b0 - a0;
+                    // the run fills the checkpoint at its end as it goes (Prefill::set_checkpoint)
+                    void* const ck = track ? pcache.prepare() : nullptr;
+                    prefill.set_checkpoint(b0, ck);
                     if (!prefill.run(ids.data() + a0, b0 - a0, a0, err)) {
+                        prefill.checkpoint_wait();   // (its copies land before the buffer goes back)
                         // an error while a STOP is set is still an error: the states may have gone past the chunks
                         if (!prefill.stopped()) { report(err); return 1; }
                         // STOP: the session holds the chunks read before it
                         if (track && prefill.processed() > 0) pcache.set(a0, ids.data() + a0, prefill.processed());
                         break;
                     }
+                    tr("prompt run", a0, b0);
+                    const bool filled = prefill.checkpoint_wait();
                     if (track) {
                         pcache.set(a0, ids.data() + a0, b0 - a0);
-                        pcache.checkpoint(b0);
+                        pcache.checkpoint(b0, filled ? ck : nullptr);
+                        tr("prompt checkpoint", b0);
                     }
                     if (split_on) psplit.ran(b0);
                     a0 = b0;
@@ -4298,6 +4323,16 @@ int lamina::program::run(int argc, char** argv) {
                 add_prompt_usage(drive.d.usage, prefill.routed(), g.n_expert);
                 add_prompt_usage(prompt_heat, prefill.routed(), g.n_expert);   // (empty: no learned profile)
                 tr("prompt done (slots refilled)");
+                if (o.prefill_profile) {
+                    std::fprintf(stderr, "lamina serve: a batched part of %lld tokens at %lld, %.1f ms; its PLE rows "
+                                         "waited for %.1f ms\n", (long long) (batched_end - reuse), (long long) reuse,
+                                 prefill.stats().ms_total - prof0.ms_total, prefill.stats().ms_ple - prof0.ms_ple);
+                    print_sections("", prefill.stats(), &prof0);
+                    for (size_t st = 0; st < prof0_st.size(); ++st)
+                        print_sections(st == 0 ? " (the second stage)" : " (the third stage)", psplit.stats((int) st),
+                                       &prof0_st[st]);
+                    std::fflush(stderr);
+                }
                 if (trace) {   // the runners' totals since the start (a request's: the difference from the line before)
                     const lamina::prefill::PrefillStats& ps = prefill.stats();
                     std::fprintf(stderr, "lamina trace: prompt experts so far: %lld chunks in %.0f ms; main GPU streamed %lld, "
@@ -4759,15 +4794,9 @@ int lamina::program::run(int argc, char** argv) {
         }
         if (o.prefill_profile) {
             const int n_st = split_on ? 1 + psplit.stages() : 1;
-            for (int st = 0; st < n_st; ++st) {
-                const lamina::prefill::PrefillStats& px = st == 0 ? ps : psplit.stats(st - 1);
-                std::fprintf(stderr, "lamina: prefill GPU ms by section%s:",
-                             st == 0 ? "" : st == 1 ? " (the second stage)" : " (the third stage)");
-                for (int i = 0; i < lamina::prefill::kPsCount; ++i)
-                    std::fprintf(stderr, "%s %s %.0f", i ? ";" : "", lamina::prefill::prefill_section_name(i),
-                                 px.ms_section[i]);
-                std::fprintf(stderr, "\n");
-            }
+            for (int st = 0; st < n_st; ++st)
+                print_sections(st == 0 ? "" : st == 1 ? " (the second stage)" : " (the third stage)",
+                               st == 0 ? ps : psplit.stats(st - 1), nullptr);
         }
     }
 

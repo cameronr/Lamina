@@ -91,6 +91,10 @@ public:
     bool prefetch_next(std::string& err);
     int prefetch_pending() const;
     bool prefetch_left() const;
+    /// After the routing, before run_layer of the layer's first pass: `experts`, which both passes read.  Those its
+    /// cache does not hold and that were not copied ahead stream into the copy-ahead area's free room in their
+    /// batch's staging copies, where the second pass reads them; staging would copy them once a pass.
+    void keep_for_pass(const std::vector<int32_t>& experts);
 
     /// Remote: pinned [max_chunk, n_embd]: the MoE input goes in here, the sums come out here (both FP16).
     uint16_t* host_input() const;

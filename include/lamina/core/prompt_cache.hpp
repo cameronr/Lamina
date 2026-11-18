@@ -68,8 +68,13 @@ public:
     /// The cells [pos, pos + n) now hold `tokens`; pos <= live length, and anything after pos is gone.
     void set(int64_t pos, const int64_t* tokens, int64_t n);
     void set(int64_t pos, const int32_t* tokens, int64_t n);
-    /// Checkpoints the session, which is at `pos` == the live length.
-    void checkpoint(int64_t pos);
+    /// A buffer for the checkpoint a prompt run fills as it goes (prefill::Prefill::set_checkpoint), where the cache
+    /// has a pinned one to give (else null: checkpoint() copies at the end).  checkpoint() takes it; one it does not
+    /// goes back at the next prepare(), begin() or clear().
+    void* prepare();
+    /// Checkpoints the session, which is at `pos` == the live length: from `filled`, prepare()'s buffer whose device
+    /// state the run has copied in (null: copied now).
+    void checkpoint(int64_t pos, void* filled = nullptr);
     /// Forgets the live sequence, every checkpoint and every parked conversation (after non-finite logits: whatever
     /// the state holds may be poisoned).
     void clear();
@@ -101,8 +106,9 @@ private:
     void release(Seq& seq, int64_t keep_upto);   // frees the checkpoints after `keep_upto`
     /// Thins `seq`'s chain to the cap (chain_victim).
     void enforce_cap(Seq& seq);
-    /// The session's state at `pos` (== the live length) in a buffer of its own; nullptr: none.
-    void* save(int64_t pos);
+    /// The session's state at `pos` (== the live length) in a buffer of its own (`filled`: prepare()'s, the device
+    /// state in it already); nullptr: none.
+    void* save(int64_t pos, void* filled = nullptr);
     /// Parks a copy of the live sequence: its K/V cells, its checkpoints after `keep_upto` (the ones before stay with
     /// the live sequence, which continues from there) and one at its end.
     void stash_live(int64_t keep_upto);
@@ -125,6 +131,8 @@ private:
     std::vector<void*> free_;
     std::vector<std::pair<void*, bool>> owned_;   // every buffer, and whether it is pinned
     int pinned_ = 0;
+    void* prepared_ = nullptr;   // prepare()'s, until checkpoint() takes it
+    void drop_prepared();
 };
 
 }  // namespace lamina::core

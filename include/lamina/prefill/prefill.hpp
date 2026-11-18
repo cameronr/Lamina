@@ -167,6 +167,15 @@ public:
     /// one after every chunk).
     bool profile = false;
 
+    /// The checkpoint the next run() fills as it goes (core::PromptCache::prepare): the state at `pos`, that run's
+    /// end, into the pinned `host` (null: none).  Each layer's part is copied out once the run's last chunk is
+    /// through that layer and its inputs have left (the copies share this GPU's x4 link), on a stream of its own, so
+    /// the checkpoint waits for no copy at the end: a part's 113 MB took 20 ms there, and a split prompt's first
+    /// stage waited ~90 ms more behind its residual's hand-off.  The layers this path runs only (set_layers).
+    void set_checkpoint(int64_t pos, void* host);
+    /// After that run: its copies have landed; false: one failed (the checkpoint is not taken).
+    bool checkpoint_wait();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

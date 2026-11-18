@@ -188,16 +188,24 @@ bool session_ckpt_save(const SessionState& s, const ModelGeometry& g, int64_t po
 
 bool session_ckpt_save_layers(const SessionState& s, const ModelGeometry& g, int64_t pos, void* host, void* stream,
                               int64_t lo, int64_t hi, int64_t first) {
+    if (!session_ckpt_queue_layers(s, g, pos, host, stream, lo, hi, first)) return false;
+    if (lo == 0) session_ckpt_put_window(s, g, host);
+    return cudaStreamSynchronize((cudaStream_t) stream) == cudaSuccess || session_copy_failed(stream);
+}
+
+bool session_ckpt_queue_layers(const SessionState& s, const ModelGeometry& g, int64_t pos, void* host, void* stream,
+                               int64_t lo, int64_t hi, int64_t first) {
     cudaStream_t cs = (cudaStream_t) stream;
     uint8_t* h = (uint8_t*) host;
     for (const CkptPart& p : ckpt_parts(s, g, pos, first, lo, hi))
         if (cudaMemcpyAsync(h + p.host, p.dev, (size_t) p.bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess)
             return session_copy_failed(stream);
-    if (lo == 0) {
-        const int32_t ints[kCkptHostInts] = {s.ple_prev[0], s.ple_prev[1], s.ple_token};
-        std::memcpy(h + ckpt_ints_at(g), ints, sizeof ints);
-    }
-    return cudaStreamSynchronize(cs) == cudaSuccess || session_copy_failed(stream);
+    return true;
+}
+
+void session_ckpt_put_window(const SessionState& s, const ModelGeometry& g, void* host) {
+    const int32_t ints[kCkptHostInts] = {s.ple_prev[0], s.ple_prev[1], s.ple_token};
+    std::memcpy((uint8_t*) host + ckpt_ints_at(g), ints, sizeof ints);
 }
 
 bool session_ckpt_load(SessionState& s, const ModelGeometry& g, int64_t pos, const void* host, void* stream) {

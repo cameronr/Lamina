@@ -141,6 +141,9 @@ struct ExpertRunner::Impl {
     std::vector<int32_t> pre_grp, pre_list;
     size_t pre_next = 0;
     int32_t pre_pieces = 0;
+    // keep_for_pass: the layer's experts its second pass reads too (keep), and those placed in the area that their
+    // batch's staging copies have yet to copy there (pre_due), then covered by pre_ev[pre_grp[e]]
+    std::vector<uint8_t> keep, pre_due;
     bool pre_gate = false;            // the layer's first piece waits for the area's last reader
     std::vector<cudaEvent_t> pre_ev;
     cudaEvent_t pre_used = nullptr;   // the last read of the area
@@ -246,6 +249,8 @@ bool ExpertRunner::init(int device, int main_device, void* stream, core::ExpertS
         ok = ok && cudaEventCreateWithFlags(&m.pre_used, cudaEventDisableTiming) == cudaSuccess;
         m.pre_off.assign((size_t) n_expert, -1);
         m.pre_grp.assign((size_t) n_expert, 0);
+        m.keep.assign((size_t) n_expert, 0);
+        m.pre_due.assign((size_t) n_expert, 0);
     }
     if (!ok || !m.gemm.init(m.s, err, true)) {
         if (err.empty()) err = "prompt experts: streams or events";
@@ -356,6 +361,8 @@ bool ExpertRunner::prefetch_begin(int64_t layer, int64_t chunk, const std::vecto
     m.pre_layer = -1;
     if (m.pre_cap == 0) return true;
     std::fill(m.pre_off.begin(), m.pre_off.end(), -1);
+    std::fill(m.keep.begin(), m.keep.end(), 0);
+    std::fill(m.pre_due.begin(), m.pre_due.end(), 0);
     m.pre_layer = layer;
     m.pre_end = std::min(m.pre_cap, area_cap(chunk, m.fast));
     const int32_t* res = m.res && m.cache ? m.res + (size_t) layer * (size_t) m.n_expert : nullptr;
@@ -374,6 +381,12 @@ bool ExpertRunner::prefetch_left() const {
     const Impl& m = *impl_;
     if (m.pre_layer < 0 || m.pre_next >= m.pre_list.size()) return false;
     return m.pre_at + area_stride(m.pre_layer) <= m.pre_end;
+}
+
+void ExpertRunner::keep_for_pass(const std::vector<int32_t>& experts) {
+    Impl& m = *impl_;
+    if (m.pre_layer < 0) return;
+    for (int32_t e : experts) m.keep[(size_t) e] = 1;
 }
 
 int ExpertRunner::prefetch_pending() const {
@@ -523,15 +536,21 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
     int32_t* h_rows = h_adds + adds_cap(m.max_chunk, m.n_expert);
     float* h_w = (float*) (h_rows + (size_t) m.max_chunk * K);
     std::vector<int> rows_of(n_exp);
+    const uint64_t a_stride = m.pre_layer == layer ? area_stride(layer) : 0;
     for (size_t b = 0; b < batches.size(); ++b) {
         const auto [j0, j1] = batches[b];
         size_t streamed = 0;
         for (size_t j = j0; j < j1; ++j) {
             const int64_t r = off[j] - off[j0];
-            const int32_t slot = held(experts[j]);
+            const int32_t e = experts[j], slot = held(e);
             if (slot < 0 && !m.streams) {
                 err = "prompt experts: an expert its cache does not hold, and no staging";
                 return false;
+            }
+            if (slot < 0 && pre(e) < 0 && a_stride > 0 && m.keep[(size_t) e] && m.pre_at + a_stride <= m.pre_end) {
+                m.pre_off[(size_t) e] = (int64_t) m.pre_at;   // keep_for_pass: its staging copies it into the area
+                m.pre_at += a_stride;
+                m.pre_due[(size_t) e] = 1;
             }
             P[0 * E + j] = slot >= 0 ? (void*) m.cache->device_slot(slot)
                          : pre(experts[j]) >= 0 ? (void*) (m.pre + pre(experts[j]))
@@ -607,14 +626,15 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
         st_dst.clear();
         st_src.clear();
         st_bytes.clear();
-        bool pinned = true;
+        bool pinned = true, due = false;
         for (size_t j = j0; j < j1;) {
             const int32_t e = experts[j];
-            if (held(e) >= 0 || pre(e) >= 0) { ++j; continue; }
+            if (held(e) >= 0 || (pre(e) >= 0 && !m.pre_due[(size_t) e])) { ++j; continue; }
             const uint8_t* b0 = m.src->blob(layer, e);
             uint8_t* dst = (uint8_t*) P[0 * E + j];
             size_t k = j + 1;   // the run: the next experts' blobs follow this one in the arena and in staging
-            if (m.src->pinned(layer, e) && stride == bb)
+            if (pre(e) >= 0) due = true;   // keep_for_pass: into the area, alone
+            else if (m.src->pinned(layer, e) && stride == bb)
                 while (k < j1 && held(experts[k]) < 0 && pre(experts[k]) < 0 && m.src->pinned(layer, experts[k]) &&
                        m.src->blob(layer, experts[k]) == b0 + (k - j) * bb &&
                        (uint8_t*) P[0 * E + k] == dst + (k - j) * bb) ++k;
@@ -634,6 +654,15 @@ bool ExpertRunner::run_layer(int64_t layer, int64_t T, int64_t t_begin, int64_t 
         }
         cudaEventRecord(m.copied[sl], m.copy);
         m.live[sl] = true;
+        if (due) {   // the experts this batch copied into the area: a piece of their own, for the second pass
+            cudaEventRecord(m.pre_ev[(size_t) m.pre_pieces], m.copy);
+            for (size_t j = j0; j < j1; ++j)
+                if (m.pre_due[(size_t) experts[j]]) {
+                    m.pre_grp[(size_t) experts[j]] = m.pre_pieces;
+                    m.pre_due[(size_t) experts[j]] = 0;
+                }
+            ++m.pre_pieces;
+        }
         return true;
     };
     std::vector<char> has_stream(batches.size(), 0);

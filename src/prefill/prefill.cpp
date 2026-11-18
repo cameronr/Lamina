@@ -206,6 +206,8 @@ struct Prefill::Impl {
     } hshare[Prefill::kMaxHelpers];
     double shift = 0.0;              // set_shift
     std::vector<uint8_t> shifted;    // per expert of the layer: held here, computed by the second GPU (set_shift)
+    std::vector<uint8_t> both;           // per expert of the layer: the second GPU's second pass reads it
+    std::vector<int32_t> kept;           // the experts both of its passes read, in the first one's order
     std::vector<float> w1, w2[2];
     // a chunk's PLE rows, read on a thread while the chunk before runs: two pinned buffers, their row indices
     float* ple_host[2] = {};
@@ -223,6 +225,13 @@ struct Prefill::Impl {
     int pacing = 0;
     std::vector<cudaEvent_t> pace_ev;
     uint64_t pace_at = 0;
+    // set_checkpoint: the position and buffer the next run fills, its copies' stream, the event they wait for, and
+    // whether one failed
+    int64_t ck_pos = -1;
+    void* ck_host = nullptr;
+    cudaStream_t ck_s = nullptr;
+    cudaEvent_t ck_ev = nullptr;
+    bool ck_failed = false;
 };
 
 Prefill::Prefill() : impl_(new Impl) {}
@@ -232,8 +241,11 @@ Prefill::~Prefill() {
     if (m.cs) cudaStreamSynchronize(m.cs);
     if (m.xfer) cudaStreamSynchronize(m.xfer);
     if (m.xsum) cudaStreamSynchronize(m.xsum);
+    if (m.ck_s) cudaStreamSynchronize(m.ck_s);
     if (m.ev_mixed) cudaEventDestroy(m.ev_mixed);
     if (m.ev_routed) cudaEventDestroy(m.ev_routed);
+    if (m.ck_ev) cudaEventDestroy(m.ck_ev);
+    if (m.ck_s) cudaStreamDestroy(m.ck_s);
     for (auto* v : {&m.ev_in, &m.ev_piece, &m.ev_written, &m.ev_out, &m.pace_ev})
         for (cudaEvent_t e : *v) if (e) cudaEventDestroy(e);
     if (m.xfer) cudaStreamDestroy(m.xfer);
@@ -267,6 +279,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             pieces = pieces && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
     if (!pieces || cudaStreamCreateWithFlags(&m.xfer, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&m.xsum, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&m.ck_s, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&m.ck_ev, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&m.ev_mixed, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&m.ev_routed, cudaEventDisableTiming) != cudaSuccess ||
         cudaHostAlloc((void**) &m.ids_host, (size_t) max_chunk * K * 4, cudaHostAllocDefault) != cudaSuccess ||
@@ -319,6 +333,19 @@ void Prefill::set_layers(int64_t first, int64_t last, SplitOut* out) {
     m.out_live = false;
 }
 void Prefill::set_pacing(int sections) { impl_->pacing = std::max(0, sections); }
+void Prefill::set_checkpoint(int64_t pos, void* host) {
+    Impl& m = *impl_;
+    m.ck_pos = host != nullptr ? pos : -1;
+    m.ck_host = host;
+    m.ck_failed = false;
+}
+bool Prefill::checkpoint_wait() {
+    Impl& m = *impl_;
+    const bool ok = !m.ck_failed && cudaStreamSynchronize(m.ck_s) == cudaSuccess;
+    m.ck_host = nullptr;
+    m.ck_pos = -1;
+    return ok;
+}
 void Prefill::set_fast_link(bool on) {
     impl_->fast_local = on;
     impl_->local.set_fast_link(on);
@@ -891,25 +918,34 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             pending = false;
             if (!qsa) ++gdn_index;
             else ++qsa_index;
-            // ---- until the routing is in host memory: each sub-chunk's input on to the second GPU once it is in host
+            // ---- until the routing is in host memory: each sub-chunk's input on to the other GPUs once it is in host
             // memory (queued ahead, its copy would hold up that GPU's copy engine, which runs copies in submission
-            // order, whatever their stream), and the copies ahead, at most two pieces queued
+            // order, whatever their stream), and the copies ahead, at most two pieces queued.  The last sub-chunk's
+            // input lands there ~1 ms after the routing (a 2K-token sub-chunk's 10 MB over this GPU's x4 link): the
+            // experts are queued below without waiting for it, but for the passes that read it
             cudaEventRecord(m.ev_routed, m.cs);
             const int64_t n_sub = (T + SUB - 1) / SUB;
             int64_t k_in = m.offload || !m.helpers.empty() ? 0 : n_sub;
-            for (;;) {
-                cudaError_t q = cudaSuccess;
-                while (k_in < n_sub && (q = cudaEventQuery(m.ev_in[(size_t) k_in])) == cudaSuccess) {
+            cudaError_t in_err = cudaSuccess;
+            auto stage_inputs = [&] {
+                while (k_in < n_sub) {
+                    const cudaError_t q = cudaEventQuery(m.ev_in[(size_t) k_in]);
+                    if (q != cudaSuccess) {
+                        if (q != cudaErrorNotReady) in_err = q;
+                        return;
+                    }
                     const int64_t rows = std::min(SUB, T - k_in * SUB);
                     if (m.offload) m.offload->stage_input(k_in * SUB, rows, m.ev_in[(size_t) k_in]);
                     for (ExpertRunner* h : m.helpers) h->stage_input(k_in * SUB, rows, m.ev_in[(size_t) k_in]);
                     ++k_in;
                 }
+            };
+            for (;;) {
+                stage_inputs();
                 const cudaError_t r = cudaEventQuery(m.ev_routed);
-                if ((r == cudaSuccess && k_in == n_sub) || (r != cudaSuccess && r != cudaErrorNotReady) ||
-                    (q != cudaSuccess && q != cudaErrorNotReady))
+                if (r != cudaErrorNotReady || in_err != cudaSuccess)
                     break;   // done, or an error the synchronization below reports
-                if (r != cudaSuccess && streamer->prefetch_left() && streamer->prefetch_pending() < 2) {
+                if (streamer->prefetch_left() && streamer->prefetch_pending() < 2) {
                     if (!streamer->prefetch_next(err)) return false;
                 } else {
                     std::this_thread::yield();
@@ -1013,11 +1049,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
                 return true;
             };
-            if (m.offload &&
-                !m.offload->run_layer(l, T, 0, th, m.ex2[0], m.off2[0], m.src2[0], m.w2[0], SUB, nullptr, nullptr, err))
-                return false;
-            if (!helpers_run(0, 0, th)) return false;
+            // the experts both of the second GPU's passes read: the first pass's staging copies them into its
+            // copy-ahead area where it has room, and the second reads them there (staged, each pass copied them:
+            // UD-Q4_K_XL's parts of 3K and 4K tokens 16% and 9% sooner)
+            if (m.offload && th < T) {
+                m.both.assign((size_t) NE, 0);
+                for (const int32_t e : m.ex2[1]) m.both[(size_t) e] = 1;
+                m.kept.clear();
+                for (const int32_t e : m.ex2[0])
+                    if (m.both[(size_t) e]) m.kept.push_back(e);
+                m.offload->keep_for_pass(m.kept);
+            }
+            // the first pass where its sub-chunks' inputs have gone out (a part of more than one sub-chunk), this GPU's
+            // experts, the rest as the last inputs land
+            bool pass0 = false;
+            auto run_pass0 = [&]() -> bool {
+                pass0 = true;
+                return (!m.offload || m.offload->run_layer(l, T, 0, th, m.ex2[0], m.off2[0], m.src2[0], m.w2[0], SUB,
+                                                           nullptr, nullptr, err)) &&
+                       helpers_run(0, 0, th);
+            };
+            const int64_t sub0 = (th + SUB - 1) / SUB;   // the sub-chunks the first pass reads
+            stage_inputs();
+            if (k_in >= sub0 && !run_pass0()) return false;
             if (!m.local.run_layer(l, T, 0, T, m.ex1, m.off1, m.src1, m.w1, SUB, b.mixed_h, b.bo_moe, err)) return false;
+            for (stage_inputs(); k_in < n_sub && in_err == cudaSuccess; stage_inputs()) {
+                if (!pass0 && k_in >= sub0 && !run_pass0()) return false;
+                std::this_thread::yield();
+            }
+            if (in_err != cudaSuccess) {
+                err = std::string("prefill: ") + cudaGetErrorString(in_err);
+                return false;
+            }
+            if (!pass0 && !run_pass0()) return false;
             if (m.offload && th < T &&
                 !m.offload->run_layer(l, T, th, T, m.ex2[1], m.off2[1], m.src2[1], m.w2[1], SUB, nullptr, nullptr, err))
                 return false;
@@ -1038,6 +1102,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     cudaEventRecord(m.ev_piece[(size_t) (t0 / SUB)], m.xsum);
                 }
+            }
+            // ---- set_checkpoint: the run's last chunk is through this layer's mixer half, whose state the
+            // checkpoint holds, and the layer's inputs have left: its part goes out behind this GPU's work so far
+            if (m.ck_host != nullptr && c0 + T >= n && pos0 + n == m.ck_pos) {
+                cudaEventRecord(m.ck_ev, m.cs);
+                cudaStreamWaitEvent(m.ck_s, m.ck_ev, 0);
+                if (!core::session_ckpt_queue_layers(ss, g, m.ck_pos, m.ck_host, m.ck_s, l, l + 1, L0))
+                    m.ck_failed = true;
             }
             pending = true;
             const core::WeightRef* cv = v.get("cvec");

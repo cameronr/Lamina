@@ -117,7 +117,9 @@ enum class PleIo { Direct, Mmap, Ram };
 
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
-    uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
+    /// outstanding SSD reads: a window needs 16 a token, a prompt chunk 16 a token for all of its tokens (on this
+    /// PC's NVMe SSD 256 read a chunk's rows ~20% sooner than 64; 512 no sooner)
+    uint32_t max_inflight = 256;
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows (~95 MB of IQ4_NL, ~335 MB of BF16); 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
 };
