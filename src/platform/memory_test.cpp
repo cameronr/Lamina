@@ -1,5 +1,5 @@
 // src/platform/memory_test.cpp - plan v0.3 P0.1: lock_resident on a 256 MiB region and its undoing, available_ram,
-// total_ram and the start's RAM check, RamFit (CPU only, no GPU, no model).  On Linux a lock that ulimit -l (RLIMIT_MEMLOCK) does not allow is skipped, not
+// total_ram and the start's RAM check, RamFit, keep_from_children on Linux (CPU only, no GPU, no model).  On Linux a lock that ulimit -l (RLIMIT_MEMLOCK) does not allow is skipped, not
 // failed (exit 77): the region cannot be locked there (8 MiB on CI's runners).
 #include "lamina/platform/memory.hpp"
 
@@ -14,7 +14,11 @@
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 #else
+#include <cerrno>
+#include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 int main() {
@@ -83,6 +87,36 @@ int main() {
     std::printf("working-set minimum %llu MiB, after three more locks and unlocks %llu MiB\n",
                 (unsigned long long) (min0 >> 20), (unsigned long long) (min1 >> 20));
     fail |= min1 != min0;
+#endif
+#if !defined(_WIN32)
+    {   // keep_from_children: a region so advised is not in a forked child; one not advised is (mincore: ENOMEM where
+        // nothing is mapped)
+        const size_t n = 4ull << 20;
+        void* kept = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* plain = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        bool ok = kept != MAP_FAILED && plain != MAP_FAILED;
+        if (ok) {
+            std::memset(kept, 1, n);
+            std::memset(plain, 1, n);
+            ok = lamina::platform::keep_from_children(kept, n);
+        }
+        if (ok) {
+            std::fflush(stdout);
+            const pid_t c = fork();
+            if (c == 0) {
+                unsigned char v = 0;
+                const bool gone = mincore(kept, 4096, &v) != 0 && errno == ENOMEM;
+                const bool there = mincore(plain, 4096, &v) == 0;
+                _exit(gone && there ? 0 : 1);
+            }
+            int st = 0;
+            ok = c > 0 && waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        }
+        std::printf("keep_from_children: %s\n", ok ? "ok, not in a child (an unadvised region is)" : "WRONG");
+        fail |= !ok;
+        if (kept != MAP_FAILED) munmap(kept, n);
+        if (plain != MAP_FAILED) munmap(plain, n);
+    }
 #endif
     std::free(p);
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : skipped ? "OK, the lock SKIPPED" : "OK");

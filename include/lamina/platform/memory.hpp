@@ -26,6 +26,13 @@ LockResult lock_resident(void* p, uint64_t bytes);
 /// working-set minimum goes down by what the lock raised it.
 void unlock_resident(void* p, uint64_t bytes);
 
+/// Keeps the page-aligned [p, p + bytes) out of the child processes this one starts: Linux madvise(MADV_DONTFORK),
+/// nothing elsewhere (CreateProcess copies no memory).  A region cudaHostRegister pins needs it: fork() gives the child
+/// a copy of every pinned page at once instead of sharing it copy-on-write, so a program the server starts once the
+/// expert arena is pinned (nvidia-smi, an MCP server, sd-cli) would first take another arena's worth of RAM.  The
+/// children exec at once and read none of it.  False when the advice is refused.
+bool keep_from_children(void* p, uint64_t bytes);
+
 /// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
 /// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
 /// 8 bytes at `luid` (cudaDeviceProp::luid).  Page-locked host memory the GPU maps is charged there.  False (and

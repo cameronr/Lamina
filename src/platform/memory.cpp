@@ -84,6 +84,8 @@ void unlock_resident(void* p, uint64_t bytes) {
         SetProcessWorkingSetSizeEx(self, min_ws - raised, max_ws, flags);
 }
 
+bool keep_from_children(void*, uint64_t) { return true; }   // CreateProcess shares no memory with the child
+
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why) {
     budget = usage = 0;
     // dxgi.dll is loaded when asked, not linked: a start that never needs this keeps the imports it had
@@ -156,6 +158,10 @@ LockResult lock_resident(void* p, uint64_t bytes) {
 
 void unlock_resident(void* p, uint64_t bytes) {
     if (p != nullptr && bytes != 0) munlock(p, bytes);
+}
+
+bool keep_from_children(void* p, uint64_t bytes) {
+    return p != nullptr && bytes != 0 && madvise(p, (size_t) bytes, MADV_DONTFORK) == 0;
 }
 
 bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
