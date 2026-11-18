@@ -6,6 +6,8 @@
 // Text positions are byte offsets into UTF-8 text.
 #pragma once
 
+#include "dialect.hpp"
+
 #include <array>
 #include <cstdint>
 #include <map>
@@ -58,6 +60,7 @@ public:
     std::string pre;                           ///< tokenizer.ggml.pre
     std::map<std::string, int64_t> special_ids;   ///< tokenizer.ggml.<name>_token_id
     std::string architecture;                  ///< general.architecture
+    std::optional<Hy4Tags> hy4;                ///< the template's tags when it is Hy4-flash's (dialect.hpp)
 
 private:
     void encode_plain(std::string_view text, std::vector<int32_t>& out) const;
@@ -76,7 +79,7 @@ private:
     std::unordered_map<uint64_t, std::pair<int32_t, int32_t>> merges_;   ///< (left, right) -> (rank, merged id)
     std::array<int32_t, 256> byte_token_{};    ///< a byte's single-symbol token
     size_t max_special_len_ = 1;
-    std::string regex_;                        ///< the pre-tokenizer's pattern (llama.cpp's for `pre`)
+    std::vector<std::string> regex_;           ///< the pre-tokenizer's patterns, in turn (llama.cpp's for `pre`)
 
     mutable std::mutex cache_mu_;
     mutable std::unordered_map<std::string, std::vector<int32_t>> piece_cache_;
@@ -96,13 +99,20 @@ private:
 /// the text of ids one at a time
 class Detokenizer {
 public:
-    explicit Detokenizer(const Tokenizer& tok) : tok_(tok) {}
-    std::string push(int32_t id) { return dec_.push(tok_.token_bytes(id)); }
+    explicit Detokenizer(const Tokenizer& tok) : tok_(tok) {
+        if (tok.hy4) tr_.emplace(*tok.hy4);
+    }
+    /// the token's text; Hy4-flash's tags as Qwen's forms, which the output parser reads
+    std::string push(int32_t id) {
+        std::string s = dec_.push(tok_.token_bytes(id));
+        return tr_ ? tr_->piece(s) : s;
+    }
     bool pending() const { return dec_.pending(); }
 
 private:
     const Tokenizer& tok_;
     Utf8Decoder dec_;
+    std::optional<TagTranslator> tr_;
 };
 
 /// `tok.encode(text, true, plain)` for chat prompts, reusing the ids of an earlier prompt up to a literal boundary

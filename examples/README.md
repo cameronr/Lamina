@@ -11,6 +11,9 @@ which takes the model file, the GPU, the draft layer, the projector and the file
   the fewest GPUs that hold every expert, else on the main GPU with the CPU computing the experts it lacks.
 - `qwen38-27b-ud-q6_k_m.json`: Qwen3.8-27B, unsloth's UD-Q6_K_M, on the same path, its layers split over the fewest
   GPUs that hold it at the full 262,144 cells, K and V in q8_0 (~36 GB of VRAM: a 24 GB and a 16 GB GPU).
+- `hy4-flash-q4_k_m.json`: Hy4-flash, AngelSlim's Q4_K_M (both shards), on the engine's hy4 path: its dense weights
+  and 524,288 cells of K and V on the main GPU (~16 GB of VRAM), the routed experts in RAM for the CPU (~90 GB), the
+  Engram table (59 GiB) read from the drive.
 
 `lamina-server -m MODEL.gguf --write-config FILE` writes one with the PC's own files and GPUs. `run-<model>.bat.example`
 is a launcher for each: copied to `run-<model>.bat`, it starts the example from the clone's folder, the model's files

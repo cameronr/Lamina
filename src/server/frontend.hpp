@@ -6,6 +6,7 @@
 // (<tool_call><function=NAME><parameter=P>VALUE</parameter>...</function></tool_call>), never emitting a partial tag.
 #pragma once
 
+#include "dialect.hpp"
 #include "json.hpp"
 
 #include <memory>
@@ -48,6 +49,7 @@ public:
 private:
     json detect_caps() const;
     std::string source_;
+    std::optional<Hy4Tags> hy4_;   ///< Hy4-flash's tags: the probes read their renders translated
     std::unique_ptr<jinja::program> prog_;
     json caps_;
 };

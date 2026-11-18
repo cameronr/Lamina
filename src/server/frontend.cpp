@@ -79,7 +79,7 @@ std::string utf8_prefix(std::string_view s, size_t chars) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------- template
-ChatTemplate::ChatTemplate(std::string source) : source_(std::move(source)) {
+ChatTemplate::ChatTemplate(std::string source) : source_(std::move(source)), hy4_(Hy4Tags::from_template(source_)) {
     jinja::lexer lexer;
     const auto tokens = lexer.tokenize(source_);
     prog_ = std::make_unique<jinja::program>(jinja::parse_from_tokens(tokens));
@@ -136,7 +136,8 @@ std::string ChatTemplate::render(const json& messages, const json& tools, bool a
 json ChatTemplate::detect_caps() const {
     auto render_probe = [&](const json& messages, const json& tools = nullptr) -> std::string {
         try {
-            return render(messages, tools);
+            const std::string r = render(messages, tools);
+            return hy4_ ? TagTranslator(*hy4_).text(r) : r;
         } catch (const std::exception&) {   // a hint only: a template that rejects a feature has it off
             return "";
         }

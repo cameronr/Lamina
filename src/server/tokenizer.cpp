@@ -75,6 +75,12 @@ FILE* open_utf8(const std::string& path) {
 const char* kQwen35Regex =
     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s"
     "\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+// hy_v4 (Hy4-flash): DeepSeek-V3's three, applied in turn (LLAMA_VOCAB_PRE_TYPE_HY_V4)
+const char* const kHyV4Regex[] = {
+    "\\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+};
 
 constexpr size_t kHeapMin = 64;          // longer words merge through a heap (same order as the scan)
 constexpr size_t kPieceCacheMax = 200000;
@@ -106,10 +112,14 @@ std::unique_ptr<Tokenizer> Tokenizer::from_gguf(const std::string& path) {
     auto t = std::make_unique<Tokenizer>();
     t->pre = str("tokenizer.ggml.pre");
     if (t->pre.empty()) t->pre = "qwen35";
-    if (t->pre != "qwen35" && t->pre != "qwen2" && t->pre != "qwen3")
+    if (t->pre == "hy_v4")
+        t->regex_.assign(std::begin(kHyV4Regex), std::end(kHyV4Regex));
+    else if (t->pre == "qwen35" || t->pre == "qwen2" || t->pre == "qwen3")
+        t->regex_ = {kQwen35Regex};
+    else
         throw std::runtime_error(path + ": the pre-tokenizer '" + t->pre + "' is not one this server runs");
-    t->regex_ = kQwen35Regex;
     t->chat_template = str("tokenizer.chat_template");
+    t->hy4 = Hy4Tags::from_template(t->chat_template);
     t->architecture = str("general.architecture");
     for (int64_t i = 0, n = gguf_get_n_kv(g); i < n; ++i) {
         const std::string k = gguf_get_key(g, i);
@@ -279,7 +289,7 @@ void Tokenizer::bpe(const std::string& piece, std::vector<int32_t>& out) const {
 void Tokenizer::encode_plain(std::string_view text, std::vector<int32_t>& out) const {
     if (text.empty()) return;
     // a piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
-    for (const std::string& piece : unicode_regex_split(std::string(text), {regex_}, false)) {
+    for (const std::string& piece : unicode_regex_split(std::string(text), regex_, false)) {
         {
             std::lock_guard<std::mutex> lk(cache_mu_);
             const auto it = piece_cache_.find(piece);

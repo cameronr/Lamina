@@ -130,10 +130,11 @@ Prepared Service::prepare(json& messages, const json& tools, const json& kwargs,
     std::vector<int32_t> ids = encoded_ids;
     // the prompt's end says, where a template decides for itself (a <|think_off|> or <|think_low|> in a message)
     const std::string prompt_end = ids.size() >= 2 ? tok.decode(std::vector<int32_t>(ids.end() - 2, ids.end())) : "";
-    const bool thinking_off = prompt_end == "</think>\n\n" || (prompt_end != "<think>\n" && jget(kwargs, "enable_thinking").is_boolean() &&
-                                                               !kwargs["enable_thinking"].get<bool>());
+    bool thinking_off = prompt_end == "</think>\n\n" || (prompt_end != "<think>\n" && jget(kwargs, "enable_thinking").is_boolean() &&
+                                                         !kwargs["enable_thinking"].get<bool>());
+    if (tok.hy4 && !ids.empty()) thinking_off = tok.token_bytes(ids.back()) != tok.hy4->think_open;   // its last tag says
     if (force && thinking_off) {
-        const std::vector<int32_t> f = tok.encode(*force, true);
+        const std::vector<int32_t> f = tok.encode(tok.hy4 ? qwen_to_hy4(*force, *tok.hy4) : *force, true);
         ids.insert(ids.end(), f.begin(), f.end());
     }
     embeddings = Embeddings{};
@@ -944,7 +945,8 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
                 parser.state() == "reasoning" && parser.buf() != kThinkEnd && !(stops && stops->hit) && !cancel.is_set()) {
                 // #1053: the model wrote its reasoning and stopped before </think>: close the thinking once and let it answer
                 close_retried = true;
-                const std::vector<int32_t> extra = tok.encode(kReasoningClose, true);
+                const std::vector<int32_t> extra =
+                    tok.encode(tok.hy4 ? qwen_to_hy4(kReasoningClose, *tok.hy4) : std::string(kReasoningClose), true);
                 if (max_new - n - (int64_t) extra.size() >= 1) {
                     say("[lamina] the reply ended inside its thinking with no answer: closing the thinking once and "
                         "continuing (reasoning_close_retry)");
@@ -990,7 +992,7 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
                 text = std::string(2 - std::min<size_t>(2, nl), '\n') + force.value_or("");
             }
             force.reset();
-            const std::vector<int32_t> extra = tok.encode(text, true);
+            const std::vector<int32_t> extra = tok.encode(tok.hy4 ? qwen_to_hy4(text, *tok.hy4) : text, true);
             if (max_new - n - (int64_t) extra.size() < 1) break;   // no room left to answer: "length"
             if (wrap) say("[lamina] thinking budget reached (" + std::to_string(thought) + " tokens): wrapping up the thinking");
             for (const int32_t t : extra) {

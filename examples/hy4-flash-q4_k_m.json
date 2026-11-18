@@ -1,0 +1,19 @@
+{
+  "model": "../Lamina-data/models/hy4-flash-Q4_K_M/Hy4-flash-Q4_K_M-00001-of-00002.gguf",
+  "gpu": [
+    "RTX 3090"
+  ],
+  "args": {
+    "max-context": 524288
+  },
+  "cwd": ".",
+  "model_name": "hy4-flash-q4_k_m",
+  "port": 8086,
+  "sampling": {
+    "temperature": 0.9,
+    "top_p": 1.0,
+    "top_k": 64
+  },
+  "log": "./lamina-hy4-flash-q4_k_m.log",
+  "lib_dirs": []
+}

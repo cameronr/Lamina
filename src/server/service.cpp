@@ -453,8 +453,11 @@ Service::Service(std::shared_ptr<Engine> engine_, const Tokenizer& tok_, std::sh
     : fit_max_tokens(fit_max_tokens_), engine(std::move(engine_)), tok(tok_), tpl(std::move(tpl_)),
       model(std::move(model_)), vision(std::move(vision_)), sampling_defaults_(std::move(sampling_defaults_)) {
     literals = literal_tags(tok.control_tokens());
+    // the turn's end: the GGUF's eos, and Qwen's markers where they are one token of this vocabulary
     for (const char* s : {"<|im_end|>", "<|endoftext|>"})
-        for (const int32_t t : tok.encode(s, true)) stop_ids.insert(t);
+        if (const std::vector<int32_t> t = tok.encode(s, true); t.size() == 1) stop_ids.insert(t[0]);
+    if (const auto e = tok.special_ids.find("eos"); e != tok.special_ids.end() && e->second >= 0)
+        stop_ids.insert((int32_t) e->second);
     prompts = std::make_unique<PromptEncoder>(tok);
     started_at = now_s();
     instance_id = random_hex(32);
@@ -1133,6 +1136,7 @@ bool Service::short_opening(const json& messages) const {
 }
 
 std::string Service::render_prompt(const json& messages, const json& tools, const json& kwargs) {
+    if (tok.hy4) return tpl->render(messages, tools, true, hy4_kwargs(kwargs));   // its own effort levels, no workarounds
     // #458: with effort_end, a request with a non-default effort is rendered as a default one up to the answer (the
     // same prompt start, so the conversation cache keeps it) and its effort follows in a short system turn
     const json& effort = jget(kwargs, "reasoning_effort");

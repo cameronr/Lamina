@@ -808,7 +808,7 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
   else()
     target_compile_options(lamina_unicode PRIVATE -w)
   endif()
-  add_library(lamina_text STATIC src/server/json.cpp src/server/log.cpp src/server/tokenizer.cpp
+  add_library(lamina_text STATIC src/server/json.cpp src/server/log.cpp src/server/tokenizer.cpp src/server/dialect.cpp
                                  src/server/frontend.cpp)
   target_include_directories(lamina_text PUBLIC src/server ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision)
   target_link_libraries(lamina_text PUBLIC lamina_jinja lamina_unicode nlohmann ggml-base lamina_warnings)
