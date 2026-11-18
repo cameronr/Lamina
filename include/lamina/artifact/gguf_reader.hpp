@@ -117,6 +117,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 43:
+        return "F8_E4M3";
     // Agention's llama.cpp fork: the APR trellis expert types (the engine's kernels: 147-149, Gyro-L's)
     case 143:
         return "PTQ1_0";
@@ -235,6 +237,7 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         bytes = 56;
         return true;
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
+    case 43:   // F8_E4M3: one byte a value, no scale (Hy4-flash's Engram table)
         elems = 1;
         bytes = 1;
         return true;
@@ -348,6 +351,7 @@ struct MetaValue {
     MetaType elem = MetaType::U32; // arrays
     uint64_t count = 0;
     std::vector<MetaValue> items;
+    uint64_t data = 0;             // an array's first element: its byte offset in the file (GgufFile::numbers)
     bool is_num() const { return type != MetaType::STRING && type != MetaType::ARRAY; }
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
@@ -400,6 +404,7 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
+        v.data = c.pos();
         v.items.reserve((size_t)std::min<uint64_t>(v.count, kMetaArrayKept));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
@@ -445,6 +450,48 @@ public:
     const MetaValue* get(const std::string& key) const {
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
+    }
+    /// A numeric array's every element, read from the mapping (MetaValue keeps the first kMetaArrayKept): integers
+    /// sign-extended to 64 bits as MetaValue::u holds them, BOOL as 0 / 1, floats converted.  False when the key is
+    /// missing or not an array of numbers.
+    bool numbers(const std::string& key, std::vector<uint64_t>* ints, std::vector<double>* reals = nullptr) const {
+        const MetaValue* v = get(key);
+        if (v == nullptr || v->type != MetaType::ARRAY) return false;
+        size_t sz = 0;
+        switch (v->elem) {
+        case MetaType::U8: case MetaType::I8: case MetaType::BOOL: sz = 1; break;
+        case MetaType::U16: case MetaType::I16: sz = 2; break;
+        case MetaType::U32: case MetaType::I32: case MetaType::F32: sz = 4; break;
+        case MetaType::U64: case MetaType::I64: case MetaType::F64: sz = 8; break;
+        default: return false;
+        }
+        if (v->data + v->count * sz > size_) return false;
+        if (ints) ints->resize((size_t) v->count);
+        if (reals) reals->resize((size_t) v->count);
+        const uint8_t* p = base_ + v->data;
+        for (uint64_t i = 0; i < v->count; ++i, p += sz) {
+            uint64_t u = 0;
+            double f = 0;
+            switch (v->elem) {
+            case MetaType::U8: u = *p; break;
+            case MetaType::BOOL: u = *p ? 1 : 0; break;
+            case MetaType::I8: u = (uint64_t) (int64_t) (int8_t) *p; break;
+            case MetaType::U16: { uint16_t x; std::memcpy(&x, p, 2); u = x; break; }
+            case MetaType::I16: { int16_t x; std::memcpy(&x, p, 2); u = (uint64_t) (int64_t) x; break; }
+            case MetaType::U32: { uint32_t x; std::memcpy(&x, p, 4); u = x; break; }
+            case MetaType::I32: { int32_t x; std::memcpy(&x, p, 4); u = (uint64_t) (int64_t) x; break; }
+            case MetaType::U64: case MetaType::I64: std::memcpy(&u, p, 8); break;
+            case MetaType::F32: { float x; std::memcpy(&x, p, 4); f = x; break; }
+            case MetaType::F64: std::memcpy(&f, p, 8); break;
+            default: break;
+            }
+            const bool real = v->elem == MetaType::F32 || v->elem == MetaType::F64;
+            if (ints) (*ints)[(size_t) i] = real ? (uint64_t) (int64_t) f : u;
+            if (reals) (*reals)[(size_t) i] = real ? f : (v->elem == MetaType::I8 || v->elem == MetaType::I16 ||
+                                                         v->elem == MetaType::I32 || v->elem == MetaType::I64)
+                                                            ? (double) (int64_t) u : (double) u;
+        }
+        return true;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
@@ -883,12 +930,38 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
 /// The architecture guard: "" when the engine can read the model whose metadata shard is `f`.  Qwen3.8-Flash-Next
 /// (qwen4exp) is read and checked against the shape the kernels are compiled for; Qwen3.6-35B-A3B (qwen35moe) and
 /// Qwen3.8-27B (qwen35) must carry every key their geometry is read from (core::geometry_from_gguf).
+/// Hy4-flash's keys, present and numbers (arrays: per-layer arrays of `block_count`); the shapes and the rest are
+/// lamina/hy4/geometry.hpp's (hy4::read_geometry), which the engine path reads.
+inline std::string check_architecture_hy4(const GgufFile& g) {
+    const std::string a = "hy_v4_flash.";
+    static const char* const nums[] = {
+        "block_count", "embedding_length", "attention.head_count_kv", "attention.q_lora_rank", "attention.kv_lora_rank",
+        "attention.key_length_mla", "attention.value_length_mla", "rope.dimension_count", "expert_count",
+        "expert_used_count", "expert_feed_forward_length", "expert_shared_count", "leading_dense_block_count",
+        "feed_forward_length", "hyper_connection.count", "attention.sliding_window", "rope.freq_base",
+        "rope.freq_base_swa", "attention.layer_norm_rms_epsilon",
+    };
+    for (const char* k : nums) {
+        const MetaValue* v = g.get(a + k);
+        if (!v) return "missing " + a + k;
+        if (!v->is_num()) return a + k + " is not a number";
+    }
+    const uint64_t n = g.get(a + "block_count")->u;
+    for (const char* k : {"attention.head_count", "attention.sliding_window_pattern"}) {
+        const MetaValue* v = g.get(a + k);
+        if (!v) return "missing " + a + k;
+        if (v->type != MetaType::ARRAY || v->count != n) return a + k + " is not an array of block_count values";
+    }
+    return {};
+}
+
 inline std::string check_architecture(const GgufFile& f) {
     const MetaValue* arch = f.get("general.architecture");
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35(f, "qwen35moe", true);
     if (family == ModelFamily::Qwen35) return check_architecture_qwen35(f, "qwen35", false);
+    if (family == ModelFamily::HyV4Flash) return check_architecture_hy4(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

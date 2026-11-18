@@ -2,8 +2,9 @@
 //
 // This engine was written for one model (Qwen3.8-Flash-Next, `qwen4exp`).  Qwen3.6-35B-A3B (`qwen35moe`) is a close
 // cousin (same tokenizer, the same Gated-DeltaNet + gated-attention 3:1 layer pattern, the same head dims), so the
-// reader, the geometry and the layout tables know both.  The ENGINE runs only the families `model_family_runs`
-// names; a recognised family it does not run yet is refused with `model_family_not_supported`, not mis-run.
+// reader, the geometry and the layout tables know both.  Hy4-flash (`hy_v4_flash`) shares no layer with them: its
+// geometry and layout are lamina/hy4/geometry.hpp's.  The ENGINE runs only the families `model_family_runs` names; a
+// recognised family it does not run yet is refused with `model_family_not_supported`, not mis-run.
 //
 // No dependencies: the GGUF reader (the architecture guard) and the core geometry both include this.
 #pragma once
@@ -17,12 +18,14 @@ enum class ModelFamily {
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
     Qwen35,      ///< Qwen3.8-27B: Qwen3.6's layers with a dense FFN in place of the experts (Unsloth's GGUFs)
+    HyV4Flash,   ///< Tencent's Hy4-flash: gated MLA, sparse and window layers, iHC, Engram, latent experts (AngelSlim's GGUFs)
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
     if (arch == "qwen35") return ModelFamily::Qwen35;
+    if (arch == "hy_v4_flash") return ModelFamily::HyV4Flash;
     return ModelFamily::Unknown;
 }
 
@@ -35,6 +38,8 @@ inline const char* model_family_arch(ModelFamily f) {
         return "qwen35moe";
     case ModelFamily::Qwen35:
         return "qwen35";
+    case ModelFamily::HyV4Flash:
+        return "hy_v4_flash";
     default:
         return "";
     }
@@ -49,14 +54,16 @@ inline const char* model_family_title(ModelFamily f) {
         return "Qwen3.6-35B-A3B";
     case ModelFamily::Qwen35:
         return "Qwen3.8-27B";
+    case ModelFamily::HyV4Flash:
+        return "Hy4-flash";
     default:
         return "an unknown model";
     }
 }
 
-/// Whether Flash-Next's engine path runs the family.  Qwen3.6 has an engine path of its own (src/qwen35), which
-/// `lamina` switches to at the top of main (a build with CUDA and native experts); without it the family is refused
-/// with `model_family_not_supported`.
+/// Whether Flash-Next's engine path runs the family.  Qwen3.6 and Hy4-flash have engine paths of their own (src/qwen35,
+/// src/hy4), which `lamina` switches to at the top of main (a build with CUDA and native experts); without them the
+/// family is refused with `model_family_not_supported`.
 inline bool model_family_runs(ModelFamily f) { return f == ModelFamily::Qwen4Exp; }
 
 /// The refusal for a recognised family the engine does not run (empty when it runs it).
