@@ -104,14 +104,14 @@ template <class T> T* dalloc(size_t n) {
 }
 template <class T> T* halloc(size_t n) {   // pinned
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, std::max<size_t>(n * sizeof(T), 256), cudaHostAllocDefault));
+    CK(cudaHostAlloc(&p, std::max<size_t>(n * sizeof(T), 256), cudaHostAllocPortable));   // the tiers copy from it
     own(&Owned::pinned, p);
     return (T*) p;
 }
 /// pinned host memory the GPU reads through the mapping: the host pointer, the device's in *dev
 template <class T> T* hmapped(size_t n, T** dev) {
     void* p = nullptr;
-    CK(cudaHostAlloc(&p, std::max<size_t>(n * sizeof(T), 256), cudaHostAllocMapped));
+    CK(cudaHostAlloc(&p, std::max<size_t>(n * sizeof(T), 256), cudaHostAllocMapped | cudaHostAllocPortable));
     own(&Owned::pinned, p);
     std::memset(p, 0, std::max<size_t>(n * sizeof(T), 256));
     CK(cudaHostGetDevicePointer((void**) dev, p, 0));
@@ -133,6 +133,15 @@ struct Mat {
     const uint8_t* d = nullptr;   // device, GGUF blocks
     int type = -1;
     int n_in = 0, n_out = 0;
+};
+
+/// A GPU's slots of one MoE layer
+struct SlotSet {
+    uint8_t* slots = nullptr;          // n blobs, the layer's stride apart (device)
+    int n = 0;
+    std::vector<int32_t> slot_of;      // [n_expert]: its slot or -1 (host)
+    std::vector<int32_t> slot_expert;  // [n]: its expert or -1
+    int32_t* slot_of_d = nullptr;      // slot_of on that GPU
 };
 
 struct Layer {
@@ -160,13 +169,9 @@ struct Layer {
     C::NativeFmt fmt;
     uint8_t* arena = nullptr;   // n_expert blobs, `stride` bytes apart (host)
     size_t stride = 0;
-    // VRAM slots on the main GPU: the experts the routing uses most (Engine::place_slots, rebalance)
-    K::NativeExpertLayout gl;          // the GPU's view of a blob
-    uint8_t* slots = nullptr;          // n_slots blobs, `stride` apart (device)
-    int n_slots = 0;
-    std::vector<int32_t> slot_of;      // [n_expert]: its slot or -1 (host)
-    std::vector<int32_t> slot_expert;  // [n_slots]: its expert or -1
-    int32_t* slot_of_d = nullptr;      // slot_of on the device
+    // the experts in VRAM: each GPU's slots (Engine::gpus: [0] the main GPU, then the expert tiers)
+    K::NativeExpertLayout gl;          // the GPUs' view of a blob
+    std::vector<SlotSet> held;
     std::vector<float> use;            // routing counts, halved at each rebalance
     // caches
     __half* kv = nullptr;       // latent rows: the context's cells (sparse) or the window's ring
@@ -890,10 +895,10 @@ struct Engine {
         CK(cudaMemcpyAsync(h_rin, rin, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * Kk * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaEventRecordWithFlags(ev, st, cudaEventRecordExternal));   // a node of its own in a graph: the host waits on it
-        if (l.n_slots > 0) {
+        if (!l.held.empty() && l.held[0].n > 0) {
             quant(rin, T, Ld, rinq);
-            hy4k::k_group_slots<<<1, 512, 0, st>>>(ids, T * Kk, Kk, E, l.slot_of_d, l.slots, l.stride, grp_ptr, grp_start,
-                                                  n_groups, ent_dst, ent_tok);
+            hy4k::k_group_slots<<<1, 512, 0, st>>>(ids, T * Kk, Kk, E, l.held[0].slot_of_d, l.held[0].slots, l.stride,
+                                                  grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
             K::native_expert_grouped(l.gl, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                      std::min<int64_t>((int64_t) T * Kk, E), (int64_t) T * Kk, rinq,
                                      (int64_t) (Ld / 32) * 36, escr, parts, st);
@@ -905,23 +910,37 @@ struct Engine {
         mmvq(l.s_down, hq, sy, T);
     }
 
-    /// The CPU's part of an MoE layer, between two segments: the experts without a slot on the pool, their rows into
-    /// mapped memory (h_out, h_miss), which the next segment merges.
+    /// The host's part of an MoE layer, between two segments: each entry to its holder (the main GPU's slots, which the
+    /// segment before ran; a tier's, whose share runs now on that GPU; else the CPU pool), the tiers' and the CPU's rows
+    /// into mapped memory (h_out, with h_miss), which the next segment merges.
     void cpu_part(Layer& l, int T) {
         const auto& g = m->g;
         const int Kk = (int) g.top_k, Ld = (int) g.n_latent;
         CK(cudaEventSynchronize(ev));
         const auto t0 = Clock::now();
+        std::fill(tier_used.begin(), tier_used.end(), (char) 0);
+        int n_miss = 0;
+        for (int e = 0; e < T * Kk; ++e) {
+            const int ex = h_ids[e];
+            l.use[(size_t) ex] += 1.f;
+            int holder = -1;
+            for (size_t gi = 0; gi < l.held.size() && holder < 0; ++gi)
+                if (l.held[gi].n > 0 && l.held[gi].slot_of[(size_t) ex] >= 0) holder = (int) gi;
+            h_miss[e] = holder != 0;
+            if (holder >= 0) ++gpus[(size_t) holder].hits;
+            if (holder > 0) tier_used[(size_t) holder] = 1;
+            if (holder < 0) ++n_miss;
+        }
+        for (size_t gi = 1; gi < tier_used.size(); ++gi)
+            if (tier_used[gi]) tier_launch((int) gi, l, T);
         jobs.clear();
         std::map<int, size_t> open;
-        int n_miss = 0;
         std::vector<char> quantized((size_t) T, 0);
         for (int e = 0; e < T * Kk; ++e) {
             const int ex = h_ids[e], t = e / Kk;
-            l.use[(size_t) ex] += 1.f;
-            h_miss[e] = l.slot_of[(size_t) ex] < 0;
-            if (!h_miss[e]) continue;
-            ++n_miss;
+            bool held = false;
+            for (const SlotSet& s : l.held) held = held || (s.n > 0 && s.slot_of[(size_t) ex] >= 0);
+            if (held) continue;
             if (!quantized[(size_t) t]) {
                 C::native_quant_act(l.fmt, h_rin + (size_t) t * Ld, acts + (size_t) t * C::kNativeActBytes);
                 quantized[(size_t) t] = 1;
@@ -941,6 +960,11 @@ struct Engine {
         lookups += T * Kk;
         hits += T * Kk - n_miss;
         if (n_miss > 0) pool->run_split_multi_native(l.fmt, jobs.data(), (int) jobs.size());
+        for (size_t gi = 1; gi < tier_used.size(); ++gi)
+            if (tier_used[gi]) {
+                lamina::core::DeviceScope ds(gpus[gi].dev, main_dev);
+                CK(cudaEventSynchronize(gpus[gi].ev));
+            }
         cpu_ms += ms_since(t0);
     }
 
@@ -958,72 +982,244 @@ struct Engine {
         hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
     }
 
-    // ---- the routed experts in VRAM
-    /// Slots on the main GPU for every MoE layer, as many a layer as `gib` GiB hold (negative: the free VRAM less a
-    /// reserve), filled from the profile's counts (else experts 0..); the GPU's view of each layer's blobs.
-    void place_slots(double gib) {
+    // ---- the routed experts in VRAM: the main GPU's slots (holder 0) and the expert tiers' (the other GPUs, holders
+    // 1..), every MoE layer the same count a GPU.  One ranking of a layer's experts by its routing counts places them:
+    // the most used on the main GPU, the next on the first tier and so on, the rest on the CPU; an expert is held by one
+    // GPU at most.
+    struct Gpu {
+        int dev = 0;
+        std::string name;
+        cudaStream_t st = nullptr;
+        cudaEvent_t ev = nullptr;
+        int S = 0;   // slots a layer
+        // a tier's own buffers on its GPU: the routing and the routed input, its entries grouped, their rows
+        int32_t* ids_d = nullptr;
+        float* rin_d = nullptr;
+        uint8_t *rinq_d = nullptr, *escr = nullptr;
+        unsigned long long* grp_ptr = nullptr;
+        int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
+        float* rows_d = nullptr;
+        float** out_d = nullptr;       // h_out's address (the mapping's, the same on every GPU)
+        uint32_t** flag_d = nullptr;   // null: native_expert_rows_out raises no flag
+        unsigned* counter_d = nullptr;
+        std::map<int, cudaGraphExec_t> graphs;   // layer * 16 + rows
+        int64_t hits = 0;
+    };
+    std::vector<Gpu> gpus;   // [0]: the main GPU
+    int main_dev = 0;
+    std::vector<char> tier_used;   // a forward's layer: the tiers given entries
+
+    /// The main GPU's slots (as many a layer as `main_gib` GiB hold; negative: its free VRAM less a reserve) and each of
+    /// `tier_devs`' (its free VRAM less a reserve), filled by the profile's ranking (else experts in order).
+    void place_slots(double main_gib, const std::vector<int>& tier_devs) {
         const auto& g = m->g;
+        CK(cudaGetDevice(&main_dev));
         size_t row = 0;
         for (const Layer& l : m->layers)
             if (!l.dense) row += l.stride;
-        size_t fr = 0, tot = 0;
-        CK(cudaMemGetInfo(&fr, &tot));
-        const size_t reserve = (size_t) 1536 << 20;
-        const size_t budget = gib >= 0 ? (size_t) (gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
-        const int S = (int) std::min<size_t>((size_t) g.n_expert, row ? budget / row : 0);
+        auto slots_for = [&](double gib, size_t reserve) {
+            size_t fr = 0, tot = 0;
+            CK(cudaMemGetInfo(&fr, &tot));
+            const size_t budget = gib >= 0 ? (size_t) (gib * (double) (1ull << 30)) : (fr > reserve ? fr - reserve : 0);
+            return (int) std::min<size_t>((size_t) g.n_expert, row ? budget / row : 0);
+        };
+        gpus.clear();
+        Gpu g0;
+        g0.dev = main_dev;
+        g0.st = st;
+        g0.ev = ev;
+        g0.S = slots_for(main_gib, (size_t) 1536 << 20);
+        cudaDeviceProp pr{};
+        CK(cudaGetDeviceProperties(&pr, main_dev));
+        g0.name = pr.name;
+        gpus.push_back(g0);
+        for (const int d : tier_devs) {
+            lamina::core::DeviceScope ds(d, main_dev);
+            Gpu t;
+            t.dev = d;
+            CK(cudaGetDeviceProperties(&pr, d));
+            t.name = pr.name;
+            CK(cudaStreamCreateWithFlags(&t.st, cudaStreamNonBlocking));
+            own(&Owned::streams, t.st);
+            CK(cudaEventCreateWithFlags(&t.ev, cudaEventDisableTiming));
+            own(&Owned::events, t.ev);
+            const size_t n_ent = (size_t) kMaxT * (size_t) g.top_k;
+            t.ids_d = dalloc<int32_t>(n_ent);
+            t.rin_d = dalloc<float>((size_t) kMaxT * (size_t) g.n_latent);
+            t.rinq_d = dalloc<uint8_t>((size_t) kMaxT * (size_t) g.n_latent / 32 * 36);
+            t.grp_ptr = dalloc<unsigned long long>(n_ent + 1);
+            t.grp_start = dalloc<int32_t>(n_ent + 2);
+            t.n_groups = dalloc<int32_t>(1);
+            t.ent_dst = dalloc<int32_t>(n_ent);
+            t.ent_tok = dalloc<int32_t>(n_ent);
+            t.escr = dalloc<uint8_t>(K::native_expert_scratch_bytes((int64_t) n_ent, g.n_ff_exp));
+            t.rows_d = dalloc<float>(n_ent * (size_t) g.n_latent);
+            t.out_d = dalloc<float*>(1);
+            t.flag_d = dalloc<uint32_t*>(1);
+            t.counter_d = dalloc<unsigned>(1);
+            float* out = h_out_d;
+            uint32_t* none = nullptr;
+            CK(cudaMemcpy(t.out_d, &out, sizeof out, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(t.flag_d, &none, sizeof none, cudaMemcpyHostToDevice));
+            CK(cudaMemset(t.counter_d, 0, sizeof(unsigned)));
+            t.S = slots_for(-1, (size_t) 1280 << 20);
+            gpus.push_back(t);
+        }
         load_profile();
         for (Layer& l : m->layers) {
             if (l.dense) continue;
             l.gl = K::native_expert_layout(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp);
             l.gl.swiglu_limit = l.fmt.swiglu_limit;
             if (l.use.empty()) l.use.assign((size_t) g.n_expert, 0.f);
-            l.slot_of.assign((size_t) g.n_expert, -1);
-            l.slot_of_d = dalloc<int32_t>((size_t) g.n_expert);
-            if (S <= 0 || !K::native_expert_supported(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp)) continue;
-            l.n_slots = S;
-            l.slots = dalloc<uint8_t>((size_t) S * l.stride);
-            l.slot_expert.assign((size_t) S, -1);
-            std::vector<int32_t> order((size_t) g.n_expert);
-            for (int e = 0; e < (int) g.n_expert; ++e) order[(size_t) e] = e;
-            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
-            for (int k = 0; k < S; ++k) put_slot(l, k, order[(size_t) k]);
-            CK(cudaMemcpy(l.slot_of_d, l.slot_of.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice));
+            const bool ok = K::native_expert_supported(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp);
+            l.held.assign(gpus.size(), SlotSet{});
+            for (size_t gi = 0; gi < gpus.size(); ++gi) {
+                lamina::core::DeviceScope ds(gpus[gi].dev, main_dev, gi > 0);
+                SlotSet& s = l.held[gi];
+                s.slot_of.assign((size_t) g.n_expert, -1);
+                s.slot_of_d = dalloc<int32_t>((size_t) g.n_expert);
+                if (!ok || gpus[gi].S <= 0) continue;
+                s.n = gpus[gi].S;
+                s.slots = dalloc<uint8_t>((size_t) s.n * l.stride);
+                s.slot_expert.assign((size_t) s.n, -1);
+            }
+            const std::vector<int32_t> order = ranking(l);
+            size_t at = 0;
+            for (size_t gi = 0; gi < gpus.size(); ++gi)
+                for (int k = 0; k < l.held[gi].n && at < order.size(); ++k) put_slot(l, (int) gi, k, order[at++]);
+            for (size_t gi = 0; gi < gpus.size(); ++gi) upload_table(l, (int) gi);
         }
-        CK(cudaDeviceSynchronize());
-        std::fprintf(stderr, "lamina: %d of %lld routed experts a layer in VRAM (%.2f GiB)%s\n", std::max(S, 0),
-                     (long long) g.n_expert, (double) std::max(S, 0) * (double) row / (double) (1ull << 30),
-                     profile_loaded ? ", the profile's" : "");
+        for (const Gpu& gp : gpus) {
+            lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
+            CK(cudaDeviceSynchronize());
+        }
+        tier_used.assign(gpus.size(), 0);
+        for (size_t gi = 0; gi < gpus.size(); ++gi)
+            std::fprintf(stderr, "lamina: GPU %d, %s: %d of %lld routed experts a layer (%.2f GiB)%s\n", gpus[gi].dev,
+                         gpus[gi].name.c_str(), std::max(gpus[gi].S, 0), (long long) g.n_expert,
+                         (double) std::max(gpus[gi].S, 0) * (double) row / (double) (1ull << 30),
+                         gi == 0 ? (profile_loaded ? ", the profile's ranking" : ", in order (no profile yet)") : "");
     }
-    void put_slot(Layer& l, int k, int32_t e) {
-        if (l.slot_expert[(size_t) k] >= 0) l.slot_of[(size_t) l.slot_expert[(size_t) k]] = -1;
-        CK(cudaMemcpyAsync(l.slots + (size_t) k * l.stride, l.arena + (size_t) e * l.stride, l.fmt.bytes,
-                           cudaMemcpyHostToDevice, st));
-        l.slot_expert[(size_t) k] = e;
-        l.slot_of[(size_t) e] = k;
+    /// A layer's experts, the most used first (ties by id)
+    std::vector<int32_t> ranking(const Layer& l) const {
+        std::vector<int32_t> order(l.use.size());
+        for (size_t e = 0; e < order.size(); ++e) order[e] = (int32_t) e;
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
+        return order;
     }
-    /// The slots to the experts the routing used most: in each layer the most used experts without a slot take the slots
-    /// of the least used ones that are used less, at most `max_swaps` copies in all; then the counts are halved.
+    void upload_table(Layer& l, int gi) {
+        lamina::core::DeviceScope ds(gpus[(size_t) gi].dev, main_dev, gi > 0);
+        SlotSet& s = l.held[(size_t) gi];
+        CK(cudaMemcpyAsync(s.slot_of_d, s.slot_of.data(), s.slot_of.size() * 4, cudaMemcpyHostToDevice, gpus[(size_t) gi].st));
+    }
+    /// Expert e into GPU gi's slot k (its blob from the RAM arena), out of any other GPU's slot
+    void put_slot(Layer& l, int gi, int k, int32_t e) {
+        SlotSet& s = l.held[(size_t) gi];
+        for (size_t oi = 0; oi < l.held.size(); ++oi) {
+            SlotSet& so = l.held[oi];
+            if (so.slot_of.empty() || so.slot_of[(size_t) e] < 0) continue;
+            so.slot_expert[(size_t) so.slot_of[(size_t) e]] = -1;
+            so.slot_of[(size_t) e] = -1;
+        }
+        if (s.slot_expert[(size_t) k] >= 0) s.slot_of[(size_t) s.slot_expert[(size_t) k]] = -1;
+        {
+            lamina::core::DeviceScope ds(gpus[(size_t) gi].dev, main_dev, gi > 0);
+            CK(cudaMemcpyAsync(s.slots + (size_t) k * l.stride, l.arena + (size_t) e * l.stride, l.fmt.bytes,
+                               cudaMemcpyHostToDevice, gpus[(size_t) gi].st));
+        }
+        s.slot_expert[(size_t) k] = e;
+        s.slot_of[(size_t) e] = k;
+    }
+    /// The GPUs' slots toward the ranking: in each layer, GPU by GPU (the main first), the experts its share of the
+    /// ranking holds that it lacks take its empty slots, then the slots of its experts outside that share (the least
+    /// used first) while they are used less (by 1.25x); at most `max_swaps` copies in all; then the counts are halved.
     int rebalance(int max_swaps) {
-        const auto& g = m->g;
         int swaps = 0;
         for (Layer& l : m->layers) {
-            if (l.n_slots == 0) continue;
-            std::vector<int32_t> out, in;
-            for (int e = 0; e < (int) g.n_expert; ++e) (l.slot_of[(size_t) e] < 0 ? out : in).push_back(e);
-            std::sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
-            std::sort(in.begin(), in.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] < l.use[(size_t) b]; });
-            bool moved = false;
-            for (size_t i = 0; i < out.size() && i < in.size() && swaps < max_swaps; ++i) {
-                if (l.use[(size_t) out[i]] <= 1.25f * l.use[(size_t) in[i]] + 0.5f) break;
-                put_slot(l, l.slot_of[(size_t) in[i]], out[i]);
-                ++swaps;
-                moved = true;
+            if (l.dense || l.held.empty()) continue;
+            const std::vector<int32_t> order = ranking(l);
+            std::vector<int> want(order.size(), -1);   // expert -> the GPU its rank gives it
+            size_t at = 0;
+            for (size_t gi = 0; gi < l.held.size(); ++gi)
+                for (int k = 0; k < l.held[gi].n && at < order.size(); ++k) want[(size_t) order[at++]] = (int) gi;
+            std::vector<char> changed(l.held.size(), 0);
+            for (size_t gi = 0; gi < l.held.size() && swaps < max_swaps; ++gi) {
+                SlotSet& s = l.held[gi];
+                if (s.n == 0) continue;
+                std::vector<int32_t> in, out;
+                for (const int32_t e : order)
+                    if (want[(size_t) e] == (int) gi && s.slot_of[(size_t) e] < 0) in.push_back(e);   // most used first
+                for (int k = 0; k < s.n; ++k) {
+                    const int32_t e = s.slot_expert[(size_t) k];
+                    if (e >= 0 && want[(size_t) e] != (int) gi) out.push_back(e);
+                }
+                std::sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] < l.use[(size_t) b]; });
+                size_t oi = 0;
+                for (const int32_t e : in) {
+                    if (swaps >= max_swaps) break;
+                    int k = -1;
+                    for (int j = 0; j < s.n && k < 0; ++j)
+                        if (s.slot_expert[(size_t) j] < 0) k = j;
+                    if (k < 0) {
+                        if (oi >= out.size() || l.use[(size_t) e] <= 1.25f * l.use[(size_t) out[oi]] + 0.5f) break;
+                        k = s.slot_of[(size_t) out[oi++]];
+                    }
+                    for (size_t hi = 0; hi < l.held.size(); ++hi)   // the GPU it leaves
+                        if (!l.held[hi].slot_of.empty() && l.held[hi].slot_of[(size_t) e] >= 0) changed[hi] = 1;
+                    put_slot(l, (int) gi, k, e);
+                    changed[gi] = 1;
+                    ++swaps;
+                }
             }
-            if (moved) CK(cudaMemcpyAsync(l.slot_of_d, l.slot_of.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice, st));
+            for (size_t gi = 0; gi < l.held.size(); ++gi)
+                if (changed[gi]) upload_table(l, (int) gi);
             for (float& u : l.use) u *= 0.5f;
         }
-        CK(cudaStreamSynchronize(st));
+        for (const Gpu& gp : gpus) {
+            lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
+            CK(cudaStreamSynchronize(gp.st));
+        }
         return swaps;
+    }
+    /// A tier's share of an MoE layer, on its GPU (current): the routing and the routed input from the host, its entries
+    /// grouped and run, their rows into the mapped h_out (the next segment merges them as the CPU's)
+    void tier_enqueue(Gpu& gp, int gi, Layer& l, int T) {
+        const auto& g = m->g;
+        const int E = (int) g.n_expert, Kk = (int) g.top_k, Ld = (int) g.n_latent;
+        SlotSet& s = l.held[(size_t) gi];
+        CK(cudaMemcpyAsync(gp.ids_d, h_ids, (size_t) T * Kk * 4, cudaMemcpyHostToDevice, gp.st));
+        CK(cudaMemcpyAsync(gp.rin_d, h_rin, (size_t) T * Ld * 4, cudaMemcpyHostToDevice, gp.st));
+        K::quantize_q8_1_rows(gp.rin_d, T, Ld, gp.rinq_d, gp.st);
+        hy4k::k_group_slots<<<1, 512, 0, gp.st>>>(gp.ids_d, T * Kk, Kk, E, s.slot_of_d, s.slots, l.stride, gp.grp_ptr,
+                                                 gp.grp_start, gp.n_groups, gp.ent_dst, gp.ent_tok);
+        K::native_expert_grouped(l.gl, gp.grp_ptr, gp.grp_start, gp.n_groups, gp.ent_dst, gp.ent_tok,
+                                 std::min<int64_t>((int64_t) T * Kk, E), (int64_t) T * Kk, gp.rinq_d,
+                                 (int64_t) (Ld / 32) * 36, gp.escr, gp.rows_d, gp.st);
+        K::native_expert_rows_out(gp.rows_d, gp.n_groups, gp.grp_start, gp.ent_dst, Ld, (int64_t) T * Kk, gp.out_d,
+                                  gp.flag_d, nullptr, gp.counter_d, gp.st);
+        CK(cudaEventRecordWithFlags(gp.ev, gp.st, cudaEventRecordExternal));
+    }
+    void tier_launch(int gi, Layer& l, int T) {
+        Gpu& gp = gpus[(size_t) gi];
+        lamina::core::DeviceScope ds(gp.dev, main_dev);
+        if (!use_graphs) {
+            tier_enqueue(gp, gi, l, T);
+            return;
+        }
+        const int key = l.il * 16 + T;
+        auto it = gp.graphs.find(key);
+        if (it == gp.graphs.end()) {
+            CK(cudaStreamBeginCapture(gp.st, cudaStreamCaptureModeThreadLocal));
+            tier_enqueue(gp, gi, l, T);
+            cudaGraph_t gr = nullptr;
+            CK(cudaStreamEndCapture(gp.st, &gr));
+            cudaGraphExec_t ex = nullptr;
+            CK(cudaGraphInstantiate(&ex, gr, 0));
+            cudaGraphDestroy(gr);
+            own(&Owned::graphs, ex);
+            it = gp.graphs.emplace(key, ex).first;
+        }
+        CK(cudaGraphLaunch(it->second, gp.st));
     }
     // the profile: 'HY4P', n_layers, n_expert, then each MoE layer's counts (float)
     bool profile_loaded = false;
@@ -1232,6 +1428,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     double expert_vram = -1;
     std::string profile;
     bool graphs = true;
+    std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -1260,7 +1457,9 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--expert-vram") expert_vram = std::atof(next());
         else if (a == "--expert-profile") profile = next();
         else if (a == "--no-graph") graphs = false;
-        else if (a == "--tier-gpus") (void) next();   // the expert tiers' GPUs: not used yet (open item ey)
+        else if (a == "--tier-gpus") {   // the expert tiers' GPUs (CUDA ordinals, the family switch's)
+            for (const int32_t d : lamina::program::parse_ids(next())) tier_devs.push_back((int) d);
+        }
         else {
             std::fprintf(stderr, "lamina: Hy4-flash's path does not take %s\n", a.c_str());
             return 2;
@@ -1278,7 +1477,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.profile_path = profile;
     E.use_graphs = graphs;
     E.init(m, max_ctx, threads);
-    E.place_slots(expert_vram);
+    E.place_slots(expert_vram, tier_devs);
     if (serve) {
         Serve sv(E, m.eos);
         return sv.run();
@@ -1331,6 +1530,9 @@ int run_engine(int argc, char** argv, bool check_only) {
                  "the CPU's experts %.1f ms, the table %.1f ms while generating; VRAM hits %.1f%%\n", prompt.size(), pp_ms,
                  prompt.size() / (pp_ms / 1000.0), gen.size(), tg_ms, gen.size() / (tg_ms / 1000.0), E.cpu_ms - cpu0,
                  E.table_ms - tab0, E.lookups ? 100.0 * (double) E.hits / (double) E.lookups : 0.0);
+    for (const Engine::Gpu& gp : E.gpus)
+        std::fprintf(stderr, "lamina: GPU %d, %s: %.1f%% of the routed entries\n", gp.dev, gp.name.c_str(),
+                     E.lookups ? 100.0 * (double) gp.hits / (double) E.lookups : 0.0);
     E.save_profile();
     return 0;
 }

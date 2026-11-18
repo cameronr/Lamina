@@ -1,10 +1,12 @@
 {
   "model": "../Lamina-data/models/hy4-flash-Q4_K_M/Hy4-flash-Q4_K_M-00001-of-00002.gguf",
   "gpu": [
-    "RTX 3090"
+    "RTX 3090",
+    "auto"
   ],
   "args": {
-    "max-context": 524288
+    "max-context": 524288,
+    "expert-profile": "./hy4-flash-q4_k_m-learned.bin"
   },
   "cwd": ".",
   "model_name": "hy4-flash-q4_k_m",
