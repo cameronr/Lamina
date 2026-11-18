@@ -5,8 +5,7 @@
     "auto"
   ],
   "args": {
-    "max-context": 524288,
-    "expert-profile": "./hy4-flash-q4_k_m-learned.bin"
+    "max-context": 524288
   },
   "cwd": ".",
   "model_name": "hy4-flash-q4_k_m",
@@ -17,5 +16,7 @@
     "top_k": 64
   },
   "log": "./lamina-hy4-flash-q4_k_m.log",
-  "lib_dirs": []
+  "lib_dirs": [],
+  "expert_profile_save": "./hy4-flash-q4_k_m-learned.bin",
+  "expert_profile_save_every": 1
 }

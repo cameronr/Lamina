@@ -51,8 +51,8 @@ const std::vector<Param> kParams = {
     {"--replica-load-tokens", "", "replica_load_tokens", K::Int, "N",
      "a request in flight counts as N prompt tokens when one is picked for a replica (default 3000)"},
     {"--expert-profile-save", "", "expert_profile_save", K::Path, "FILE",
-     "Flash-Next: what the run learned about the experts, which the next start begins from (with -m: beside the "
-     "program)"},
+     "Flash-Next and Hy4-flash: what the run learned about the experts, which the next start begins from (with -m: "
+     "beside the program)"},
     {"--expert-profile-save-every", "", "expert_profile_save_every", K::Num, "MIN",
      "minutes between those saves (0: at exit only)"},
     {"--engine-silence-s", "", "engine_silence_s", K::Num, "S",

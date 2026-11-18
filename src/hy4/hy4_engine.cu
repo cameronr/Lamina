@@ -24,6 +24,7 @@
 #include "lamina/kernels/iq_kernels.hpp"
 #include "lamina/kernels/native_mmvq.hpp"
 #include "lamina/ngram/ple_reader.hpp"
+#include "lamina/platform/console_quit.hpp"
 #include "lamina/program/host_sampling.hpp"
 #include "lamina/program/serve_io.hpp"
 
@@ -40,9 +41,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -173,6 +176,8 @@ struct Layer {
     K::NativeExpertLayout gl;          // the GPUs' view of a blob
     std::vector<SlotSet> held;
     std::vector<float> use;            // routing counts, halved at each rebalance
+    std::vector<float> total;          // the run's routing counts (the learned profile's)
+    std::vector<float> start;          // the start profile's shares (empty: none)
     // caches
     __half* kv = nullptr;       // latent rows: the context's cells (sparse) or the window's ring
     int64_t kv_cells = 0;
@@ -482,7 +487,9 @@ struct Engine {
     int32_t *h_miss = nullptr, *h_miss_d = nullptr;
     uint8_t *rinq = nullptr, *escr = nullptr;
     int64_t hits = 0, lookups = 0;
-    std::string profile_path;
+    std::string profile_path, save_path;   // the profile started from; where the learned one goes
+    double save_every_min = 1.0;
+    Clock::time_point last_save = Clock::now();
     // counters
     double cpu_ms = 0, table_ms = 0;
     int64_t forwards = 0;
@@ -923,6 +930,7 @@ struct Engine {
         for (int e = 0; e < T * Kk; ++e) {
             const int ex = h_ids[e];
             l.use[(size_t) ex] += 1.f;
+            l.total[(size_t) ex] += 1.f;
             int holder = -1;
             for (size_t gi = 0; gi < l.held.size() && holder < 0; ++gi)
                 if (l.held[gi].n > 0 && l.held[gi].slot_of[(size_t) ex] >= 0) holder = (int) gi;
@@ -1071,6 +1079,7 @@ struct Engine {
             l.gl = K::native_expert_layout(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp);
             l.gl.swiglu_limit = l.fmt.swiglu_limit;
             if (l.use.empty()) l.use.assign((size_t) g.n_expert, 0.f);
+            l.total.assign((size_t) g.n_expert, 0.f);
             const bool ok = K::native_expert_supported(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp);
             l.held.assign(gpus.size(), SlotSet{});
             for (size_t gi = 0; gi < gpus.size(); ++gi) {
@@ -1098,7 +1107,7 @@ struct Engine {
             std::fprintf(stderr, "lamina: GPU %d, %s: %d of %lld routed experts a layer (%.2f GiB)%s\n", gpus[gi].dev,
                          gpus[gi].name.c_str(), std::max(gpus[gi].S, 0), (long long) g.n_expert,
                          (double) std::max(gpus[gi].S, 0) * (double) row / (double) (1ull << 30),
-                         gi == 0 ? (profile_loaded ? ", the profile's ranking" : ", in order (no profile yet)") : "");
+                         gi == 0 ? (profile_loaded ? ", ranked by " + profile_from : std::string(", in order (no profile)")).c_str() : "");
     }
     /// A layer's experts, the most used first (ties by id)
     std::vector<int32_t> ranking(const Layer& l) const {
@@ -1133,7 +1142,8 @@ struct Engine {
     /// The GPUs' slots toward the ranking: in each layer, GPU by GPU (the main first), the experts its share of the
     /// ranking holds that it lacks take its empty slots, then the slots of its experts outside that share (the least
     /// used first) while they are used less (by 1.25x); at most `max_swaps` copies in all; then the counts are halved.
-    int rebalance(int max_swaps) {
+    /// `waiting` (if set) is asked before each copy: true ends the copies there (the counts are halved all the same).
+    int rebalance(int max_swaps, const std::function<bool()>& waiting = nullptr) {
         int swaps = 0;
         for (Layer& l : m->layers) {
             if (l.dense || l.held.empty()) continue;
@@ -1156,6 +1166,7 @@ struct Engine {
                 std::sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] < l.use[(size_t) b]; });
                 size_t oi = 0;
                 for (const int32_t e : in) {
+                    if (swaps < max_swaps && waiting && waiting()) max_swaps = swaps;
                     if (swaps >= max_swaps) break;
                     int k = -1;
                     for (int j = 0; j < s.n && k < 0; ++j)
@@ -1221,42 +1232,71 @@ struct Engine {
         }
         CK(cudaGraphLaunch(it->second, gp.st));
     }
-    // the profile: 'HY4P', n_layers, n_expert, then each MoE layer's counts (float)
+    // a profile: 'HY4P', n_layers, n_expert, then each MoE layer's shares of its routing (float, summing to 1)
     bool profile_loaded = false;
+    std::string profile_from;
+    /// The start: the learned profile when it holds this model's shape, else --expert-profile's.  Its shares rank the
+    /// experts and count as 1,000 entries a layer of routing until the rebalances halve them.
     void load_profile() {
-        if (profile_path.empty()) return;
-        FILE* f = std::fopen(profile_path.c_str(), "rb");
-        if (!f) return;
-        int32_t hdr[3] = {};
         const auto& g = m->g;
-        if (std::fread(hdr, 4, 3, f) == 3 && hdr[0] == 0x50345948 && hdr[1] == (int32_t) g.n_layers &&
-            hdr[2] == (int32_t) g.n_expert) {
-            bool ok = true;
+        auto read = [&](const std::string& path) {
+            if (path.empty()) return false;
+            FILE* f = std::fopen(path.c_str(), "rb");
+            if (!f) return false;
+            int32_t hdr[3] = {};
+            bool ok = std::fread(hdr, 4, 3, f) == 3 && hdr[0] == 0x50345948 && hdr[1] == (int32_t) g.n_layers &&
+                      hdr[2] == (int32_t) g.n_expert;
             for (Layer& l : m->layers) {
-                if (l.dense) continue;
-                l.use.assign((size_t) g.n_expert, 0.f);
-                ok = ok && std::fread(l.use.data(), 4, l.use.size(), f) == l.use.size();
+                if (l.dense || !ok) continue;
+                l.start.assign((size_t) g.n_expert, 0.f);
+                ok = std::fread(l.start.data(), 4, l.start.size(), f) == l.start.size();
+                double sum = 0;
+                for (const float v : l.start) sum += v > 0 ? v : 0;
+                for (float& v : l.start) v = sum > 0 && v > 0 ? (float) (v / sum) : 0.f;
             }
-            profile_loaded = ok;
+            std::fclose(f);
             if (!ok)
-                for (Layer& l : m->layers) l.use.clear();
+                for (Layer& l : m->layers) l.start.clear();
+            return ok;
+        };
+        if (read(save_path)) profile_from = save_path;
+        else if (read(profile_path)) profile_from = profile_path;
+        profile_loaded = !profile_from.empty();
+        if (!profile_loaded) return;
+        for (Layer& l : m->layers) {
+            if (l.dense) continue;
+            l.use.resize(l.start.size());
+            for (size_t e = 0; e < l.start.size(); ++e) l.use[e] = 1000.f * l.start[e];
         }
-        std::fclose(f);
     }
-    void save_profile() {
-        if (profile_path.empty()) return;
-        const std::string tmp = profile_path + ".tmp";
+    /// The learned profile: each layer's share of the run's routing and the start's share at equal weight (the run's
+    /// alone without a start); written once `save_every_min` minutes passed since the last (`force`: now)
+    void save_profile(bool force) {
+        if (save_path.empty()) return;
+        if (!force && (save_every_min <= 0 || ms_since(last_save) < save_every_min * 60000.0)) return;
+        last_save = Clock::now();
+        const std::string tmp = save_path + ".tmp";
         FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) return;
         const auto& g = m->g;
         const int32_t hdr[3] = {0x50345948, (int32_t) g.n_layers, (int32_t) g.n_expert};
         bool ok = std::fwrite(hdr, 4, 3, f) == 3;
-        for (const Layer& l : m->layers)
-            if (!l.dense) ok = ok && std::fwrite(l.use.data(), 4, l.use.size(), f) == l.use.size();
+        std::vector<float> share((size_t) g.n_expert);
+        for (const Layer& l : m->layers) {
+            if (l.dense) continue;
+            double sum = 0;
+            for (const float v : l.total) sum += v;
+            const bool run = sum > 0, base = !l.start.empty();
+            for (size_t e = 0; e < share.size(); ++e) {
+                const double r = run ? l.total[e] / sum : 0.0, b = base ? l.start[e] : 0.0;
+                share[e] = (float) (run && base ? 0.5 * (r + b) : run ? r : b);
+            }
+            ok = ok && std::fwrite(share.data(), 4, share.size(), f) == share.size();
+        }
         ok = std::fclose(f) == 0 && ok;
         if (ok) {
-            std::remove(profile_path.c_str());
-            std::rename(tmp.c_str(), profile_path.c_str());
+            std::remove(save_path.c_str());
+            std::rename(tmp.c_str(), save_path.c_str());
         }
     }
 
@@ -1372,9 +1412,13 @@ struct Serve {
         const long long hits = E.hits - hits0, lookups = E.lookups - lookups0;
         serve_print("DONE %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, reuse, hits, lookups, (long long) fresh);
-        const int swaps = E.rebalance(512);
-        E.save_profile();
-        if (swaps > 0) std::fprintf(stderr, "lamina: %d experts moved into VRAM slots\n", swaps);
+        const auto r0 = Clock::now();
+        const int swaps = E.rebalance(512, [&] {
+            std::lock_guard<std::mutex> lk(mu);
+            return eof || !lines.empty();
+        });
+        E.save_profile(false);
+        if (swaps > 0) std::fprintf(stderr, "lamina: %d experts moved into VRAM slots in %.0f ms\n", swaps, ms_since(r0));
         std::fprintf(stderr, "lamina: %zu prompt tokens (%zu reused) in %.1f ms, %lld generated in %.1f ms (%.2f tok/s), "
                      "%s\n", ids.size(), reuse, prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, finish);
@@ -1397,6 +1441,16 @@ struct Serve {
             cv.notify_one();
         });
         lamina::program::ReaderEnd reader_end{reader, io};
+        // Ctrl+C in the console ends the engine as QUIT does, before any request queued (the running one stops at its
+        // next token), then the exit work runs (the learned profile).  In-process the host handles it.
+        std::optional<lamina::platform::ConsoleQuit> console_quit;
+        if (!io.in_process)
+            console_quit.emplace([&] {
+                stop.store(true);
+                std::lock_guard<std::mutex> lk(mu);
+                lines.push_front("QUIT");
+                cv.notify_one();
+            });
         for (;;) {
             std::string line;
             {
@@ -1426,7 +1480,8 @@ int run_engine(int argc, char** argv, bool check_only) {
     int n_gen = 64, threads = 0;
     bool serve = false;
     double expert_vram = -1;
-    std::string profile;
+    std::string profile, profile_save;
+    double save_every = 1.0;
     bool graphs = true;
     std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
@@ -1456,6 +1511,8 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--serve") serve = true;
         else if (a == "--expert-vram") expert_vram = std::atof(next());
         else if (a == "--expert-profile") profile = next();
+        else if (a == "--expert-profile-save") profile_save = next();
+        else if (a == "--expert-profile-save-every") save_every = std::atof(next());
         else if (a == "--no-graph") graphs = false;
         else if (a == "--tier-gpus") {   // the expert tiers' GPUs (CUDA ordinals, the family switch's)
             for (const int32_t d : lamina::program::parse_ids(next())) tier_devs.push_back((int) d);
@@ -1475,12 +1532,16 @@ int run_engine(int argc, char** argv, bool check_only) {
     }
     Engine E;
     E.profile_path = profile;
+    E.save_path = profile_save;
+    E.save_every_min = save_every;
     E.use_graphs = graphs;
     E.init(m, max_ctx, threads);
     E.place_slots(expert_vram, tier_devs);
     if (serve) {
         Serve sv(E, m.eos);
-        return sv.run();
+        const int rc = sv.run();
+        E.save_profile(true);
+        return rc;
     }
     const std::vector<int32_t> prompt = lamina::program::parse_ids(tokens.c_str()),
                                forced = lamina::program::parse_ids(force.c_str());
@@ -1533,7 +1594,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     for (const Engine::Gpu& gp : E.gpus)
         std::fprintf(stderr, "lamina: GPU %d, %s: %.1f%% of the routed entries\n", gp.dev, gp.name.c_str(),
                      E.lookups ? 100.0 * (double) gp.hits / (double) E.lookups : 0.0);
-    E.save_profile();
+    E.save_profile(true);
     return 0;
 }
 
