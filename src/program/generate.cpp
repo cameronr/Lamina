@@ -169,6 +169,9 @@ struct Options {
     /// With --second-gpu, the prompt path's experts the main GPU's cache does not hold run on the second GPU
     /// (default); `--no-prompt-offload` streams them to the main GPU instead.
     bool no_prompt_offload = false;
+    /// --serve: a throw-away prompt part through the prompt path before READY (the kernels its first part loads);
+    /// `--no-warmup` leaves that to the first request.
+    bool no_warmup = false;
     /// verify windows of up to this many tokens: the last emitted one and spec - 1 drafts
     int spec = 0;
     /// Benchmarks: the run emits this continuation (token ids) instead of the window's pick, and a draft is
@@ -514,6 +517,8 @@ void usage() {
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native; auto: 16384)\n"
                  "  --no-prefill-borrow  the prompt path's buffers keep VRAM of their own for the whole session\n"
                  "                       instead of borrowing the expert caches' last slots while a prompt runs\n"
+                 "  --no-warmup          --serve: no throw-away prompt part before READY (the first request then\n"
+                 "                       loads the prompt path's kernels)\n"
                  "  --stats              print the per-stage breakdown\n"
                  "  --window-hashes PATH per verify window, a line with its round, first position and size, a 64-bit hash\n"
                  "                       of its final residual rows and its argmaxes: two builds that do the same\n"
@@ -1431,6 +1436,7 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
             }
             else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
             else if (a == "--no-prompt-offload") o.no_prompt_offload = true;
+            else if (a == "--no-warmup") o.no_warmup = true;
             else if (a == "--spec") o.spec = std::atoi(next("--spec"));
             else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
             else if (a == "--temperature") o.temperature = std::atof(next("--temperature"));
@@ -3775,6 +3781,28 @@ int lamina::program::run(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // A throw-away part of one chunk through the prompt path before READY: a fresh engine's first prompt loads
+        // each kernel it launches on each GPU (CUDA's lazy loading: a first 2K-token part 0.5 s slower than the next
+        // on IQ3_S), so the first request does not.  The lent slots come back from the arena as they were (not by the
+        // part's routing), the session is as at load, and the tiers and the learned profile do not count its routing.
+        if (!o.no_warmup) {
+            const Clock::time_point w0 = Clock::now();
+            const int64_t wn = std::min<int64_t>(2048, o.prefill_chunk);
+            const std::vector<int64_t> wtok((size_t) wn, 198);   // newlines: any token does
+            tier.apply_pending(true);
+            for (TierSlot& ts : tiers) ts.adapt.apply_pending(true);
+            pbuf.use_helper(true);
+            if ((kvg.on && !kvg_ensure(wn + 256)) || !pbuf.take(wn, err) || !prefill.run(wtok.data(), wn, 0, err) ||
+                !pbuf.give_back(*srcp, err)) {
+                std::fprintf(stderr, "lamina serve: the warm-up: %s\n", err.empty() ? "no VRAM for its cells" : err.c_str());
+                return 1;
+            }
+            prefill.clear_routed();
+            lamina::core::session_zero(ss, g, nullptr, main_cs);
+            cudaStreamSynchronize((cudaStream_t) main_cs);
+            std::fprintf(stderr, "lamina serve: warmed up in %.0f ms (a prompt part of %lld tokens)\n",
+                         std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), (long long) wn);
+        }
         // PP <done> <total> <ms> <tok/s>: the prompt's progress, one line per chunk (the server's progress and
         // keep-alives); `pp_at` is where the running segment starts, `pp_total` 0 outside a prompt
         int64_t pp_from = 0, pp_at = 0, pp_total = 0;
