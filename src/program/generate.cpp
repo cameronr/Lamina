@@ -347,15 +347,12 @@ const char* const kTierName[lamina::core::kMaxGpuTiers] = {"second", "third", "f
 double tier_value(const std::vector<double>& v, size_t t) { return v.empty() ? 0.0 : v[std::min(t, v.size() - 1)]; }
 
 /// --gpu's cards into the options the engine reads: the first card names the main GPU and gives its settings, the
-/// others name the tiers (tier_names, tier_cards).  False (said) for a card's setting its place does not take, or
-/// --gpu beside --main-gpu or --second-gpu.
-bool apply_cards(Options& o, bool named_otherwise) {
+/// others name the tiers (tier_names, tier_cards).  A --main-gpu after the last --gpu names the main GPU in the first
+/// card's place (its settings stay), a --second-gpu after it the tiers in the later cards' place (-1: none), as a later
+/// flag takes an earlier one's place.  False (said) for a card's setting its place does not take.
+bool apply_cards(Options& o, bool main_after, bool tiers_after) {
     using lamina::program::GpuCard;
     if (o.cards.empty()) return true;
-    if (named_otherwise) {
-        std::fprintf(stderr, "lamina: --gpu names the GPUs, and --main-gpu or --second-gpu does too: use --gpu alone\n");
-        return false;
-    }
     const GpuCard& m = o.cards[0];
     auto refuse = [&](const GpuCard& c, const char* why) {
         std::fprintf(stderr, "lamina: --gpu %s: %s\n", lamina::program::gpu_card_text(c).c_str(), why);
@@ -365,20 +362,23 @@ bool apply_cards(Options& o, bool named_otherwise) {
         if (o.cards.size() > 1) return refuse(m, "auto stands for every GPU: name the main GPU first, then auto");
         if (m.has_cache() || m.reserve || m.has_vram_only() || m.prefetch || m.clocks || m.sleep)
             return refuse(m, "auto as the first card takes no settings (name the main GPU to give it some)");
-        o.main_gpu_name = "0";
-        o.tier_names = {"auto"};
-        o.tier_cards = {GpuCard{"auto"}};
+        if (!main_after) o.main_gpu_name = "0";
+        if (!tiers_after) {
+            o.tier_names = {"auto"};
+            o.tier_cards = {GpuCard{"auto"}};
+        }
         return true;
     }
     if (m.prefetch || m.clocks || m.sleep)
         return refuse(m, "the main GPU takes cache, reserve and vram-only (prefetch, clocks and sleep are a tier's)");
-    o.main_gpu_name = m.name;
+    if (!main_after) o.main_gpu_name = m.name;
     if (m.cache_auto) o.expert_cache = -1;
     else if (m.cache_slots) o.expert_cache = (int) *m.cache_slots;
     else if (m.cache_bytes) o.expert_cache_bytes = *m.cache_bytes;
     if (m.reserve) o.vram_reserve_mib = (int) (*m.reserve >> 20);
     if (m.vram_only_auto) o.vram_pin_auto = true;
     else if (m.vram_only) o.vram_pin_gib = (double) *m.vram_only / 1073741824.0;
+    if (tiers_after) return true;   // --second-gpu's names, their settings the per-tier lists'
     o.tier_names.clear();
     o.tier_cards.clear();
     for (size_t i = 1; i < o.cards.size(); ++i) {
@@ -619,7 +619,8 @@ void usage(bool all = false) {
                  "                       host loop's)\n"
                  "\n"
                  "Older spellings, still taken (a card's own setting wins over them; a per-tier list's values go to the\n"
-                 "tiers in order, its last one to those past it):\n"
+                 "tiers in order, its last one to those past it; of --gpu, --main-gpu and --second-gpu the later takes\n"
+                 "the earlier's place: --second-gpu -1 after the cards, no tiers):\n"
                  "  --main-gpu GPU       the first --gpu's card\n"
                  "  --second-gpu G[,G,G] the later --gpu's cards, or auto (--tier-gpus the same; -1: none)\n"
                  "  --expert-cache N|auto  the main GPU's cache= (N slots; 0: the profile's count; default auto)\n"
@@ -1369,7 +1370,8 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
         const char* what;
     };
     bool have_tokens = false;
-    bool named_otherwise = false;   // --main-gpu or --second-gpu, which --gpu replaces
+    // the places of the last --gpu, --main-gpu and --second-gpu: a later one takes the earlier one's place
+    int last_gpu = 0, last_main = 0, last_tiers = 0;
     // the switches, each also as --no-<name>; a negative one (--no-warmup) as --<name> too (--warmup): the later wins
     struct Switch {
         const char* name;
@@ -1411,7 +1413,9 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                     std::fprintf(stderr, "lamina: --gpu %s\n", e.c_str());
                     return 2;
                 }
+                if (last_gpu < last_main || last_gpu < last_tiers) o.cards.clear();   // after the older flags: anew
                 o.cards.push_back(std::move(card));
+                last_gpu = i;
                 continue;
             }
             if (a == "--clocks-hold" || a == "--clocks-lead") {   // a time with its unit (the lead: or off)
@@ -1499,7 +1503,7 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                     continue;
                 }
                 if (a == "--second-gpu" || a == "--tier-gpus") {   // names, as --main-gpu's (a negative number: none)
-                    named_otherwise = true;
+                    last_tiers = i;
                     o.tier_names.clear();
                     std::stringstream names(next(a.c_str()));
                     for (std::string s; std::getline(names, s, ',');) {
@@ -1577,7 +1581,7 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
             else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
             else if (a == "--mtp") o.mtp = next("--mtp");
             else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-            else if (a == "--main-gpu") { o.main_gpu_name = next("--main-gpu"); named_otherwise = true; }
+            else if (a == "--main-gpu") { o.main_gpu_name = next("--main-gpu"); last_main = i; }
             else if (a == "--second-gpu-min-mb") o.second_gpu_min_mb = std::atof(next("--second-gpu-min-mb"));
             else if (a == "--vram-pin-gib") o.vram_pin_gib = std::atof(next("--vram-pin-gib"));
             else if (a == "--second-gpu-pin-gib") o.second_gpu_pin_gib = std::atof(next("--second-gpu-pin-gib"));
@@ -1626,7 +1630,7 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
         std::fprintf(stderr, "lamina: %s needs a value\n", m.what);
         return 2;
     }
-    if (!apply_cards(o, named_otherwise)) return 2;
+    if (!apply_cards(o, last_main > last_gpu, last_tiers > last_gpu)) return 2;
     if (o.max_context == 0) o.max_context = o.serve ? kTrainedContext : 4096;
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
