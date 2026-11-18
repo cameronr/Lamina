@@ -194,9 +194,10 @@ __global__ void k_head_q8_0(const uint8_t* w, const uint8_t* xq, float* y, int H
     y[(size_t) t * ldy + (size_t) h * ld_head_y + j] = acc;
 }
 
-/// The cached latent row of token t: [rms(kva[0:512]) * norm | roped kva[512:576]] as halves into cache row cell[t].
-/// Rope as k_rope_norm (one head of n_rot at 512).
-__global__ void k_kv_store(const float* kva, const float* norm, __half* cache, const int32_t* pos, int ring,
+/// The cached latent row of token t: [rms(kva[0:512]) * norm | roped kva[512:576]] as halves into the cache's row for
+/// position pos[t]: pos % ring in a ring, else pos - base (a buffer whose row 0 is position `base`).  Rope as
+/// k_rope_norm (one head of n_rot at 512).
+__global__ void k_kv_store(const float* kva, const float* norm, __half* cache, const int32_t* pos, int ring, int base,
                            float theta_scale, float eps) {
     __shared__ float sh[32];
     const int t = blockIdx.x;
@@ -205,7 +206,7 @@ __global__ void k_kv_store(const float* kva, const float* norm, __half* cache, c
     for (int i = threadIdx.x; i < kLatent; i += blockDim.x) s += r[i] * r[i];
     s = block_sum(s, sh);
     const float inv = rsqrtf(s / (float) kLatent + eps);
-    __half* dst = cache + (size_t) (ring ? pos[t] % ring : pos[t]) * kKvRow;
+    __half* dst = cache + (size_t) (ring ? pos[t] % ring : pos[t] - base) * kKvRow;
     for (int i = threadIdx.x; i < kLatent; i += blockDim.x) dst[i] = __float2half(r[i] * inv * norm[i]);
     const int i = threadIdx.x;
     if (i < (kKvRow - kLatent) / 2) {

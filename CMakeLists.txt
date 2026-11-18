@@ -744,7 +744,7 @@ if(LAMINA_NATIVE_EXPERTS)
     target_include_directories(lamina_hy4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(lamina_hy4 PRIVATE lamina_kernels lamina_kernels_cpu lamina_warnings lamina_serve_io
-                          CUDA::cudart)
+                          lamina_engine lamina_mmq CUDA::cublas CUDA::cudart)
     target_compile_options(lamina_hy4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
     add_executable(lamina-hy4 src/hy4/hy4_main.cpp)
     target_link_libraries(lamina-hy4 PRIVATE lamina_hy4 CUDA::cudart)

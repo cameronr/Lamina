@@ -12,10 +12,12 @@
 //   * generate mode: --tokens IDS [--n N] [--force IDS] [--dump-full-logits F] (bench/parity.py's interface through
 //     scratch/q36/logits_to_parity.py).
 #include "hy4_kernels.cuh"
+#include "hy4_prompt.cuh"
 
 #include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/artifact/gguf_split.hpp"
 #include "lamina/core/cuda_host.hpp"
+#include "lamina/core/gpu_select.hpp"
 #include "lamina/hy4/engine.hpp"
 #include "lamina/hy4/geometry.hpp"
 #include "lamina/kernels/bf16_gemv.hpp"
@@ -25,9 +27,11 @@
 #include "lamina/kernels/native_mmvq.hpp"
 #include "lamina/ngram/ple_reader.hpp"
 #include "lamina/platform/console_quit.hpp"
+#include "lamina/prefill/moe_mmq.hpp"
 #include "lamina/program/host_sampling.hpp"
 #include "lamina/program/serve_io.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -45,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <string>
@@ -130,6 +135,7 @@ constexpr int kMaxT = 8;              // rows a forward takes at most (native_mm
 constexpr int kTail = 16;             // the indexer's per-cell value / gate rows kept (four groups of 4)
 constexpr int kScoreBlocks = 128;     // the indexer scores' grid (a grid-stride loop over the groups)
 constexpr float kEngramEps = 1.1920929e-07f;   // the reference's unset RMSNorm eps: FLT_EPSILON
+constexpr size_t kWeightPad = 4096;   // zero bytes after each dense weight
 
 // ------------------------------------------------------------------------------------------------ the model
 struct Mat {
@@ -196,6 +202,7 @@ struct Model {
     std::string table_path;
     uint64_t table_off = 0;
     double arena_gib = 0;
+    size_t pinned = 0;   // the arena's bytes in pinned memory
     int32_t eos = -1;   // tokenizer.ggml.eos_token_id: the end of an answer
 };
 
@@ -222,8 +229,9 @@ struct Loader {
         const uint8_t* src = host(name, &t);
         if (ti) *ti = t;
         const uint64_t n = lamina::tensor_payload_bytes(*t);
-        uint8_t* d = dalloc<uint8_t>(n);
+        uint8_t* d = dalloc<uint8_t>(n + kWeightPad);   // MMQ's k loop reads past a short last row (zero activations)
         CK(cudaMemcpy(d, src, n, cudaMemcpyHostToDevice));
+        CK(cudaMemset(d + n, 0, kWeightPad));
         return d;
     }
     /// a Q8_0 matrix [n_in, n_out...]: its rows on the device
@@ -265,7 +273,7 @@ struct Loader {
     }
 };
 
-bool load(const std::string& path, Model& m, int threads, std::string& err) {
+bool load(const std::string& path, Model& m, int threads, double pin_gib, std::string& err) {
     const auto t0 = Clock::now();
     const lamina::GgufModel gm = lamina::GgufModel::open(path);
     if (std::string e = lamina::hy4::read_geometry(gm.meta(), m.g); !e.empty()) { err = e; return false; }
@@ -384,10 +392,29 @@ bool load(const std::string& path, Model& m, int threads, std::string& err) {
         s.gsz = lamina::tensor_payload_bytes(*tg) / (size_t) g.n_expert;
         s.dsz = lamina::tensor_payload_bytes(*td) / (size_t) g.n_expert;
         if (s.gsz != y.fmt.up_off || 2 * s.gsz + s.dsz != y.fmt.bytes) { err = p + "routed experts: unexpected blob layout"; return false; }
-        y.stride = (y.fmt.bytes + 63) & ~(size_t) 63;
-        y.arena = (uint8_t*) heap_new(y.stride * (size_t) g.n_expert);
+        {   // whole blocks of both types (MMQ reads expert e at e * stride), 64-byte aligned
+            int be = 0, bg = 0, bd = 0;
+            lamina::block_geometry((uint32_t) tg->type, be, bg);
+            lamina::block_geometry((uint32_t) td->type, be, bd);
+            const size_t unit = std::lcm(std::lcm((size_t) 64, (size_t) bg), (size_t) bd);
+            y.stride = (y.fmt.bytes + unit - 1) / unit * unit;
+        }
+        // pinned while the limit allows (the GPUs copy from it at their links' full rate, the host not waiting), else
+        // pageable
+        const size_t bytes = y.stride * (size_t) g.n_expert;
+        if ((double) (m.pinned + bytes) <= pin_gib * (double) (1ull << 30)) {
+            void* h = nullptr;
+            if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) == cudaSuccess) {
+                own(&Owned::pinned, h);
+                y.arena = (uint8_t*) h;
+                m.pinned += bytes;
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        if (!y.arena) y.arena = (uint8_t*) heap_new(bytes);
         if (!y.arena) { err = "out of host memory for the routed experts"; return false; }
-        total += y.stride * (size_t) g.n_expert;
+        total += bytes;
         src.push_back(s);
     }
     m.arena_gib = (double) total / (double) (1ull << 30);
@@ -407,8 +434,9 @@ bool load(const std::string& path, Model& m, int threads, std::string& err) {
     for (int i = 0; i < std::max(1, threads); ++i) th.emplace_back(copy);
     for (auto& t : th) t.join();
     std::fprintf(stderr, "lamina: Hy4-flash: %lld layers (+%lld MTP), dense weights on the GPU in %.1f s, the routed "
-                 "experts (%.1f GiB) in host memory in %.1f s\n", (long long) g.n_layers, (long long) g.n_mtp, dense_s,
-                 m.arena_gib, ms_since(t0) / 1000.0 - dense_s);
+                 "experts (%.1f GiB, %.1f of it pinned) in host memory in %.1f s\n", (long long) g.n_layers,
+                 (long long) g.n_mtp, dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30),
+                 ms_since(t0) / 1000.0 - dense_s);
     return true;
 }
 
@@ -611,6 +639,28 @@ struct Engine {
     }
 
     int64_t pos() const { return (int64_t) seq.size(); }
+
+    // ---- a prompt part: chunks through the prompt path (Prompt, when it is set up and the part has chunk_min tokens
+    // or more: pieces as even as chunk_cap allows), else forwards of kMaxT rows
+    std::function<void(const int32_t*, int)> chunk_fn;
+    int64_t chunk_cap = 0, chunk_min = 0;
+    /// n tokens into the state; `on(done)` after each piece (false: stop there).  Returns the logits row of the last
+    /// token (host_logits), -1 when stopped first.
+    int feed(const int32_t* toks, int64_t n, const std::function<bool(int64_t)>& on) {
+        int64_t done = 0;
+        int last = 0;
+        const bool chunks = chunk_fn && n >= chunk_min;
+        const int64_t pieces = chunks ? (n + chunk_cap - 1) / chunk_cap : 0, size = chunks ? (n + pieces - 1) / pieces : kMaxT;
+        while (done < n) {
+            const int T = (int) std::min<int64_t>(size, n - done);
+            if (chunks) chunk_fn(toks + done, T);
+            else forward(toks + done, T);
+            done += T;
+            last = chunks ? 0 : T - 1;
+            if (on && !on(done) && done < n) return -1;
+        }
+        return last;
+    }
 
     // ---- going back.  The sparse layers' cells and the pooled keys are by position: what a shorter state keeps is
     // already right.  The window layers' rings and the indexer's tail hold the last cells only: going back up to
@@ -823,7 +873,7 @@ struct Engine {
         quant(qnope, (int64_t) T * H, g.nope(), qnq);
         hy4k::k_head_q8_0<<<dim3((unsigned) ((H * hy4k::kLatent + 127) / 128), T), 128, 0, st>>>(
             l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow);
-        hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, l.theta,
+        hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta,
                                                        g.eps);
         const int32_t* cells = cells_swa;
         const int32_t* counts = n_swa;
@@ -1311,6 +1361,737 @@ struct Engine {
 
 int argmax(const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); }
 
+// ------------------------------------------------------------------------------------------------ the prompt path
+namespace MMQ = lamina::prefill::mmq;
+constexpr size_t kQ8Block = 144;   // bytes of a q8_1 block of MMQ's layout (128 values)
+
+/// A GPU's share of a prompt chunk's routed experts: the entries of the experts in its slots and, on the streaming GPU,
+/// of the experts no GPU holds (copied from the arena into two staging buffers in turn); their rows summed per token
+/// into `acc`, which a tier hands to the main GPU through pinned memory.
+struct MoeDev {
+    int gi = 0, dev = 0;
+    cudaStream_t st = nullptr, cst = nullptr;
+    cudaEvent_t done = nullptr, copied[2] = {}, used[2] = {};
+    std::unique_ptr<MMQ::Context> mmq;
+    uint8_t *tq = nullptr, *eq = nullptr, *hq = nullptr;
+    float *gu = nullptr, *h = nullptr, *rows = nullptr, *acc = nullptr;
+    int32_t *ident = nullptr, *plan = nullptr, *plan_h = nullptr;
+    int64_t ident_rows = 0;
+    float* acc_h = nullptr;
+    uint8_t* stage[2] = {};
+};
+
+/// The prompt path: a chunk of up to `cap` rows a forward.  The main GPU runs the projections on llama.cpp's MMQ (the
+/// Q8_0 weights read once a chunk), the attention a head group of 32 at a time on the tensor cores (the window layers
+/// over their cells in position order, the sparse ones over the indexer's pick, its scores on the tensor cores), the
+/// router and the shared expert; the routed experts run on every GPU that holds some (MMQ over its slots), the ones no
+/// GPU holds on the GPU with the fastest link, copied there from the arena.  The state it leaves is the decode's.
+struct Prompt {
+    Engine& E;
+    Model* m = nullptr;
+    int cap = 0;              // rows a chunk
+    int min_rows = 32;        // a shorter part goes through the decode's forwards
+    static constexpr int kG = hy4p::kQRows;   // heads a pass
+    static constexpr int kEmax = 4096;        // a group's entries at most
+    static constexpr int kStage = 32;         // experts a staging buffer
+    static constexpr int kSub = 512;          // rows a pass of Engram's and the dense FFN's products
+    int R = 0;                // the indexer's rows a pass
+    int streamer = 0;         // the devs index that runs the experts no GPU holds
+    cublasHandle_t blas = nullptr;
+    cudaStream_t st = nullptr;
+    cudaEvent_t routed = nullptr;
+    // the main GPU's rows
+    float *X = nullptr, *xh = nullptr, *xn = nullptr, *y = nullptr, *sy = nullptr, *emb = nullptr, *post = nullptr;
+    uint8_t *xq = nullptr, *qrq = nullptr, *hdq = nullptr, *oq = nullptr, *ikq = nullptr, *subq = nullptr, *fhq = nullptr,
+            *shq = nullptr, *mq = nullptr, *eraw = nullptr;
+    float *qa = nullptr, *kva = nullptr, *qg = nullptr, *ql = nullptr, *gt = nullptr;
+    float *iq = nullptr, *ik = nullptr, *iv = nullptr, *ig = nullptr, *iw = nullptr, *scores = nullptr;
+    float *erows = nullptr, *ekv = nullptr, *evalid = nullptr, *fg = nullptr, *fu = nullptr, *fh = nullptr;
+    float *logits_r = nullptr, *wts = nullptr, *rin = nullptr, *sg = nullptr, *su = nullptr, *sh = nullptr, *tmp = nullptr;
+    int32_t *ids = nullptr, *cells = nullptr, *ncells = nullptr, *hids = nullptr, *hb = nullptr, *tok_d = nullptr,
+            *pos_d = nullptr;
+    int64_t hids_rows = 0;
+    __half* lin = nullptr;
+    // the host's (pinned)
+    int32_t *h_ids = nullptr, *h_tok = nullptr, *h_pos = nullptr;
+    float *h_wts = nullptr, *h_valid = nullptr;
+    uint8_t *tq_h = nullptr, *h_raw = nullptr;
+    uint32_t* h_rows = nullptr;
+    std::vector<MoeDev> devs;   // [0] the main GPU, then the tiers in Engine::gpus' order
+    size_t stage_bytes = 0;
+    bool ok = false;
+    double ms_moe = 0, ms_copy = 0;
+    // LAMINA_HY4_PP_TRACE=1: every GPU waited for after each phase, the phases' sums printed after a chunk
+    const bool trace = std::getenv("LAMINA_HY4_PP_TRACE") != nullptr;
+    double ph[6] = {};
+    Clock::time_point ph_t;
+    void mark(int k) {
+        if (!trace) return;
+        for (const MoeDev& d : devs) {
+            lamina::core::DeviceScope ds(d.dev, main_dev, d.gi > 0);
+            CK(cudaDeviceSynchronize());
+        }
+        ph[k] += ms_since(ph_t);
+        ph_t = Clock::now();
+    }
+
+    explicit Prompt(Engine& e) : E(e), m(e.m) {}
+
+    /// The buffers of a chunk of `rows` on the main GPU and on each of `tier_devs` (before their slots take the rest);
+    /// false (with a note) where MMQ cannot run one of the model's products.
+    bool init(int rows, const std::vector<int>& tier_devs) {
+        const auto& g = m->g;
+        cap = std::max(kMaxT + 1, rows);
+        for (const Layer& l : m->layers) {
+            // every product's (type, rows) as the chunk runs it: the head-group slices, the per-head matrices
+            std::vector<std::pair<int, int64_t>> need{{l.q_a.type, l.q_a.n_out}, {l.q_b.type, kG * g.k_head},
+                                                      {l.kv_a.type, l.kv_a.n_out}, {l.wo.type, l.wo.n_out},
+                                                      {l.gate.type, kG * g.v_head}, {l.k_b.type, hy4k::kLatent},
+                                                      {l.v_b.type, g.v_head}};
+            for (const Mat* w : {&l.iq_b, &l.ik, &l.icv, &l.icg, &l.e_kv, &l.f_gate, &l.f_up, &l.f_down, &l.r_down,
+                                 &l.r_up, &l.s_gate, &l.s_up, &l.s_down})
+                if (w->d) need.emplace_back(w->type, w->n_out);
+            for (const auto& [t, r] : need)
+                if (!MMQ::fits(t, r)) {
+                    std::fprintf(stderr, "lamina: no MMQ for a [%lld rows] product of type %d: prompts read %d rows a "
+                                 "forward\n", (long long) r, t, kMaxT);
+                    return false;
+                }
+            if (!l.dense && (!MMQ::fits(l.fmt.gu_type, 2 * g.n_ff_exp) || !MMQ::fits(l.fmt.d_type, g.n_latent))) {
+                std::fprintf(stderr, "lamina: no MMQ for the routed experts' types (%d, %d): prompts read %d rows a "
+                             "forward\n", l.fmt.gu_type, l.fmt.d_type, kMaxT);
+                return false;
+            }
+        }
+        CK(cudaGetDevice(&main_dev));
+        st = E.st;
+        CK(cudaEventCreateWithFlags(&routed, cudaEventDisableTiming));
+        own(&Owned::events, routed);
+        if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "lamina: cuBLAS did not start: prompts read %d rows a forward\n", kMaxT);
+            return false;
+        }
+        const size_t T = (size_t) cap, N = (size_t) g.n_embd, hc = (size_t) g.hc, Ld = (size_t) g.n_latent,
+                     F = (size_t) g.n_ff_exp, Ex = (size_t) g.n_expert, K = (size_t) g.top_k;
+        size_t hmax = 0;
+        for (const Layer& l : m->layers) hmax = std::max<size_t>(hmax, (size_t) l.H);
+        X = dalloc<float>(T * hc * N);
+        xh = dalloc<float>(T * N);
+        xn = dalloc<float>(T * N);
+        y = dalloc<float>(T * N);
+        sy = dalloc<float>(T * N);
+        emb = dalloc<float>(T * N);
+        post = dalloc<float>(T * hc);
+        xq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) N));
+        qa = dalloc<float>(T * (size_t) g.q_lora);
+        qrq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, g.q_lora));
+        kva = dalloc<float>(T * (size_t) g.kv_row());
+        qg = dalloc<float>(T * kG * (size_t) g.k_head);
+        ql = dalloc<float>(T * kG * hy4k::kLatent);
+        gt = dalloc<float>(T * kG * (size_t) g.v_head);
+        hdq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) (kG * T), hy4k::kLatent));
+        oq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) (hmax * g.v_head)));
+        hids_rows = MMQ::ids_table_rows((int64_t) (kG * T), (int64_t) T);
+        hids = dalloc<int32_t>((size_t) hids_rows);
+        CK(cudaMemset(hids, 0, (size_t) hids_rows * 4));
+        hb = dalloc<int32_t>(kG + 1);
+        lin = dalloc<__half>(((size_t) g.n_swa + T) * hy4k::kKvRow);
+        const size_t ih = (size_t) g.idx_heads, idd = (size_t) g.idx_dim, ld = (size_t) (E.ctx / g.idx_pool);
+        iq = dalloc<float>(T * ih * idd);
+        ik = dalloc<float>(T * idd);
+        ikq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) idd));
+        iv = dalloc<float>(T * idd);
+        ig = dalloc<float>(T * idd);
+        iw = dalloc<float>(T * ih);
+        R = (int) std::max<size_t>(8, std::min<size_t>(T, ((size_t) 128 << 20) / (ld * 4)));
+        scores = dalloc<float>((size_t) R * ld);
+        cells = dalloc<int32_t>(T * (size_t) g.idx_top_k);
+        ncells = dalloc<int32_t>(T);
+        const size_t n_mod = g.eng_layers.size(), eh = (size_t) g.eng_heads(), ed = (size_t) g.eng_dim;
+        eraw = dalloc<uint8_t>(n_mod * T * eh * ed);
+        erows = dalloc<float>(T * eh * ed);
+        evalid = dalloc<float>(T);
+        const size_t sub = std::min<size_t>(T, kSub);
+        size_t widest = std::max<size_t>(eh * ed, N);
+        subq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) sub, (int64_t) std::max<size_t>(widest, (size_t) g.n_ff)));
+        ekv = dalloc<float>(sub * (hc + 1) * N);
+        fg = dalloc<float>(sub * (size_t) g.n_ff);
+        fu = dalloc<float>(sub * (size_t) g.n_ff);
+        fh = dalloc<float>(sub * (size_t) g.n_ff);
+        logits_r = dalloc<float>(T * Ex);
+        ids = dalloc<int32_t>(T * K);
+        wts = dalloc<float>(T * K);
+        rin = dalloc<float>(T * Ld);
+        sg = dalloc<float>(T * F);
+        su = dalloc<float>(T * F);
+        sh = dalloc<float>(T * F);
+        shq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) F));
+        mq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
+        tmp = dalloc<float>(T * Ld);
+        tok_d = dalloc<int32_t>(T);
+        pos_d = dalloc<int32_t>(T);
+        h_ids = halloc<int32_t>(T * K);
+        h_wts = halloc<float>(T * K);
+        h_tok = halloc<int32_t>(T);
+        h_pos = halloc<int32_t>(T);
+        h_valid = halloc<float>(T);
+        h_rows = halloc<uint32_t>(n_mod * T * eh);
+        h_raw = halloc<uint8_t>(n_mod * T * eh * ed);
+        tq_h = halloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
+        for (const Layer& l : m->layers) stage_bytes = std::max(stage_bytes, l.stride);
+        // the GPUs' shares: the main GPU, then the tiers
+        std::vector<int> all{main_dev};
+        all.insert(all.end(), tier_devs.begin(), tier_devs.end());
+        const size_t plan_n = T * K * 6 + 16384;
+        for (size_t i = 0; i < all.size(); ++i) {
+            lamina::core::DeviceScope ds(all[i], main_dev, i > 0);
+            MoeDev d;
+            d.gi = (int) i;
+            d.dev = all[i];
+            if (i == 0) {
+                d.st = st;
+            } else {
+                CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
+                own(&Owned::streams, d.st);
+            }
+            CK(cudaStreamCreateWithFlags(&d.cst, cudaStreamNonBlocking));
+            own(&Owned::streams, d.cst);
+            for (cudaEvent_t* e : {&d.done, &d.copied[0], &d.copied[1], &d.used[0], &d.used[1]}) {
+                CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+                own(&Owned::events, *e);
+            }
+            CK(cudaEventRecord(d.used[0], d.st));
+            CK(cudaEventRecord(d.used[1], d.st));
+            d.mmq = std::make_unique<MMQ::Context>();
+            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
+            d.eq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) Ld));
+            d.gu = dalloc<float>((size_t) kEmax * 2 * F);
+            d.h = dalloc<float>((size_t) kEmax * F);
+            d.hq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) F));
+            d.rows = dalloc<float>((size_t) kEmax * Ld);
+            d.acc = dalloc<float>(T * Ld);
+            d.ident_rows = MMQ::ids_table_rows(kEmax);
+            d.ident = dalloc<int32_t>((size_t) d.ident_rows);
+            MMQ::iota(d.ident, d.ident_rows, d.st);
+            d.plan = dalloc<int32_t>(plan_n);
+            d.plan_h = halloc<int32_t>(plan_n);
+            if (i > 0) d.acc_h = halloc<float>(T * Ld);
+            devs.push_back(std::move(d));
+        }
+        // the experts no GPU holds go to the GPU whose link copies fastest (core::probe_gpus: the links woken first)
+        double best = 0;
+        if (devs.size() > 1) {
+            std::vector<int> ords;
+            for (const MoeDev& d : devs) ords.push_back(d.dev);
+            const std::vector<lamina::core::GpuProbe> pr = lamina::core::probe_gpus(ords, main_dev);
+            for (size_t i = 0; i < pr.size(); ++i)
+                if (pr[i].h2d_gbps > best) {
+                    best = pr[i].h2d_gbps;
+                    streamer = (int) i;
+                }
+        }
+        {
+            lamina::core::DeviceScope ds(devs[(size_t) streamer].dev, main_dev, streamer > 0);
+            for (uint8_t*& s : devs[(size_t) streamer].stage) s = dalloc<uint8_t>((size_t) kStage * stage_bytes + 4096);
+        }
+        for (const MoeDev& d : devs) {
+            lamina::core::DeviceScope ds(d.dev, main_dev, d.gi > 0);
+            CK(cudaDeviceSynchronize());
+        }
+        CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) sizeof(hy4p::AttnSmem)));
+        CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) sizeof(hy4p::AttnSmem)));
+        std::fprintf(stderr, "lamina: prompts in chunks of up to %d rows; the experts no GPU holds on GPU %d%s\n", cap,
+                     devs[(size_t) streamer].dev,
+                     devs.size() > 1 ? (" (" + std::to_string((int) best) + " GB/s from pinned memory)").c_str() : "");
+        ok = true;
+        return true;
+    }
+    int main_dev = 0;
+
+    unsigned blocks(int64_t n) const { return (unsigned) ((n + hy4k::kThreads - 1) / hy4k::kThreads); }
+    void dense(const Mat& w, const uint8_t* x, int T, float* out, int64_t rows = 0, size_t row0 = 0, int64_t ld = 0) {
+        const int64_t r = rows ? rows : w.n_out;
+        const size_t row_bytes = (size_t) w.n_in / 32 * 34;
+        devs[0].mmq->run_dense(w.d + row0 * row_bytes, w.type, r, w.n_in, x, T, out, ld ? ld : r, st);
+    }
+    void q8(const float* x, int64_t rows, int64_t cols, uint8_t* out, int type = 8, const int32_t* map = nullptr,
+            int64_t ld = 0) {
+        MMQ::quantize(x, map, out, type, cols, ld ? ld : cols, rows, st);
+    }
+
+    /// T rows (tokens toks at positions pos() ..) through the model; the last row's logits into the engine's logits row 0.
+    void run(const int32_t* toks, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc;
+        const int64_t p0 = E.pos();
+        for (int t = 0; t < T; ++t) E.seq.push_back(toks[t]);
+        const auto tt = Clock::now();
+        const size_t n_mod = g.eng_layers.size(), eh = (size_t) g.eng_heads(), ed = (size_t) g.eng_dim;
+        std::vector<uint32_t> r(n_mod * eh);
+        for (int t = 0; t < T; ++t) {
+            engram_ids(g, E.seq, p0 + t, r.data(), h_valid[t]);
+            for (size_t e = 0; e < n_mod; ++e)
+                std::memcpy(h_rows + (e * (size_t) T + (size_t) t) * eh, r.data() + e * eh, eh * 4);
+            h_pos[t] = (int32_t) (p0 + t);
+            h_tok[t] = toks[t];
+        }
+        const lamina::ngram::PleReader::Ticket ticket = E.reader.issue(h_rows, n_mod * (size_t) T * eh, h_raw);
+        CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        hy4p::k_head_ids<<<(unsigned) ((kG * T + 255) / 256), 256, 0, st>>>(hids, kG, T);
+        hy4p::k_head_bounds<<<1, 64, 0, st>>>(hb, kG, T);
+        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, T, N, emb, st);
+        hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
+        std::string err;
+        if (!E.reader.collect(ticket, err)) {
+            std::fprintf(stderr, "lamina: the Engram table: %s\n", err.c_str());
+            throw Fatal{1};
+        }
+        E.table_ms += ms_since(tt);
+        CK(cudaMemcpyAsync(eraw, h_raw, n_mod * (size_t) T * eh * ed, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(evalid, h_valid, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        std::fill(std::begin(ph), std::end(ph), 0.0);
+        ph_t = Clock::now();
+        const auto c0 = Clock::now();
+        for (Layer& l : m->layers) {
+            front(l, T, p0);
+            mark(0);
+            if (l.dense) dense_ffn(l, T);
+            else moe(l, T);
+            mark(5);
+        }
+        // the head over the last row
+        const float* Xl = X + (size_t) (T - 1) * hc * N;
+        hy4k::k_hc_pre<<<1, 256, 0, st>>>(Xl, m->ohc_fn, m->ohc_scale, m->ohc_base, hc, N, hc, g.eps, g.hc_eps, 0.f,
+                                          nullptr, xh, m->out_norm, xn, g.eps);
+        K::bf16_gemv_fp32_mmvf_multi(xn, m->head, E.logits, N, g.n_vocab, 1, st);
+        ++E.forwards;
+        if (trace) {
+            mark(5);
+            std::fprintf(stderr, "lamina: chunk of %d rows at %lld: %.0f ms; attention and indexer %.0f, routing %.0f, plan "
+                         "%.0f, experts %.0f, the rest %.0f\n", T, (long long) p0, ms_since(c0), ph[0], ph[1], ph[2], ph[3],
+                         ph[5]);
+        }
+    }
+
+    /// Engram, the attention, and the FFN's input (xn, its q8_1 rows in xq; iHC's post weights in `post`)
+    void front(Layer& l, int T, int64_t p0) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc, H = l.H;
+        if (l.eng >= 0) {
+            const int ehn = (int) g.eng_heads(), edn = (int) g.eng_dim, w = ehn * edn;
+            hy4k::k_engram_rows<<<dim3(ehn, T), 128, 0, st>>>(eraw + (size_t) l.eng * T * w, l.e_lnorm, evalid, erows, ehn,
+                                                               edn, kEngramEps);
+            for (int r0 = 0; r0 < T; r0 += kSub) {
+                const int n = std::min(kSub, T - r0);
+                q8(erows + (size_t) r0 * w, n, w, subq);
+                dense(l.e_kv, subq, n, ekv);
+                hy4k::k_engram_mix<<<n, 256, 0, st>>>(X + (size_t) r0 * hc * N, ekv, l.e_kv_b, l.e_gate, l.e_gamma,
+                                                      l.e_hcs, evalid + r0, hc, N, kEngramEps);
+            }
+        }
+        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hca_fn, l.hca_scale, l.hca_base, hc, N, 2 * hc, g.eps, g.hc_eps,
+                                          g.hc_mag, post, xh, l.attn_norm, xn, g.eps);
+        q8(xn, T, N, xq);
+        dense(l.q_a, xq, T, qa);
+        hy4k::k_rms<<<T, hy4k::kThreads, 0, st>>>(qa, (int) g.q_lora, l.q_a_norm, qa, (int) g.q_lora, (int) g.q_lora, g.eps);
+        q8(qa, T, g.q_lora, qrq);
+        dense(l.kv_a, xq, T, kva);
+        const int64_t p_end = p0 + T;
+        const int ring = (int) E.ring, n_swa = (int) g.n_swa;
+        int lin0 = 0;
+        if (l.swa) {
+            // the window's cells in position order: the ring's before the chunk, then the chunk's; the ring keeps the last
+            lin0 = (int) std::max<int64_t>(0, p0 - n_swa + 1);
+            if (p0 > lin0) hy4p::k_copy_cells<<<(unsigned) (p0 - lin0), 64, 0, st>>>(l.kv, ring, lin, 0, lin0, lin0);
+            hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, lin, pos_d, 0, lin0, l.theta, g.eps);
+            const int64_t pa = std::max<int64_t>(p0, p_end - ring);
+            hy4p::k_copy_cells<<<(unsigned) (p_end - pa), 64, 0, st>>>(lin, 0, l.kv, ring, (int) pa, lin0);
+        } else {
+            hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, 0, 0, l.theta, g.eps);
+            indexer(l, T, p0);
+        }
+        const float scale = 1.0f / sqrtf((float) g.k_head);
+        const size_t kb_bytes = (size_t) hy4k::kLatent * ((size_t) g.nope() / 32 * 34);
+        const size_t vb_bytes = (size_t) g.v_head * ((size_t) hy4k::kLatent / 32 * 34);
+        for (int h0 = 0; h0 < H; h0 += kG) {
+            dense(l.q_b, qrq, T, qg, kG * g.k_head, (size_t) h0 * g.k_head);
+            hy4k::k_rope_norm<<<dim3(kG, T), 32, 0, st>>>(qg, kG, (int) g.k_head, (int) g.nope(), (int) g.n_rot, pos_d, 0,
+                                                          l.theta);
+            q8(qg, (int64_t) kG * T, g.nope(), hdq, 8, hids, g.k_head);
+            MMQ::Product kb;
+            kb.w = l.k_b.d + (size_t) h0 * kb_bytes;
+            kb.type = l.k_b.type;
+            kb.w_rows = hy4k::kLatent;
+            kb.w_cols = g.nope();
+            kb.expert_bytes = kb_bytes;
+            kb.n = kG;
+            kb.xq = hdq;
+            kb.bounds = hb;
+            kb.ids = hids;
+            kb.ids_rows = hids_rows;
+            kb.total_rows = (int64_t) kG * T;
+            kb.max_rows = T;
+            kb.dst = ql;
+            kb.ld_dst = hy4k::kLatent;
+            devs[0].mmq->run(kb, st);
+            if (l.swa)
+                hy4p::k_attn_prompt<false><<<T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, lin, nullptr, nullptr, 0, pos_d,
+                                                                                  n_swa, lin0, l.sinks + h0, scale);
+            else
+                hy4p::k_attn_prompt<true><<<T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, l.kv, cells, ncells,
+                                                                                 (int) g.idx_top_k, pos_d, 0, 0,
+                                                                                 l.sinks + h0, scale);
+            q8(ql, (int64_t) kG * T, hy4k::kLatent, hdq, 8, hids);
+            MMQ::Product vb = kb;
+            vb.w = l.v_b.d + (size_t) h0 * vb_bytes;
+            vb.type = l.v_b.type;
+            vb.w_rows = g.v_head;
+            vb.w_cols = hy4k::kLatent;
+            vb.expert_bytes = vb_bytes;
+            vb.dst = qg;
+            vb.ld_dst = g.v_head;
+            devs[0].mmq->run(vb, st);
+            dense(l.gate, xq, T, gt, kG * g.v_head, (size_t) h0 * g.v_head);
+            const int64_t n_o = (int64_t) T * kG * g.v_head;
+            hy4k::k_gate_mul<<<blocks(n_o), hy4k::kThreads, 0, st>>>(qg, gt, n_o);
+            // into the wo input's column blocks of these heads
+            q8(qg, T, (int64_t) kG * g.v_head, oq + (size_t) h0 * g.v_head / 128 * T * kQ8Block);
+        }
+        dense(l.wo, oq, T, y);
+        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_attn, N, g.eps);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
+        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hcf_fn, l.hcf_scale, l.hcf_base, hc, N, 2 * hc, g.eps, g.hc_eps,
+                                          g.hc_mag, post, xh, l.ffn_norm, xn, g.eps);
+        q8(xn, T, N, xq);
+    }
+
+    /// The sparse layer's indexer over a chunk: its rows' keys pooled into the groups they complete (the tail's cells
+    /// before the chunk), the tail's last cells, each row's cells (every position while its visible groups are within
+    /// the reach, else the top groups' by the tensor-core scores, R rows a pass).
+    void indexer(Layer& l, int T, int64_t p0) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, ih = (int) g.idx_heads, idd = (int) g.idx_dim, pool_n = (int) g.idx_pool;
+        dense(l.iq_b, qrq, T, iq);
+        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, st>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, pos_d, 0, l.theta);
+        dense(l.ik, xq, T, ik);
+        hy4k::k_rms<<<T, 128, 0, st>>>(ik, idd, l.ik_norm, ik, idd, idd, g.eps);
+        q8(ik, T, idd, ikq);
+        dense(l.icv, ikq, T, iv);
+        dense(l.icg, ikq, T, ig);
+        const int64_t p_end = p0 + T;
+        const int64_t g_a = (p0 + pool_n) / pool_n - 1, g_b = p_end / pool_n;   // the groups the chunk completes
+        if (g_b > g_a)
+            hy4p::k_pool_chunk<<<(unsigned) (g_b - g_a), idd, 0, st>>>(iv, ig, l.tail, kTail, (int) p0, (int) g_a, idd,
+                                                                      pool_n, l.ape, l.ipool_norm, g.eps, l.theta,
+                                                                      (int) g.n_rot, l.pooled);
+        const int keep = std::min(T, kTail);
+        hy4k::k_tail_store<<<keep, 128, 0, st>>>(iv + (size_t) (T - keep) * idd, ig + (size_t) (T - keep) * idd, l.tail,
+                                                 pos_d + (T - keep), kTail, idd);
+        hy4k::k_gemv_f32<<<dim3((unsigned) ((ih + 7) / 8), T), 256, 0, st>>>(l.iproj, xn, iw, N, ih,
+                                                                           1.0f / sqrtf((float) (idd * ih)));
+        const int reach = (int) (g.idx_top_k / pool_n - (g.idx_tail ? 1 : 0));
+        const int ld = (int) (E.ctx / pool_n);
+        for (int r0 = 0; r0 < T; r0 += R) {
+            const int rr = std::min(R, T - r0);
+            const int vis_max = (int) ((p0 + r0 + rr - 1) / pool_n);
+            static const bool f32 = std::getenv("LAMINA_HY4_IDX_F32") != nullptr;   // the decode's FP32 scores (A/B)
+            if (vis_max > reach && f32) {
+                const size_t smem = ((size_t) ih * idd + ih) * sizeof(float);
+                hy4k::k_index_scores_pos<<<dim3(kScoreBlocks, rr), 256, smem, st>>>(
+                    iq + (size_t) r0 * ih * idd, iw + (size_t) r0 * ih, l.pooled, pos_d + r0, pool_n, reach, ih, idd,
+                    scores, ld);
+            } else if (vis_max > reach) {
+                const int splits = std::max(1, std::min(64, (vis_max + 1023) / 1024));
+                const int per = (vis_max + splits - 1) / splits / hy4p::kIdxTile * hy4p::kIdxTile + hy4p::kIdxTile;
+                hy4p::k_index_scores_mma<<<dim3((unsigned) ((rr + 7) / 8), (unsigned) splits), 256, 0, st>>>(
+                    iq, iw, l.pooled, pos_d, pool_n, reach, r0, rr, per, scores, ld);
+            }
+            hy4k::k_select_cells<<<rr, 1024, 0, st>>>(scores, ld, pos_d + r0, pool_n, reach,
+                                                      cells + (size_t) r0 * g.idx_top_k, (int) g.idx_top_k, ncells + r0);
+        }
+    }
+
+    void dense_ffn(Layer& l, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc, FF = (int) g.n_ff;
+        for (int r0 = 0; r0 < T; r0 += kSub) {
+            const int n = std::min(kSub, T - r0);
+            q8(xn + (size_t) r0 * N, n, N, subq);
+            dense(l.f_gate, subq, n, fg);
+            dense(l.f_up, subq, n, fu);
+            hy4k::k_swiglu<<<blocks((int64_t) n * FF), hy4k::kThreads, 0, st>>>(fg, fu, fh, (int64_t) n * FF);
+            q8(fh, n, FF, subq);
+            dense(l.f_down, subq, n, y + (size_t) r0 * N);
+        }
+        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
+    }
+
+    // ---- the routed experts.  The host takes each layer's routing, hands every entry to a GPU (its expert's slot, else
+    // the streamer, which copies the expert from the arena) and plans each GPU's groups: experts of consecutive blobs
+    // whose entries (up to kEmax) run as one MMQ product, their rows summed into the tokens' sums in pick order.
+    struct Group {
+        const uint8_t* w = nullptr;   // the first expert's blob on its GPU
+        int n = 0, n_ent = 0, max_rows = 0, n_runs = 0;
+        int o_bounds = 0, o_tok = 0, o_rtok = 0, o_rstart = 0, o_rent = 0, o_rw = 0;   // into the plan (int32)
+    };
+    struct Batch {                    // the streamer's experts copied into one staging buffer, and its groups
+        std::vector<int32_t> experts;
+        int g0 = 0, g1 = 0;
+    };
+    struct DevPlan {
+        std::vector<int32_t> P;
+        std::vector<Group> groups;    // the batches' groups first, then the slots'
+        std::vector<Batch> batches;
+        int n_slot_groups = 0;
+    };
+    std::vector<DevPlan> plans;
+    std::vector<std::vector<std::vector<int32_t>>> slot_ents;   // [dev][slot]: entries
+    std::vector<std::vector<int32_t>> free_ents;                // [expert]: entries no GPU holds
+
+    /// Groups over (blob index, entries) in ascending blob order from `base` (`stride` apart), split at kEmax entries
+    void add_groups(DevPlan& dp, const uint8_t* base, size_t stride,
+                    const std::vector<std::pair<int, const std::vector<int32_t>*>>& seq) {
+        const int K = (int) m->g.top_k;
+        std::vector<int32_t>& P = dp.P;
+        size_t i = 0, off = 0;
+        std::vector<int32_t> ents, cnt;
+        std::vector<int> loc;
+        while (i < seq.size()) {
+            ents.clear();
+            cnt.clear();
+            const int ja = seq[i].first;
+            while (i < seq.size() && (int) ents.size() < kEmax) {
+                const int j = seq[i].first;
+                const std::vector<int32_t>& v = *seq[i].second;
+                const size_t take = std::min<size_t>((size_t) kEmax - ents.size(), v.size() - off);
+                cnt.resize((size_t) (j - ja + 1), 0);
+                cnt[(size_t) (j - ja)] += (int32_t) take;
+                ents.insert(ents.end(), v.begin() + (ptrdiff_t) off, v.begin() + (ptrdiff_t) (off + take));
+                off += take;
+                if (off < v.size()) break;   // the rest of this expert's entries: the next group
+                ++i;
+                off = 0;
+            }
+            Group gr;
+            gr.w = base + (size_t) ja * stride;
+            gr.n = (int) cnt.size();
+            gr.n_ent = (int) ents.size();
+            gr.max_rows = *std::max_element(cnt.begin(), cnt.end());
+            gr.o_bounds = (int) P.size();
+            int32_t acc = 0;
+            P.push_back(0);
+            for (const int32_t c : cnt) P.push_back(acc += c);
+            gr.o_tok = (int) P.size();
+            for (const int32_t e : ents) P.push_back(e / K);
+            // the runs: the group's entries by token, in pick order
+            loc.resize(ents.size());
+            for (size_t k = 0; k < loc.size(); ++k) loc[k] = (int) k;
+            std::sort(loc.begin(), loc.end(), [&](int a, int b) { return ents[(size_t) a] < ents[(size_t) b]; });
+            std::vector<int32_t> rtok, rstart;
+            for (size_t k = 0; k < loc.size(); ++k) {
+                const int32_t tk = ents[(size_t) loc[k]] / K;
+                if (rtok.empty() || rtok.back() != tk) {
+                    rtok.push_back(tk);
+                    rstart.push_back((int32_t) k);
+                }
+            }
+            rstart.push_back((int32_t) loc.size());
+            gr.n_runs = (int) rtok.size();
+            gr.o_rtok = (int) P.size();
+            P.insert(P.end(), rtok.begin(), rtok.end());
+            gr.o_rstart = (int) P.size();
+            P.insert(P.end(), rstart.begin(), rstart.end());
+            gr.o_rent = (int) P.size();
+            for (const int k : loc) P.push_back(k);
+            gr.o_rw = (int) P.size();
+            for (const int k : loc) {
+                int32_t bits;
+                std::memcpy(&bits, &h_wts[ents[(size_t) k]], 4);
+                P.push_back(bits);
+            }
+            dp.groups.push_back(gr);
+        }
+    }
+
+    void plan_layer(Layer& l, int T) {
+        const auto& g = m->g;
+        const int K = (int) g.top_k, nE = (int) g.n_expert;
+        const size_t nd = devs.size();
+        plans.assign(nd, DevPlan{});
+        slot_ents.resize(nd);
+        for (size_t d = 0; d < nd; ++d) {
+            slot_ents[d].resize((size_t) l.held[d].n);
+            for (auto& v : slot_ents[d]) v.clear();
+        }
+        free_ents.resize((size_t) nE);
+        for (auto& v : free_ents) v.clear();
+        int64_t on_gpus = 0;
+        for (int e = 0; e < T * K; ++e) {
+            const int x = h_ids[e];
+            l.use[(size_t) x] += 1.f;
+            l.total[(size_t) x] += 1.f;
+            int holder = -1;
+            for (size_t d = 0; d < nd && holder < 0; ++d)
+                if (l.held[d].n > 0 && l.held[d].slot_of[(size_t) x] >= 0) holder = (int) d;
+            if (holder >= 0) {
+                slot_ents[(size_t) holder][(size_t) l.held[(size_t) holder].slot_of[(size_t) x]].push_back(e);
+                ++E.gpus[(size_t) holder].hits;
+                ++on_gpus;
+            } else {
+                free_ents[(size_t) x].push_back(e);
+            }
+        }
+        E.lookups += (int64_t) T * K;
+        E.hits += on_gpus;
+        std::vector<std::pair<int, const std::vector<int32_t>*>> seq;
+        for (size_t d = 0; d < nd; ++d) {
+            DevPlan& dp = plans[d];
+            if ((int) d == streamer) {   // the experts no GPU holds, kStage a staging buffer
+                std::vector<int32_t> used;
+                for (int x = 0; x < nE; ++x)
+                    if (!free_ents[(size_t) x].empty()) used.push_back(x);
+                for (size_t b0 = 0; b0 < used.size(); b0 += kStage) {
+                    Batch bt;
+                    bt.experts.assign(used.begin() + (ptrdiff_t) b0,
+                                      used.begin() + (ptrdiff_t) std::min(used.size(), b0 + kStage));
+                    seq.clear();
+                    for (size_t j = 0; j < bt.experts.size(); ++j)
+                        seq.emplace_back((int) j, &free_ents[(size_t) bt.experts[j]]);
+                    bt.g0 = (int) dp.groups.size();
+                    add_groups(dp, devs[d].stage[dp.batches.size() % 2], l.stride, seq);
+                    bt.g1 = (int) dp.groups.size();
+                    dp.batches.push_back(std::move(bt));
+                }
+            }
+            seq.clear();
+            for (int s = 0; s < l.held[d].n; ++s)
+                if (!slot_ents[d][(size_t) s].empty()) seq.emplace_back(s, &slot_ents[d][(size_t) s]);
+            const size_t g_before = dp.groups.size();
+            add_groups(dp, l.held[d].slots, l.stride, seq);
+            dp.n_slot_groups = (int) (dp.groups.size() - g_before);
+        }
+    }
+
+    void run_group(MoeDev& d, Layer& l, int T, const Group& gr) {
+        const auto& g = m->g;
+        const int Ld = (int) g.n_latent, F = (int) g.n_ff_exp;
+        hy4p::k_gather_q8<<<gr.n_ent, 128, 0, d.st>>>(reinterpret_cast<const uint4*>(d.tq), reinterpret_cast<uint4*>(d.eq),
+                                                      d.plan + gr.o_tok, gr.n_ent, T, Ld / 128);
+        MMQ::Product gu;
+        gu.w = gr.w;
+        gu.type = l.fmt.gu_type;
+        gu.w_rows = 2 * F;
+        gu.w_cols = Ld;
+        gu.expert_bytes = l.stride;
+        gu.n = gr.n;
+        gu.xq = d.eq;
+        gu.bounds = d.plan + gr.o_bounds;
+        gu.ids = d.ident;
+        gu.ids_rows = d.ident_rows;
+        gu.total_rows = gr.n_ent;
+        gu.max_rows = gr.max_rows;
+        gu.dst = d.gu;
+        gu.ld_dst = 2 * F;
+        d.mmq->run(gu, d.st);
+        const int64_t nh = (int64_t) gr.n_ent * F;
+        hy4p::k_swiglu_split<<<blocks(nh), hy4k::kThreads, 0, d.st>>>(d.gu, d.h, F, nh, l.fmt.swiglu_limit);
+        MMQ::quantize(d.h, nullptr, d.hq, l.fmt.d_type, F, F, gr.n_ent, d.st);
+        MMQ::Product dn = gu;
+        dn.w = gr.w + l.fmt.down_off;
+        dn.type = l.fmt.d_type;
+        dn.w_rows = Ld;
+        dn.w_cols = F;
+        dn.xq = d.hq;
+        dn.dst = d.rows;
+        dn.ld_dst = Ld;
+        d.mmq->run(dn, d.st);
+        hy4p::k_accum_runs<<<gr.n_runs, 256, 0, d.st>>>(d.rows, d.plan + gr.o_rtok, d.plan + gr.o_rstart, d.plan + gr.o_rent,
+                                                        reinterpret_cast<const float*>(d.plan + gr.o_rw), d.acc, Ld);
+    }
+
+    void enqueue(MoeDev& d, Layer& l, int T) {
+        const auto& g = m->g;
+        const int Ld = (int) g.n_latent;
+        DevPlan& dp = plans[(size_t) d.gi];
+        lamina::core::DeviceScope ds(d.dev, main_dev, d.gi > 0);
+        std::memcpy(d.plan_h, dp.P.data(), dp.P.size() * 4);
+        CK(cudaMemcpyAsync(d.plan, d.plan_h, dp.P.size() * 4, cudaMemcpyHostToDevice, d.st));
+        CK(cudaMemsetAsync(d.acc, 0, (size_t) T * Ld * 4, d.st));
+        if (d.gi > 0) CK(cudaMemcpyAsync(d.tq, tq_h, MMQ::q8_bytes(T, Ld), cudaMemcpyHostToDevice, d.st));
+        const size_t n_batch_groups = dp.groups.size() - (size_t) dp.n_slot_groups;
+        for (size_t gi = n_batch_groups; gi < dp.groups.size(); ++gi) run_group(d, l, T, dp.groups[gi]);
+        for (size_t b = 0; b < dp.batches.size(); ++b) {
+            const Batch& bt = dp.batches[b];
+            const int buf = (int) (b % 2);
+            CK(cudaStreamWaitEvent(d.cst, d.used[buf], 0));
+            for (size_t j = 0; j < bt.experts.size(); ++j)
+                CK(cudaMemcpyAsync(d.stage[buf] + j * l.stride, l.arena + (size_t) bt.experts[j] * l.stride, l.fmt.bytes,
+                                   cudaMemcpyHostToDevice, d.cst));
+            CK(cudaEventRecord(d.copied[buf], d.cst));
+            CK(cudaStreamWaitEvent(d.st, d.copied[buf], 0));
+            for (int gi = bt.g0; gi < bt.g1; ++gi) run_group(d, l, T, dp.groups[(size_t) gi]);
+            CK(cudaEventRecord(d.used[buf], d.st));
+        }
+        if (d.gi > 0) {
+            CK(cudaMemcpyAsync(d.acc_h, d.acc, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, d.st));
+            CK(cudaEventRecord(d.done, d.st));
+        }
+    }
+
+    void moe(Layer& l, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc, nE = (int) g.n_expert, K = (int) g.top_k, Ld = (int) g.n_latent,
+                  F = (int) g.n_ff_exp;
+        const float one = 1.f, zero = 0.f;
+        if (cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, nE, T, N, &one, l.router, N, xn, N, &zero, logits_r, nE) !=
+            CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "lamina: cublasSgemm (the router) failed\n");
+            throw Fatal{1};
+        }
+        hy4k::k_route<<<T, std::max(32, ((nE + 31) / 32) * 32), 0, st>>>(logits_r, l.bias, nE, K, g.w_norm, g.w_scale, ids,
+                                                                          wts);
+        dense(l.r_down, xq, T, rin);
+        MoeDev& d0 = devs[0];
+        q8(rin, T, Ld, d0.tq, l.fmt.gu_type);
+        CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(h_wts, wts, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
+        if (devs.size() > 1) CK(cudaMemcpyAsync(tq_h, d0.tq, MMQ::q8_bytes(T, Ld), cudaMemcpyDeviceToHost, st));
+        CK(cudaEventRecord(routed, st));
+        CK(cudaEventSynchronize(routed));
+        mark(1);
+        const auto t0 = Clock::now();
+        plan_layer(l, T);
+        mark(2);
+        if (streamer != 0) enqueue(d0, l, T);
+        for (size_t d = 1; d < devs.size(); ++d)
+            if ((int) d != streamer) enqueue(devs[d], l, T);
+        enqueue(devs[(size_t) streamer], l, T);
+        // the shared expert
+        dense(l.s_gate, xq, T, sg);
+        dense(l.s_up, xq, T, su);
+        hy4k::k_swiglu<<<blocks((int64_t) T * F), hy4k::kThreads, 0, st>>>(sg, su, sh, (int64_t) T * F);
+        q8(sh, T, F, shq);
+        dense(l.s_down, shq, T, sy);
+        // the tiers' sums, in their order
+        for (size_t d = 1; d < devs.size(); ++d) {
+            CK(cudaStreamWaitEvent(st, devs[d].done, 0));
+            CK(cudaMemcpyAsync(tmp, devs[d].acc_h, (size_t) T * Ld * 4, cudaMemcpyHostToDevice, st));
+            hy4k::k_add<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(d0.acc, tmp, (int64_t) T * Ld);
+        }
+        ms_moe += ms_since(t0);
+        mark(3);
+        q8(d0.acc, T, Ld, mq);
+        dense(l.r_up, mq, T, y);
+        hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(y, sy, (int64_t) T * N);
+        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
+    }
+};
+
 // ------------------------------------------------------------------------------------------------ serve
 /// lamina-server's engine protocol, one request at a time: GEN <max_new> [key=value ...] <ids> -> RESUME (the tokens
 /// the state already held), PP lines while the prompt is read, a T line a token, DONE; STOP ends a request at its next
@@ -1366,18 +2147,16 @@ struct Serve {
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         int64_t done = 0;
         auto last_pp = Clock::now();
-        bool cancelled = false;
-        while (done < fresh) {
-            const int T = (int) std::min<int64_t>(kMaxT, fresh - done);
-            E.forward(ids.data() + reuse + done, T);
-            done += T;
+        const int last = E.feed(ids.data() + reuse, fresh, [&](int64_t d) {
+            done = d;
             if (done == fresh || ms_since(last_pp) > 250) {
                 serve_print("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                             (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
                 last_pp = Clock::now();
             }
-            if (stop.load() && done < fresh) { cancelled = true; break; }
-        }
+            return !stop.load();
+        });
+        const bool cancelled = last < 0;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
             serve_print("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse,
@@ -1385,7 +2164,7 @@ struct Serve {
             return;
         }
         if (fresh > 0) {
-            E.host_logits((int) ((fresh - 1) % kMaxT), lg);
+            E.host_logits(last, lg);
             E.snapshot(lg);
         }
         std::mt19937_64 rng(smp.seed);
@@ -1483,6 +2262,8 @@ int run_engine(int argc, char** argv, bool check_only) {
     std::string profile, profile_save;
     double save_every = 1.0;
     bool graphs = true;
+    int prefill = 4096, prefill_min = 24;
+    double arena_pin = 72;
     std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1514,6 +2295,9 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--expert-profile-save") profile_save = next();
         else if (a == "--expert-profile-save-every") save_every = std::atof(next());
         else if (a == "--no-graph") graphs = false;
+        else if (a == "--prefill") prefill = std::atoi(next());            // rows a prompt chunk (0: the decode's forwards)
+        else if (a == "--prefill-min") prefill_min = std::atoi(next());    // a shorter prompt part: the decode's forwards
+        else if (a == "--arena-pin") arena_pin = std::atof(next());        // GiB of the arena in pinned memory at most
         else if (a == "--tier-gpus") {   // the expert tiers' GPUs (CUDA ordinals, the family switch's)
             for (const int32_t d : lamina::program::parse_ids(next())) tier_devs.push_back((int) d);
         }
@@ -1526,7 +2310,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     if (check_only) return 0;
     Model m;
     std::string err;
-    if (!load(model, m, 8, err)) {
+    if (!load(model, m, 8, arena_pin, err)) {
         std::fprintf(stderr, "lamina: %s\n", err.c_str());
         return 1;
     }
@@ -1536,6 +2320,12 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.save_every_min = save_every;
     E.use_graphs = graphs;
     E.init(m, max_ctx, threads);
+    Prompt P(E);   // its buffers before the slots take the GPUs' free memory
+    if (prefill > 0 && P.init(prefill, tier_devs)) {
+        E.chunk_fn = [&P](const int32_t* t, int n) { P.run(t, n); };
+        E.chunk_cap = P.cap;
+        E.chunk_min = std::max(1, prefill_min);
+    }
     E.place_slots(expert_vram, tier_devs);
     if (serve) {
         Serve sv(E, m.eos);
@@ -1560,12 +2350,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     }
     FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");
     const auto t0 = Clock::now();
-    int last = 0;
-    for (size_t i = 0; i < prompt.size(); i += kMaxT) {
-        const int T = (int) std::min<size_t>(kMaxT, prompt.size() - i);
-        E.forward(prompt.data() + i, T);
-        last = T - 1;
-    }
+    const int last = E.feed(prompt.data(), (int64_t) prompt.size(), nullptr);
     std::vector<float> lg;
     E.host_logits(last, lg);
     const double pp_ms = ms_since(t0);
