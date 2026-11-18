@@ -27,6 +27,7 @@
 #include "lamina/kernels/native_mmvq.hpp"
 #include "lamina/ngram/ple_reader.hpp"
 #include "lamina/platform/console_quit.hpp"
+#include "lamina/platform/memory.hpp"
 #include "lamina/prefill/moe_mmq.hpp"
 #include "lamina/program/host_sampling.hpp"
 #include "lamina/program/serve_io.hpp"
@@ -649,18 +650,30 @@ struct Engine {
     int feed(const int32_t* toks, int64_t n, const std::function<bool(int64_t)>& on) {
         int64_t done = 0;
         int last = 0;
-        const bool chunks = chunk_fn && n >= chunk_min;
-        const int64_t pieces = chunks ? (n + chunk_cap - 1) / chunk_cap : 0, size = chunks ? (n + pieces - 1) / pieces : kMaxT;
         while (done < n) {
-            const int T = (int) std::min<int64_t>(size, n - done);
-            if (chunks) chunk_fn(toks + done, T);
-            else forward(toks + done, T);
-            done += T;
-            last = chunks ? 0 : T - 1;
-            if (on && !on(done) && done < n) return -1;
+            // a segment up to the next multiple of kSnapEvery (a snapshot there) or the end, in even pieces
+            const int64_t p = pos(), seg = std::min<int64_t>(n - done, (p / kSnapEvery + 1) * kSnapEvery - p);
+            const bool chunks = chunk_fn && seg >= chunk_min;
+            const int64_t step = chunks ? chunk_cap : kMaxT, pieces = (seg + step - 1) / step,
+                          size = (seg + pieces - 1) / pieces;
+            for (int64_t sd = 0; sd < seg;) {
+                const int T = (int) std::min<int64_t>(size, seg - sd);
+                if (chunks) chunk_fn(toks + done + sd, T);
+                else forward(toks + done + sd, T);
+                sd += T;
+                last = chunks ? 0 : T - 1;
+                if (on && !on(done + sd) && done + sd < n) return -1;
+            }
+            done += seg;
+            if (pos() % kSnapEvery == 0 && done < n) {
+                std::vector<float> lg;
+                host_logits(last, lg);
+                snapshot(lg, true);
+            }
         }
         return last;
     }
+
 
     // ---- going back.  The sparse layers' cells and the pooled keys are by position: what a shorter state keeps is
     // already right.  The window layers' rings and the indexer's tail hold the last cells only: going back up to
@@ -670,9 +683,11 @@ struct Engine {
         int64_t pos = 0;
         std::vector<uint8_t> bytes;   // every window layer's ring, then every indexer layer's tail
         std::vector<float> logits;    // the last row's (the next token's distribution there)
+        bool mark = false;            // taken at a multiple of kSnapEvery during a read (kept), else at a prompt's end
     };
     std::vector<Snap> snaps;
-    static constexpr size_t kSnaps = 8;
+    static constexpr size_t kSnaps = 8;              // prompt ends kept
+    static constexpr int64_t kSnapEvery = 8192;      // a read keeps a snapshot at each multiple of this it passes
     size_t snap_bytes() const {
         size_t n = 0;
         for (const Layer& l : m->layers) {
@@ -681,11 +696,13 @@ struct Engine {
         }
         return n;
     }
-    void snapshot(const std::vector<float>& logits_now) {
-        if (!snaps.empty() && snaps.back().pos == pos()) return;
-        if (snaps.size() == kSnaps) snaps.erase(snaps.begin());
+    void snapshot(const std::vector<float>& logits_now, bool mark = false) {
+        if (snap_at(pos()) != nullptr) return;
+        if (!mark && std::count_if(snaps.begin(), snaps.end(), [](const Snap& x) { return !x.mark; }) >= (long) kSnaps)
+            snaps.erase(std::find_if(snaps.begin(), snaps.end(), [](const Snap& x) { return !x.mark; }));
         Snap s;
         s.pos = pos();
+        s.mark = mark;
         s.logits = logits_now;
         s.bytes.resize(snap_bytes());
         size_t at = 0;
@@ -712,9 +729,9 @@ struct Engine {
     }
     /// The state back to (at most) its first `keep` tokens: the cells left whole, a snapshot's, or none.  Returns the
     /// tokens kept.
-    int64_t rewind(int64_t keep) {
+    int64_t rewind(int64_t keep, bool restore = false) {
         keep = std::min<int64_t>(keep, pos());
-        if (pos() - keep <= kMaxT) {
+        if (pos() - keep <= kMaxT && !restore) {
             seq.resize((size_t) keep);
         } else {
             const Snap* best = nullptr;
@@ -742,6 +759,99 @@ struct Engine {
         }
         snaps.erase(std::remove_if(snaps.begin(), snaps.end(), [&](const Snap& s) { return s.pos > pos(); }), snaps.end());
         return pos();
+    }
+
+    // ---- parked conversations: one a request leaves goes to RAM (its sparse layers' cells and pooled keys up to its
+    // end, its snapshots and one at its end), for a later request that continues it; the least recently used leave
+    // when the park passes its budget or the RAM available to the system falls under the reserve
+    struct Parked {
+        std::vector<int32_t> seq;
+        std::vector<uint8_t> cells;   // per sparse layer: K/V rows [0, pos), then pooled keys [0, pos / pool)
+        std::vector<Snap> snaps;
+        uint64_t used = 0;
+        size_t bytes() const {
+            size_t n = cells.size();
+            for (const Snap& x : snaps) n += x.bytes.size() + x.logits.size() * 4;
+            return n;
+        }
+    };
+    std::vector<Parked> park;
+    uint64_t park_clock = 0;
+    size_t park_budget = (size_t) 16384 << 20, ram_reserve = (size_t) 6144 << 20;
+    static constexpr int64_t kParkMin = 1024;   // shorter conversations are not parked
+    size_t parked_bytes() const {
+        size_t n = 0;
+        for (const Parked& c : park) n += c.bytes();
+        return n;
+    }
+    /// The live conversation into the park, with a snapshot at its end (the logits of its last token unknown: empty);
+    /// the live state keeps copies of its snapshots up to `keep` (the start the next request shares with it)
+    void park_live(int64_t keep) {
+        const auto& g = m->g;
+        const int64_t p = pos(), groups = p / g.idx_pool;
+        if (p < kParkMin) return;
+        snapshot({}, false);
+        Parked c;
+        size_t n = 0;
+        for (const Layer& l : m->layers)
+            if (!l.swa) n += (size_t) p * hy4k::kKvRow * 2 + (size_t) groups * (size_t) g.idx_dim * 4;
+        const size_t need = n + [&] { size_t k = 0; for (const Snap& x : snaps) k += x.bytes.size() + x.logits.size() * 4; return k; }();
+        // the budget counts the snapshots too; the RAM, the cells alone (the snapshots are in RAM already)
+        uint64_t avail = 0;
+        const bool known = lamina::platform::available_ram(avail);
+        while (!park.empty() && (parked_bytes() + need > park_budget || (known && avail < n + ram_reserve))) {
+            auto lru = std::min_element(park.begin(), park.end(), [](const Parked& a, const Parked& b) { return a.used < b.used; });
+            std::fprintf(stderr, "lamina: a parked conversation of %zu tokens leaves the park (%.0f MiB)\n", lru->seq.size(),
+                         (double) lru->bytes() / (double) (1 << 20));
+            park.erase(lru);
+            if (known) lamina::platform::available_ram(avail);
+        }
+        if (need > park_budget || (known && avail < n + ram_reserve)) {
+            std::fprintf(stderr, "lamina: a conversation of %lld tokens is not parked: %.0f MiB, over the park's budget "
+                         "or the RAM reserve\n", (long long) p, (double) need / (double) (1 << 20));
+            return;
+        }
+        c.cells.resize(n);
+        size_t at = 0;
+        for (const Layer& l : m->layers) {
+            if (l.swa) continue;
+            const size_t kb = (size_t) p * hy4k::kKvRow * 2, pb = (size_t) groups * (size_t) g.idx_dim * 4;
+            CK(cudaMemcpyAsync(c.cells.data() + at, l.kv, kb, cudaMemcpyDeviceToHost, st));
+            at += kb;
+            if (pb) CK(cudaMemcpyAsync(c.cells.data() + at, l.pooled, pb, cudaMemcpyDeviceToHost, st));
+            at += pb;
+        }
+        CK(cudaStreamSynchronize(st));
+        c.seq = seq;
+        c.snaps = std::move(snaps);
+        snaps.clear();
+        for (const Snap& x : c.snaps)
+            if (x.pos <= keep) snaps.push_back(x);
+        c.used = ++park_clock;
+        std::fprintf(stderr, "lamina: a conversation of %lld tokens parked (%.0f MiB; the park %zu, %.0f MiB)\n",
+                     (long long) p, (double) c.bytes() / (double) (1 << 20), park.size() + 1,
+                     (double) (parked_bytes() + c.bytes()) / (double) (1 << 20));
+        park.push_back(std::move(c));
+    }
+    /// A parked conversation (taken out of the park) as the live state: its cells and snapshots back, the state at its
+    /// last snapshot (its end)
+    void unpark(Parked c) {
+        const auto& g = m->g;
+        const int64_t p = (int64_t) c.seq.size(), groups = p / g.idx_pool;
+        size_t at = 0;
+        for (const Layer& l : m->layers) {
+            if (l.swa) continue;
+            const size_t kb = (size_t) p * hy4k::kKvRow * 2, pb = (size_t) groups * (size_t) g.idx_dim * 4;
+            CK(cudaMemcpyAsync(l.kv, c.cells.data() + at, kb, cudaMemcpyHostToDevice, st));
+            at += kb;
+            if (pb) CK(cudaMemcpyAsync(l.pooled, c.cells.data() + at, pb, cudaMemcpyHostToDevice, st));
+            at += pb;
+        }
+        CK(cudaStreamSynchronize(st));
+        seq = std::move(c.seq);
+        snaps = std::move(c.snaps);
+        rewind(pos(), true);   // the rings and tails from its end's snapshot
+        std::fprintf(stderr, "lamina: a parked conversation of %lld tokens resumed\n", (long long) p);
     }
 
     void quant(const float* x, int64_t rows, int64_t n, uint8_t* out) { K::quantize_q8_1_rows(x, rows, n, out, st); }
@@ -2135,10 +2245,33 @@ struct Serve {
         stop.store(false);
         // what the state holds of this prompt: its common start, less one token when that is all of it (the last
         // prompt token's logits are the first pick)
-        size_t common = 0;
-        while (common < E.seq.size() && common < ids.size() && E.seq[common] == ids[common]) ++common;
+        auto common_of = [&](const std::vector<int32_t>& s) {
+            size_t c = 0;
+            while (c < s.size() && c < ids.size() && s[c] == ids[c]) ++c;
+            return c;
+        };
+        size_t common = common_of(E.seq);
+        // a parked conversation the prompt continues further than the live one: it comes back, and the live one is
+        // parked when the request leaves it (it drops kParkMin or more of its cells and more than it keeps)
+        size_t best = 0, best_c = common;
+        for (size_t i = 0; i < E.park.size(); ++i)
+            if (const size_t c = common_of(E.park[i].seq); c > best_c) {
+                best = i + 1;
+                best_c = c;
+            }
+        const int64_t drop = E.pos() - (int64_t) common;
+        if (best > 0) {
+            Engine::Parked back = std::move(E.park[best - 1]);
+            E.park.erase(E.park.begin() + (ptrdiff_t) (best - 1));
+            E.park_live(0);
+            E.unpark(std::move(back));
+            common = common_of(E.seq);
+        } else if (drop >= Engine::kParkMin && drop > (int64_t) common) {
+            E.park_live((int64_t) common);
+        }
         std::vector<float> lg;
         const Engine::Snap* whole = common == ids.size() ? E.snap_at((int64_t) common) : nullptr;
+        if (whole != nullptr && whole->logits.empty()) whole = nullptr;
         if (whole) lg = whole->logits;   // the held prompt again: its snapshot has the first pick's logits
         else if (common == ids.size()) --common;
         const size_t reuse = (size_t) E.rewind((int64_t) common);
@@ -2264,6 +2397,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     bool graphs = true;
     int prefill = 4096, prefill_min = 24;
     double arena_pin = 72;
+    double park_mib = 16384, reserve_mib = 6144;
     std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2298,6 +2432,8 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--prefill") prefill = std::atoi(next());            // rows a prompt chunk (0: the decode's forwards)
         else if (a == "--prefill-min") prefill_min = std::atoi(next());    // a shorter prompt part: the decode's forwards
         else if (a == "--arena-pin") arena_pin = std::atof(next());        // GiB of the arena in pinned memory at most
+        else if (a == "--park-mib" || a == "--conversation-cache-mib") park_mib = std::atof(next());
+        else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
         else if (a == "--tier-gpus") {   // the expert tiers' GPUs (CUDA ordinals, the family switch's)
             for (const int32_t d : lamina::program::parse_ids(next())) tier_devs.push_back((int) d);
         }
@@ -2320,6 +2456,8 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.save_every_min = save_every;
     E.use_graphs = graphs;
     E.init(m, max_ctx, threads);
+    E.park_budget = (size_t) (std::max(0.0, park_mib) * (double) (1 << 20));
+    E.ram_reserve = (size_t) (std::max(0.0, reserve_mib) * (double) (1 << 20));
     Prompt P(E);   // its buffers before the slots take the GPUs' free memory
     if (prefill > 0 && P.init(prefill, tier_devs)) {
         E.chunk_fn = [&P](const int32_t* t, int n) { P.run(t, n); };
