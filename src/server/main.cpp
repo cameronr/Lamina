@@ -301,6 +301,10 @@ int run(int argc, char** argv) {
         std::fputs(params_help().c_str(), stdout);
         return 0;
     }
+    if (cl.version) {
+        std::fputs("lamina-server " LAMINA_VERSION "\n", stdout);
+        return 0;
+    }
     if (!cl.write_config.empty() && cl.check) usage_error("--write-config or --check: not both");
     const bool attached = !cl.bench_url.empty();   // --bench-url: a server that runs, measured from here
     if (cl.bench_compare.size() == 2) {            // two reports side by side, nothing run

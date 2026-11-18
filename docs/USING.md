@@ -349,7 +349,7 @@ takes `--no-<name>` for off (`--no-answer-room`). A list takes commas (`--aliase
 they need it. Any other option is the engine's: the config's `args`, which the command line's take the place of. A
 path given on the command line starts from the folder the server was started in, one in a config from its `cwd`. A
 key the server does not read (a typo) is named in its window and ignored. Only the commands are the command line's
-alone: `--config`, `--write-config`, `--check` and `--help`.
+alone: `--config`, `--write-config`, `--check`, `--help` and `--version` (`-v`).
 
 | Key | |
 | --- | --- |

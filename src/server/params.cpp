@@ -338,6 +338,10 @@ CommandLine parse_command_line(int argc, char** argv) {
             cl.help = true;
             continue;
         }
+        if (o == "-v" || o == "--version") {
+            cl.version = true;
+            continue;
+        }
         if (o == "--config") {
             cl.config = value();
             continue;
@@ -487,7 +491,8 @@ std::string params_help() {
              {"--bench-out DIR", "where the report's folder goes (default: bench-results beside the program)"},
              {"--bench-compare OLD [NEW]", "an earlier report (its folder or results.json) beside this run's; with "
                                            "NEW and no --bench, two reports side by side"},
-             {"-h, --help", "this text"}}) {
+             {"-h, --help", "this text"},
+             {"-v, --version", "the program's version"}}) {
         std::string l = std::string("  ") + left;
         l += std::string(l.size() < kCol ? kCol - l.size() : 1, ' ');
         out += l + wrapped(help, kCol, kWidth, l.size());

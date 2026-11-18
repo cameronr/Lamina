@@ -535,7 +535,8 @@ void usage() {
                  "                       it), kernel (a copy kernel stages it inside the window's graph) or direct\n"
                  "                       (the expert kernels read the mapped RAM)\n"
                  "  --pool-workers N     the CPU expert pool's workers (default 0: every physical core but the\n"
-                 "                       host loop's)\n",
+                 "                       host loop's)\n"
+                 "  -v, --version        the program's version\n",
                  lamina::kDraftLayerScript);
 }
 

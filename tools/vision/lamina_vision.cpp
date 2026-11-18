@@ -6,6 +6,7 @@
 //
 //   lamina-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
 //                 [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]
+//   lamina-vision -v | --version
 // Flash attention defaults to auto, and to off on the CPU when ggml is built with AVX-512 (see main).
 //
 // Resident: prints "READY <n_embd>", then per stdin line
@@ -71,8 +72,8 @@ int main(int argc, char** argv) {
         if (a == "--mmproj") mmproj = next();
         else if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
-        else if (a == "--version") {
-            std::printf("lamina-vision\n");
+        else if (a == "-v" || a == "--version") {
+            std::printf("lamina-vision " LAMINA_VERSION "\n");
             return 0;
         }
         else if (a == "--threads") threads = std::atoi(next().c_str());

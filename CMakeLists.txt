@@ -9,9 +9,10 @@
 # CMake 3.22 (Ubuntu 22.04's) or newer, with 3.24's policies where CMake has them
 cmake_minimum_required(VERSION 3.22...3.24)
 project(lamina VERSION 0.2 LANGUAGES CXX)
-# on the files that print it alone: a new version recompiles three files, not every one (the CUDA kernels, ggml)
-set_property(SOURCE src/program/generate.cpp src/server/bench.cpp src/server/model_config.cpp
-             APPEND PROPERTY COMPILE_DEFINITIONS LAMINA_VERSION="${PROJECT_VERSION}")
+# on the files that print it alone: a new version recompiles these and the image encoder's (tools/vision, which gets
+# it below), not every one (the CUDA kernels, ggml)
+set_property(SOURCE src/program/main.cpp src/program/generate.cpp src/server/main.cpp src/server/bench.cpp
+             src/server/model_config.cpp APPEND PROPERTY COMPILE_DEFINITIONS LAMINA_VERSION="${PROJECT_VERSION}")
 
 # cmake --install: flat, as a release's two downloads extract into one folder. Component lamina: the programs, the
 # draft layer's download script and the licenses; component cudart: the CUDA runtime and cuBLAS the programs load.
@@ -910,6 +911,7 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
           -DLAMINA_VISION_CUDA:BOOL=ON
           -DLAMINA_PORTABLE:BOOL=ON
           -DLAMINA_VISION_OUTPUT_DIR:PATH=${CMAKE_BINARY_DIR}
+          -DLAMINA_VERSION:STRING=${PROJECT_VERSION}
           -DLAMINA_JOBS:STRING=${LAMINA_JOBS_USED}
           -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
           # the engine's toolkit: ggml-cuda looks for one before CUDA is enabled, where FindCUDAToolkit takes neither

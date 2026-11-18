@@ -56,7 +56,7 @@ int main() {
             at = sp + 1;
         }
     }
-    for (const char* c : {"--config", "--write-config", "--check", "--help", "-h"}) CHECK(flags.count(c) == 0);
+    for (const char* c : {"--config", "--write-config", "--check", "--help", "-h", "--version", "-v"}) CHECK(flags.count(c) == 0);
 
     bool neg = false;
     CHECK(lamina::find_param("-m")->key == "model");
@@ -93,6 +93,7 @@ int main() {
     CHECK(cl.config == "c.json" && cl.write_config == "w.json" && cl.check && !cl.help);
     CHECK(parse({"--mmproj", "p.gguf", "--no-mmproj"}).settings["vision"] == false);
     CHECK(parse({"--port=9000"}).settings["port"] == 9000);
+    CHECK(parse({"-v"}).version && parse({"--version"}).version && !cl.version);
 
     CHECK(refused({"--port", "x"}));
     CHECK(refused({"--port"}));
