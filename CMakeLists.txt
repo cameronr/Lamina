@@ -633,7 +633,7 @@ if(LAMINA_NATIVE_EXPERTS)
       set(_lamina_quantize_cu ${_lamina_tq_dir}/quantize.cu)   # it includes mmq.cuh
     endif()
     add_library(lamina_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_lamina_quantize_cu})
-    foreach(_t q2_0 iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q4_k q5_k q6_k q5_0 q5_1 q8_0)
+    foreach(_t q2_0 iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q3_k q4_k q5_k q6_k q5_0 q5_1 q8_0)
       target_sources(lamina_mmq PRIVATE ${_lamina_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     if(LAMINA_TQ_OVERLAY_OK)
