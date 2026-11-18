@@ -16,6 +16,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -88,8 +89,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: ggml-cpu cannot quantize an activation for this layer";
         return false;
     }
-    if (n_embd > H || n_ff > FF) {   // the pool's per-token rows (ExpertPool's SplitBufMulti) are Flash-Next's size
-        err = "native experts: an expert wider than the pool's buffers (at most " + std::to_string(FF) + " x " +
+    if (n_embd > H || n_ff > kNativeFF) {   // the pool's per-token rows (ExpertPool's SplitBufMulti)
+        err = "native experts: an expert wider than the pool's buffers (at most " + std::to_string(kNativeFF) + " x " +
               std::to_string(H) + ")";
         return false;
     }
@@ -195,7 +196,7 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     if (f.had_d) {
-        float r[FF];
+        float r[kNativeFF];
         std::memcpy(r, h, (size_t) f.n_ff * sizeof(float));
         hadamard_rotate(r, (int) f.n_ff, f.had_block, f.d_signs);
         traits(f.d_act)->from_float(r, dst, f.n_ff);
@@ -229,6 +230,23 @@ int native_gu_mt_min(int gu_type) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.swiglu_limit > 0.f) {   // the clamped SwiGLU (Hy4-flash): ggml-cpu's dots, then ggml_swiglu_clamp's arithmetic
+        const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+        const int n = (int) f.n_embd;
+        const float lim = f.swiglu_limit;
+        for (int r = r0; r < r1; ++r) {
+            const uint8_t* gr = blob + (size_t) r * f.gu_row;
+            const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
+            for (int t = 0; t < nt; ++t) {
+                float g = 0.f, u = 0.f;
+                dot(n, &g, 0, gr, 0, act[t], 0, 1);
+                dot(n, &u, 0, ur, 0, act[t], 0, 1);
+                const float gate = std::min(g, lim), up = std::clamp(u, -lim, lim);
+                ff[t][r] = gate / (1.f + std::exp(-gate)) * up;
+            }
+        }
+        return;
+    }
     if (tq_supported(f.gu_type)) {
         tq_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;

@@ -15,8 +15,10 @@ namespace lamina::kernels::cpu {
 
 /// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
 inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// The widest native expert's hidden (n_ff): the pool's per-token rows (Hy4-flash's 1,536; Flash-Next's 640).
+inline constexpr int kNativeFF = 2048;
+/// Bytes of the largest quantized down activation (2,048 values as Q8_K: 8 x 292).
+inline constexpr size_t kNativeHBytes = 2560;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -30,6 +32,8 @@ struct NativeFmt {
     int had_block = 0;                  ///< Hadamard-folded weights (hadamard.hpp): the rotation's block, else 0
     bool had_gu = false, had_d = false; ///< which of the layer's inputs are rotated
     const float* gu_signs = nullptr, *d_signs = nullptr;   ///< their sign vectors (null: identity)
+    /// SwiGLU's clamp (Hy4-flash's routed experts: silu(min(g, L)) * clamp(u, -L, L), ggml_swiglu_clamp); 0: none
+    float swiglu_limit = 0.f;
 };
 
 /// Whether this build has the ggml-cpu path.
