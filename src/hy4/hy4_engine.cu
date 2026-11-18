@@ -78,8 +78,10 @@ struct Owned {
     std::vector<void*> dev, pinned, heap;
     std::vector<cudaStream_t> streams;
     std::vector<cudaEvent_t> events;
+    std::vector<cudaGraphExec_t> graphs;
     ~Owned() {
         cudaDeviceSynchronize();
+        for (cudaGraphExec_t g : graphs) cudaGraphExecDestroy(g);
         for (cudaEvent_t e : events) cudaEventDestroy(e);
         for (cudaStream_t st : streams) cudaStreamDestroy(st);
         for (void* d : dev) cudaFree(d);
@@ -106,6 +108,15 @@ template <class T> T* halloc(size_t n) {   // pinned
     own(&Owned::pinned, p);
     return (T*) p;
 }
+/// pinned host memory the GPU reads through the mapping: the host pointer, the device's in *dev
+template <class T> T* hmapped(size_t n, T** dev) {
+    void* p = nullptr;
+    CK(cudaHostAlloc(&p, std::max<size_t>(n * sizeof(T), 256), cudaHostAllocMapped));
+    own(&Owned::pinned, p);
+    std::memset(p, 0, std::max<size_t>(n * sizeof(T), 256));
+    CK(cudaHostGetDevicePointer((void**) dev, p, 0));
+    return (T*) p;
+}
 void* heap_new(size_t n) {
     void* h = std::malloc(n);
     if (h != nullptr) own(&Owned::heap, h);
@@ -114,6 +125,7 @@ void* heap_new(size_t n) {
 
 constexpr int kMaxT = 8;              // rows a forward takes at most (native_mmvq's columns)
 constexpr int kTail = 16;             // the indexer's per-cell value / gate rows kept (four groups of 4)
+constexpr int kScoreBlocks = 128;     // the indexer scores' grid (a grid-stride loop over the groups)
 constexpr float kEngramEps = 1.1920929e-07f;   // the reference's unset RMSNorm eps: FLT_EPSILON
 
 // ------------------------------------------------------------------------------------------------ the model
@@ -280,6 +292,7 @@ bool load(const std::string& path, Model& m, int threads, std::string& err) {
         y.il = (int) l;
         y.swa = g.swa[(size_t) l];
         y.has_idx = g.has_indexer(l);
+        if (!y.swa && !y.has_idx) { err = p + ": a sparse layer without an indexer, which this path does not run"; return false; }
         y.dense = l < g.n_dense;
         y.eng = g.engram_index(l);
         y.H = (int) g.n_head[(size_t) l];
@@ -447,13 +460,12 @@ struct Engine {
     uint8_t* eraw = nullptr;
     float *erows = nullptr, *ekv = nullptr, *evalid = nullptr;
     float *iq = nullptr, *ik = nullptr, *ivg = nullptr, *iw = nullptr, *scores = nullptr;
-    int32_t *cells_swa = nullptr, *cells_sp = nullptr, *n_swa = nullptr, *n_sp = nullptr, *cell_swa = nullptr,
-            *cell_sp = nullptr, *pool_g = nullptr, *cells_sel = nullptr, *n_sel = nullptr;
+    int32_t *cells_swa = nullptr, *n_swa = nullptr, *cells_sel = nullptr, *n_sel = nullptr;
     float* logits = nullptr;
-    int32_t* tok_d = nullptr;
-    // host (pinned)
-    float *h_rin = nullptr, *h_out = nullptr, *h_logits = nullptr, *h_scores = nullptr, *h_valid = nullptr;
-    int32_t *h_ids = nullptr, *h_cells = nullptr, *h_cell = nullptr, *h_pool = nullptr, *h_ng = nullptr;
+    int32_t *tok_d = nullptr, *pos_d = nullptr;
+    // host (pinned; h_out and h_miss mapped: the next segment reads the CPU's rows through the mapping)
+    float *h_rin = nullptr, *h_out = nullptr, *h_out_d = nullptr, *h_valid = nullptr;
+    int32_t *h_ids = nullptr, *h_tok = nullptr, *h_pos = nullptr;
     uint8_t* h_raw = nullptr;
     uint32_t* h_rows = nullptr;
     uint8_t* acts = nullptr;
@@ -461,10 +473,9 @@ struct Engine {
     cudaEvent_t ev = nullptr;
     // the GPU's share of the routed experts: the entries grouped by slot, their input as q8_1, the kernels' scratch
     unsigned long long* grp_ptr = nullptr;
-    int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr, *d_miss = nullptr;
-    int32_t* h_miss = nullptr;
+    int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
+    int32_t *h_miss = nullptr, *h_miss_d = nullptr;
     uint8_t *rinq = nullptr, *escr = nullptr;
-    float* ecpu = nullptr;
     int64_t hits = 0, lookups = 0;
     std::string profile_path;
     // counters
@@ -536,28 +547,21 @@ struct Engine {
         ivg = dalloc<float>(T * 2 * idd);
         iw = dalloc<float>(T * ih);
         scores = dalloc<float>(T * (size_t) (ctx / g.idx_pool));
-        const size_t cmax = (size_t) g.idx_top_k;
         cells_swa = dalloc<int32_t>(T * (size_t) g.n_swa);
-        cells_sp = dalloc<int32_t>(T * cmax);
-        cells_sel = dalloc<int32_t>(T * cmax);
+        cells_sel = dalloc<int32_t>(T * (size_t) g.idx_top_k);
         n_swa = dalloc<int32_t>(T);
-        n_sp = dalloc<int32_t>(T);
         n_sel = dalloc<int32_t>(T);
-        cell_swa = dalloc<int32_t>(T);
-        cell_sp = dalloc<int32_t>(T);
-        pool_g = dalloc<int32_t>(4 * T);
         logits = dalloc<float>(T * (size_t) g.n_vocab);
         tok_d = dalloc<int32_t>(T);
+        pos_d = dalloc<int32_t>(T);
         h_rin = halloc<float>(T * (size_t) g.n_latent);
-        h_out = halloc<float>(T * (size_t) g.top_k * (size_t) g.n_latent);
-        h_logits = halloc<float>(T * (size_t) g.n_vocab);
-        h_scores = halloc<float>(T * (size_t) (ctx / g.idx_pool));
+        h_out = hmapped<float>(T * (size_t) g.top_k * (size_t) g.n_latent, &h_out_d);
         h_valid = halloc<float>(T);
         h_ids = halloc<int32_t>(T * (size_t) g.top_k);
-        h_cells = halloc<int32_t>(T * (cmax + (size_t) g.n_swa) + 4 * T);
-        h_cell = halloc<int32_t>(4 * T);
-        h_pool = halloc<int32_t>(3 * T * m->layers.size());   // a layer's own: its copy may still be queued
-        h_ng = halloc<int32_t>(T);
+        h_tok = halloc<int32_t>(T);
+        h_pos = halloc<int32_t>(T);
+        for (size_t li = 0; li < m->layers.size(); ++li)
+            if (!m->layers[li].dense) moe_layers.push_back((int) li);
         h_raw = halloc<uint8_t>(n_mod * T * eh * ed);
         h_rows = halloc<uint32_t>(n_mod * T * eh);
         acts = (uint8_t*) heap_new(T * C::kNativeActBytes);
@@ -567,11 +571,9 @@ struct Engine {
         n_groups = dalloc<int32_t>(1);
         ent_dst = dalloc<int32_t>(n_ent);
         ent_tok = dalloc<int32_t>(n_ent);
-        d_miss = dalloc<int32_t>(n_ent);
-        h_miss = halloc<int32_t>(n_ent);
+        h_miss = hmapped<int32_t>(n_ent, &h_miss_d);
         rinq = dalloc<uint8_t>(T * (size_t) g.n_latent / 32 * q81);
         escr = dalloc<uint8_t>(K::native_expert_scratch_bytes((int64_t) n_ent, g.n_ff_exp));
-        ecpu = dalloc<float>(n_ent * (size_t) g.n_latent);
         // the caches
         size_t kv_bytes = 0;
         for (Layer& l : m->layers) {
@@ -686,13 +688,23 @@ struct Engine {
     }
     unsigned blocks(int64_t n) const { return (unsigned) ((n + hy4k::kThreads - 1) / hy4k::kThreads); }
 
+    // ---- a forward.  Its GPU work runs in segments between the CPU's parts: segment 0 is the embedding and the layers
+    // up to the first MoE layer's routing; segment s > 0 the s-th MoE layer's end (the CPU's rows merged, the weighted
+    // sum, routed_up, the FFN's norm and iHC post) and the layers after it up to the next MoE layer's routing, the last
+    // one the head.  Each (segment, rows) pair is captured once as a CUDA graph: what changes from one forward to the
+    // next is in device memory (the tokens, the positions, the Engram rows, the slots' table) or in mapped host memory
+    // (the CPU's rows), and every decision a row's position makes (its cells, its group's pooling, the indexer's pick)
+    // is the GPU's.
+    std::vector<int> moe_layers;
+    std::map<int, cudaGraphExec_t> graphs;
+    bool use_graphs = true;
+
     /// T rows (tokens toks, at positions pos() ..) through the model; logits of every row into `logits`.
     void forward(const int32_t* toks, int T) {
         const auto& g = m->g;
-        const int N = (int) g.n_embd, hc = (int) g.hc;
         const int64_t p0 = pos();
         for (int t = 0; t < T; ++t) seq.push_back(toks[t]);
-        // Engram's rows: hashed now, read while the embedding and the first layer run
+        // Engram's rows: hashed now, read from the SSD while this forward's inputs go to the GPU
         const auto tt = Clock::now();
         const size_t n_mod = g.eng_layers.size(), eh = (size_t) g.eng_heads(), ed = (size_t) g.eng_dim;
         for (int t = 0; t < T; ++t) {
@@ -700,59 +712,90 @@ struct Engine {
             engram_ids(g, seq, p0 + t, r.data(), h_valid[t]);
             for (size_t e = 0; e < n_mod; ++e)
                 std::memcpy(h_rows + (e * (size_t) T + (size_t) t) * eh, r.data() + e * eh, eh * 4);
+            h_pos[t] = (int32_t) (p0 + t);
+            h_tok[t] = toks[t];
         }
         const lamina::ngram::PleReader::Ticket ticket = reader.issue(h_rows, n_mod * (size_t) T * eh, h_raw);
-        // the attention's cells: the window's ring for the window layers, the context for the sparse ones (until the
-        // indexer picks)
-        int32_t* hc_swa = h_cells;
-        int32_t* hc_sp = h_cells + (size_t) T * g.n_swa;
-        int32_t* hn = hc_sp + (size_t) T * g.idx_top_k;   // n_swa[T], n_sp[T]
-        for (int t = 0; t < T; ++t) {
-            const int64_t p = p0 + t;
-            const int64_t a = std::max<int64_t>(0, p - g.n_swa + 1);
-            int n = 0;
-            for (int64_t q_ = a; q_ <= p; ++q_) hc_swa[(size_t) t * g.n_swa + n++] = (int32_t) (q_ % ring);
-            hn[t] = n;
-            n = 0;
-            const int64_t until = std::min<int64_t>(p, g.idx_top_k - 1);   // dense causal while the context allows
-            for (int64_t q_ = 0; q_ <= until; ++q_) hc_sp[(size_t) t * g.idx_top_k + n++] = (int32_t) q_;
-            hn[T + t] = n;
-            h_cell[t] = (int32_t) (p % ring);
-            h_cell[T + t] = (int32_t) p;
-        }
-        CK(cudaMemcpyAsync(cells_swa, hc_swa, (size_t) T * g.n_swa * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(cells_sp, hc_sp, (size_t) T * g.idx_top_k * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(n_swa, hn, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(n_sp, hn + T, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(cell_swa, h_cell, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(cell_sp, h_cell + T, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(tok_d, toks, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        // the embedding into the streams
-        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, T, N, emb, st);
-        hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
+        CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         std::string err;
         if (!reader.collect(ticket, err)) {
             std::fprintf(stderr, "lamina: the Engram table: %s\n", err.c_str());
             throw Fatal{1};
         }
         table_ms += ms_since(tt);
-        for (size_t e = 0; e < n_mod; ++e)
-            CK(cudaMemcpyAsync(eraw + e * (size_t) T * eh * ed, h_raw + e * (size_t) T * eh * ed, (size_t) T * eh * ed,
-                               cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(eraw, h_raw, n_mod * (size_t) T * eh * ed, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(evalid, h_valid, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        for (Layer& l : m->layers) layer(l, T, p0);
+        const int n_seg = (int) moe_layers.size() + 1;
+        for (int s = 0; s < n_seg; ++s) {
+            if (s > 0) cpu_part(m->layers[(size_t) moe_layers[(size_t) s - 1]], T);
+            run_segment(s, T);
+        }
+        ++forwards;
+    }
+
+    void run_segment(int s, int T) {
+        if (!use_graphs) {
+            enqueue_segment(s, T);
+            return;
+        }
+        const int key = s * 16 + T;
+        auto it = graphs.find(key);
+        if (it == graphs.end()) {
+            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+            enqueue_segment(s, T);
+            cudaGraph_t gr = nullptr;
+            CK(cudaStreamEndCapture(st, &gr));
+            cudaGraphExec_t ex = nullptr;
+            CK(cudaGraphInstantiate(&ex, gr, 0));
+            cudaGraphDestroy(gr);
+            own(&Owned::graphs, ex);
+            it = graphs.emplace(key, ex).first;
+        }
+        CK(cudaGraphLaunch(it->second, st));
+    }
+
+    void enqueue_segment(int s, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc;
+        size_t li = 0;
+        if (s == 0) {
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, T, N, emb, st);
+            hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
+            hy4k::k_swa_cells<<<T, 256, 0, st>>>(pos_d, (int) g.n_swa, (int) ring, cells_swa, n_swa);
+        } else {
+            const int lm = moe_layers[(size_t) s - 1];
+            moe_end(m->layers[(size_t) lm], T);
+            li = (size_t) lm + 1;
+        }
+        for (; li < m->layers.size(); ++li) {
+            Layer& l = m->layers[li];
+            front(l, T);
+            if (!l.dense) {
+                moe_front(l, T);
+                return;
+            }
+            dense_ffn(l, T);
+        }
         // the head: the streams reduced, output_norm, the BF16 head
         hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, m->ohc_fn, m->ohc_scale, m->ohc_base, hc, N, hc, g.eps, g.hc_eps, 0.f,
                                           nullptr, xh, m->out_norm, xn, g.eps);
         K::bf16_gemv_fp32_mmvf_multi(xn, m->head, logits, N, g.n_vocab, T, st);
-        ++forwards;
     }
 
-    void layer(Layer& l, int T, int64_t p0) {
+    /// Engram, the attention, and the FFN's input (xn, its q8_1 rows in xq; iHC's post weights in `post`)
+    void front(Layer& l, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, hc = (int) g.hc, H = l.H;
-        if (l.eng >= 0) engram(l, T);
-        // attention
+        if (l.eng >= 0) {
+            const int eh = (int) g.eng_heads(), ed = (int) g.eng_dim;
+            hy4k::k_engram_rows<<<dim3(eh, T), 128, 0, st>>>(eraw + (size_t) l.eng * T * eh * ed, l.e_lnorm, evalid,
+                                                             erows, eh, ed, kEngramEps);
+            quant(erows, T, (int64_t) eh * ed, erq);
+            mmvq(l.e_kv, erq, ekv, T);
+            hy4k::k_engram_mix<<<T, 256, 0, st>>>(X, ekv, l.e_kv_b, l.e_gate, l.e_gamma, l.e_hcs, evalid, hc, N,
+                                                  kEngramEps);
+        }
         hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hca_fn, l.hca_scale, l.hca_base, hc, N, 2 * hc, g.eps, g.hc_eps,
                                           g.hc_mag, post, xh, l.attn_norm, xn, g.eps);
         quant(xn, T, N, xq);
@@ -763,17 +806,22 @@ struct Engine {
         mmvq(l.kv_a, xq, kva, T);
         mmvq(l.gate, xq, gt, T);
         hy4k::k_q_split<<<dim3(H, T), 256, 0, st>>>(q, qnope, qabs, H, (int) g.k_head, (int) g.nope());
-        hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, nullptr,
-                                                     (int) p0, l.theta);
+        hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
+                                                     l.theta);
         quant(qnope, (int64_t) T * H, g.nope(), qnq);
         hy4k::k_head_q8_0<<<dim3((unsigned) ((H * hy4k::kLatent + 127) / 128), T), 128, 0, st>>>(
             l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow);
-        hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, l.swa ? cell_swa : cell_sp, (int) p0,
-                                                       l.theta, g.eps);
-        const int32_t* cells = l.swa ? cells_swa : cells_sp;
-        const int32_t* counts = l.swa ? n_swa : n_sp;
-        int ld = (int) (l.swa ? g.n_swa : g.idx_top_k);
-        if (l.has_idx) indexer(l, T, p0, cells, counts);
+        hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, l.theta,
+                                                       g.eps);
+        const int32_t* cells = cells_swa;
+        const int32_t* counts = n_swa;
+        int ld = (int) g.n_swa;
+        if (!l.swa) {
+            indexer(l, T);
+            cells = cells_sel;
+            counts = n_sel;
+            ld = (int) g.idx_top_k;
+        }
         const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
         const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
         hy4k::k_mla_chunk<<<dim3(n_chunks, T), 256, smem, st>>>(qabs, l.kv, cells, counts, ld, H,
@@ -787,125 +835,51 @@ struct Engine {
         mmvq(l.wo, oq, y, T);
         hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_attn, N, g.eps);
         hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
-        // FFN
         hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hcf_fn, l.hcf_scale, l.hcf_base, hc, N, 2 * hc, g.eps, g.hc_eps,
                                           g.hc_mag, post, xh, l.ffn_norm, xn, g.eps);
         quant(xn, T, N, xq);
-        if (l.dense) {
-            mmvq(l.f_gate, xq, fg, T);
-            mmvq(l.f_up, xq, fu, T);
-            hy4k::k_swiglu<<<blocks((int64_t) T * g.n_ff), hy4k::kThreads, 0, st>>>(fg, fu, fh, (int64_t) T * g.n_ff);
-            quant(fh, T, g.n_ff, hq);
-            mmvq(l.f_down, hq, y, T);
-        } else {
-            moe_layer(l, T);
-        }
+    }
+
+    /// The sparse layer's indexer: the rows' index keys into the tail, the groups they complete pooled, and each row's
+    /// cells: every cell while its visible groups (those before its own) are within the reach, else the top groups'.
+    void indexer(Layer& l, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, ih = (int) g.idx_heads, idd = (int) g.idx_dim, pool_n = (int) g.idx_pool;
+        mmvq(l.iq_b, qrq, iq, T);
+        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, st>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, pos_d, 0, l.theta);
+        mmvq(l.ik, xq, ik, T);
+        hy4k::k_rms<<<T, 128, 0, st>>>(ik, idd, l.ik_norm, ik, idd, idd, g.eps);
+        quant(ik, T, idd, ikq);
+        mmvq(l.icv, ikq, ivg, T);
+        mmvq(l.icg, ikq, ivg + (size_t) kMaxT * idd, T);
+        hy4k::k_tail_store<<<T, 128, 0, st>>>(ivg, ivg + (size_t) kMaxT * idd, l.tail, pos_d, kTail, idd);
+        hy4k::k_pool_rows<<<T, 128, 0, st>>>(l.tail, kTail, idd, pool_n, l.ape, l.ipool_norm, g.eps, l.theta,
+                                             (int) g.n_rot, pos_d, l.pooled);
+        const int reach = (int) (g.idx_top_k / pool_n - (g.idx_tail ? 1 : 0));
+        hy4k::k_gemv_f32<<<dim3((unsigned) ((ih + 7) / 8), T), 256, 0, st>>>(l.iproj, xn, iw, N, ih,
+                                                                           1.0f / sqrtf((float) (idd * ih)));
+        const size_t smem = ((size_t) ih * idd + ih) * sizeof(float);
+        hy4k::k_index_scores_pos<<<dim3(kScoreBlocks, T), 256, smem, st>>>(iq, iw, l.pooled, pos_d, pool_n, reach, ih,
+                                                                            idd, scores, (int) (ctx / pool_n));
+        hy4k::k_select_cells<<<T, 1024, 0, st>>>(scores, (int) (ctx / pool_n), pos_d, pool_n, reach, cells_sel,
+                                                 (int) g.idx_top_k, n_sel);
+    }
+
+    void dense_ffn(Layer& l, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc;
+        mmvq(l.f_gate, xq, fg, T);
+        mmvq(l.f_up, xq, fu, T);
+        hy4k::k_swiglu<<<blocks((int64_t) T * g.n_ff), hy4k::kThreads, 0, st>>>(fg, fu, fh, (int64_t) T * g.n_ff);
+        quant(fh, T, g.n_ff, hq);
+        mmvq(l.f_down, hq, y, T);
         hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
         hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
     }
 
-    void engram(Layer& l, int T) {
-        const auto& g = m->g;
-        const int N = (int) g.n_embd, hc = (int) g.hc;
-        const int eh = (int) g.eng_heads(), ed = (int) g.eng_dim;
-        hy4k::k_engram_rows<<<dim3(eh, T), 128, 0, st>>>(eraw + (size_t) l.eng * T * eh * ed, l.e_lnorm, evalid, erows,
-                                                         eh, ed, kEngramEps);
-        quant(erows, T, (int64_t) eh * ed, erq);
-        mmvq(l.e_kv, erq, ekv, T);
-        hy4k::k_engram_mix<<<T, 256, 0, st>>>(X, ekv, l.e_kv_b, l.e_gate, l.e_gamma, l.e_hcs, evalid, hc, N, kEngramEps);
-    }
-
-    /// The sparse layer's indexer: the rows' index keys into the tail, the groups they complete pooled, and, for a row
-    /// past the dense reach (more than idx_top_k / idx_pool - 1 groups before its own), the cells of the top groups.
-    void indexer(Layer& l, int T, int64_t p0, const int32_t*& cells, const int32_t*& counts) {
-        const auto& g = m->g;
-        const int N = (int) g.n_embd, ih = (int) g.idx_heads, idd = (int) g.idx_dim, pool_n = (int) g.idx_pool;
-        mmvq(l.iq_b, qrq, iq, T);
-        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, st>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, nullptr,
-                                                      (int) p0, l.theta);
-        mmvq(l.ik, xq, ik, T);
-        hy4k::k_rms<<<T, 128, 0, st>>>(ik, idd, l.ik_norm, ik, idd, idd, g.eps);
-        quant(ik, T, idd, ikq);
-        // value and gate rows of each cell into the tail ring: [cell % kTail][value | gate]
-        for (int t = 0; t < T; ++t) {
-            const int64_t c = (p0 + t) % kTail;
-            K::native_mmvq(l.icv.type, l.icv.d, ikq + (size_t) t * idd / 32 * 36, l.tail + (size_t) c * 2 * idd, idd,
-                           idd, 1, st);
-            K::native_mmvq(l.icg.type, l.icg.d, ikq + (size_t) t * idd / 32 * 36, l.tail + ((size_t) c * 2 + 1) * idd,
-                           idd, idd, 1, st);
-        }
-        // the groups these rows complete
-        int32_t* hp = h_pool + (size_t) l.il * 3 * T;
-        int ng = 0;
-        for (int t = 0; t < T; ++t) {
-            const int64_t p = p0 + t;
-            if ((p + 1) % pool_n) continue;
-            const int64_t grp = p / pool_n;
-            hp[ng] = (int32_t) (grp * pool_n);                        // its first position: the rope's
-            hp[T + ng] = (int32_t) ((grp * pool_n) % kTail / pool_n);   // its first cell in the tail, in groups
-            hp[2 * T + ng] = (int32_t) grp;                             // its slot in `pooled`
-            ++ng;
-        }
-        if (ng > 0) {
-            CK(cudaMemcpyAsync(pool_g, hp, (size_t) 3 * T * 4, cudaMemcpyHostToDevice, st));
-            hy4k::k_pool<<<ng, 128, 0, st>>>(l.tail, idd, pool_n, l.ape, l.ipool_norm, g.eps, l.theta, (int) g.n_rot,
-                                              pool_g, pool_g + T, pool_g + 2 * T, l.pooled);
-        }
-        // a row picks when its visible groups (those before its own) outnumber the dense reach
-        const int64_t reach = g.idx_top_k / pool_n - (g.idx_tail ? 1 : 0);
-        bool pick = false;
-        for (int t = 0; t < T; ++t) pick = pick || (p0 + t) / pool_n > reach;
-        if (!pick) return;
-        hy4k::k_gemv_f32<<<dim3((unsigned) ((ih + 7) / 8), T), 256, 0, st>>>(l.iproj, xn, iw, N, ih,
-                                                                           1.0f / sqrtf((float) (idd * ih)));
-        const int64_t ldsc = ctx / pool_n;
-        int32_t* hng = h_ng;   // the rows' visible groups
-        int64_t gmax = 0;
-        for (int t = 0; t < T; ++t) {
-            hng[t] = (int32_t) ((p0 + t) / pool_n);
-            gmax = std::max<int64_t>(gmax, hng[t]);
-        }
-        int32_t* ng_d = pool_g + 3 * T;
-        CK(cudaMemcpyAsync(ng_d, hng, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        const size_t smem = ((size_t) ih * idd + ih) * sizeof(float);
-        hy4k::k_index_scores<<<dim3((unsigned) ((gmax + 7) / 8), T), 256, smem, st>>>(iq, iw, l.pooled, ng_d, ih, idd,
-                                                                                      scores, (int) ldsc);
-        for (int t = 0; t < T; ++t)
-            CK(cudaMemcpyAsync(h_scores + (size_t) t * ldsc, scores + (size_t) t * ldsc, (size_t) hng[t] * 4,
-                               cudaMemcpyDeviceToHost, st));
-        CK(cudaStreamSynchronize(st));
-        // the top `reach` groups of each picking row, then its own group's cells up to itself
-        int32_t* hc_sel = h_cells;   // free again: its earlier contents went to the device before this layer
-        int32_t* hn = h_cells + (size_t) T * g.idx_top_k;
-        std::vector<int32_t> order;
-        for (int t = 0; t < T; ++t) {
-            const int64_t p = p0 + t, vis = p / pool_n;
-            int n = 0;
-            int32_t* row = hc_sel + (size_t) t * g.idx_top_k;
-            if (vis <= reach) {
-                for (int64_t q_ = 0; q_ <= p; ++q_) row[n++] = (int32_t) q_;
-            } else {
-                order.resize((size_t) vis);
-                for (int64_t i = 0; i < vis; ++i) order[(size_t) i] = (int32_t) i;
-                const float* sc = h_scores + (size_t) t * ldsc;
-                std::nth_element(order.begin(), order.begin() + reach, order.end(), [&](int32_t a, int32_t b) {
-                    return sc[a] > sc[b] || (sc[a] == sc[b] && a < b);
-                });
-                std::sort(order.begin(), order.begin() + reach);
-                for (int64_t i = 0; i < reach; ++i)
-                    for (int k = 0; k < pool_n; ++k) row[n++] = (int32_t) (order[(size_t) i] * pool_n + k);
-                for (int64_t q_ = vis * pool_n; q_ <= p; ++q_) row[n++] = (int32_t) q_;
-            }
-            hn[t] = n;
-        }
-        CK(cudaMemcpyAsync(cells_sel, hc_sel, (size_t) T * g.idx_top_k * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(n_sel, hn, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaStreamSynchronize(st));   // the host buffers are written again by the next layer
-        cells = cells_sel;
-        counts = n_sel;
-    }
-
-    void moe_layer(Layer& l, int T) {
+    /// The MoE layer's GPU work before the CPU's: the routing, the routed input to the host (an event when it is there),
+    /// the experts with a VRAM slot, the shared expert.
+    void moe_front(Layer& l, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, E = (int) g.n_expert, Kk = (int) g.top_k, Ld = (int) g.n_latent,
                   F = (int) g.n_ff_exp;
@@ -915,8 +889,7 @@ struct Engine {
         mmvq(l.r_down, xq, rin, T);
         CK(cudaMemcpyAsync(h_rin, rin, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * Kk * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaEventRecord(ev, st));
-        // the experts with a slot on the GPU, then the shared expert, while the CPU runs the others
+        CK(cudaEventRecordWithFlags(ev, st, cudaEventRecordExternal));   // a node of its own in a graph: the host waits on it
         if (l.n_slots > 0) {
             quant(rin, T, Ld, rinq);
             hy4k::k_group_slots<<<1, 512, 0, st>>>(ids, T * Kk, Kk, E, l.slot_of_d, l.slots, l.stride, grp_ptr, grp_start,
@@ -930,18 +903,29 @@ struct Engine {
         hy4k::k_swiglu<<<blocks((int64_t) T * F), hy4k::kThreads, 0, st>>>(sg, su, sh, (int64_t) T * F);
         quant(sh, T, F, hq);
         mmvq(l.s_down, hq, sy, T);
+    }
+
+    /// The CPU's part of an MoE layer, between two segments: the experts without a slot on the pool, their rows into
+    /// mapped memory (h_out, h_miss), which the next segment merges.
+    void cpu_part(Layer& l, int T) {
+        const auto& g = m->g;
+        const int Kk = (int) g.top_k, Ld = (int) g.n_latent;
         CK(cudaEventSynchronize(ev));
         const auto t0 = Clock::now();
-        for (int t = 0; t < T; ++t) C::native_quant_act(l.fmt, h_rin + (size_t) t * Ld, acts + (size_t) t * C::kNativeActBytes);
         jobs.clear();
         std::map<int, size_t> open;
         int n_miss = 0;
+        std::vector<char> quantized((size_t) T, 0);
         for (int e = 0; e < T * Kk; ++e) {
             const int ex = h_ids[e], t = e / Kk;
             l.use[(size_t) ex] += 1.f;
             h_miss[e] = l.slot_of[(size_t) ex] < 0;
             if (!h_miss[e]) continue;
             ++n_miss;
+            if (!quantized[(size_t) t]) {
+                C::native_quant_act(l.fmt, h_rin + (size_t) t * Ld, acts + (size_t) t * C::kNativeActBytes);
+                quantized[(size_t) t] = 1;
+            }
             auto it = open.find(ex);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
@@ -958,17 +942,20 @@ struct Engine {
         hits += T * Kk - n_miss;
         if (n_miss > 0) pool->run_split_multi_native(l.fmt, jobs.data(), (int) jobs.size());
         cpu_ms += ms_since(t0);
-        if (l.n_slots == 0) {
-            CK(cudaMemcpyAsync(parts, h_out, (size_t) T * Kk * Ld * 4, cudaMemcpyHostToDevice, st));
-        } else if (n_miss > 0) {
-            CK(cudaMemcpyAsync(ecpu, h_out, (size_t) T * Kk * Ld * 4, cudaMemcpyHostToDevice, st));
-            CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) T * Kk * 4, cudaMemcpyHostToDevice, st));
-            hy4k::k_merge_cpu<<<T * Kk, hy4k::kThreads, 0, st>>>(parts, ecpu, d_miss, Ld);
-        }
+    }
+
+    /// The MoE layer's end: the CPU's rows merged (read through the mapping), the weighted sum, routed_up, the shared
+    /// expert added, the FFN's norm, iHC's post.
+    void moe_end(Layer& l, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc, Kk = (int) g.top_k, Ld = (int) g.n_latent;
+        hy4k::k_merge_cpu<<<T * Kk, hy4k::kThreads, 0, st>>>(parts, h_out_d, h_miss_d, Ld);
         hy4k::k_moe_sum<<<T, hy4k::kThreads, 0, st>>>(parts, wts, moe, Kk, Ld);
         quant(moe, T, Ld, moeq);
         mmvq(l.r_up, moeq, y, T);
         hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(y, sy, (int64_t) T * N);
+        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
     }
 
     // ---- the routed experts in VRAM
@@ -1244,6 +1231,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     bool serve = false;
     double expert_vram = -1;
     std::string profile;
+    bool graphs = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -1271,6 +1259,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--serve") serve = true;
         else if (a == "--expert-vram") expert_vram = std::atof(next());
         else if (a == "--expert-profile") profile = next();
+        else if (a == "--no-graph") graphs = false;
         else if (a == "--tier-gpus") (void) next();   // the expert tiers' GPUs: not used yet (open item ey)
         else {
             std::fprintf(stderr, "lamina: Hy4-flash's path does not take %s\n", a.c_str());
@@ -1287,6 +1276,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     }
     Engine E;
     E.profile_path = profile;
+    E.use_graphs = graphs;
     E.init(m, max_ctx, threads);
     E.place_slots(expert_vram);
     if (serve) {

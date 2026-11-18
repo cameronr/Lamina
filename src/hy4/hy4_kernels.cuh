@@ -196,7 +196,7 @@ __global__ void k_head_q8_0(const uint8_t* w, const uint8_t* xq, float* y, int H
 
 /// The cached latent row of token t: [rms(kva[0:512]) * norm | roped kva[512:576]] as halves into cache row cell[t].
 /// Rope as k_rope_norm (one head of n_rot at 512).
-__global__ void k_kv_store(const float* kva, const float* norm, __half* cache, const int32_t* cell, int pos0,
+__global__ void k_kv_store(const float* kva, const float* norm, __half* cache, const int32_t* pos, int ring,
                            float theta_scale, float eps) {
     __shared__ float sh[32];
     const int t = blockIdx.x;
@@ -205,17 +205,25 @@ __global__ void k_kv_store(const float* kva, const float* norm, __half* cache, c
     for (int i = threadIdx.x; i < kLatent; i += blockDim.x) s += r[i] * r[i];
     s = block_sum(s, sh);
     const float inv = rsqrtf(s / (float) kLatent + eps);
-    __half* dst = cache + (size_t) cell[t] * kKvRow;
+    __half* dst = cache + (size_t) (ring ? pos[t] % ring : pos[t]) * kKvRow;
     for (int i = threadIdx.x; i < kLatent; i += blockDim.x) dst[i] = __float2half(r[i] * inv * norm[i]);
     const int i = threadIdx.x;
     if (i < (kKvRow - kLatent) / 2) {
-        const float p = (float) (pos0 + t);
+        const float p = (float) pos[t];
         const float theta = p * powf(theta_scale, (float) i);
         const float c = cosf(theta), sn = sinf(theta);
         const float x0 = r[kLatent + 2 * i], x1 = r[kLatent + 2 * i + 1];
         dst[kLatent + 2 * i] = __float2half(x0 * c - x1 * sn);
         dst[kLatent + 2 * i + 1] = __float2half(x0 * sn + x1 * c);
     }
+}
+
+/// A window layer's cells for row t: the positions max(0, p - n_swa + 1) .. p in the ring of `ring` cells.
+__global__ void k_swa_cells(const int32_t* pos, int n_swa, int ring, int32_t* cells, int32_t* n) {
+    const int t = blockIdx.x;
+    const int p = pos[t], a = max(0, p - n_swa + 1);
+    for (int i = threadIdx.x; i <= p - a; i += blockDim.x) cells[(size_t) t * n_swa + i] = (a + i) % ring;
+    if (threadIdx.x == 0) n[t] = p - a + 1;
 }
 
 /// The latent attention of T rows over their cell lists (cells[t][0 .. n[t]) of the cache), split in chunks of
@@ -528,6 +536,188 @@ __global__ void __launch_bounds__(256) k_engram_mix(float* X, const float* kv, c
 }
 
 // ------------------------------------------------------------------------------------------------ the indexer
+/// The indexer's value and gate rows of row t into its tail cell (pos % tail): [cell][value | gate]
+__global__ void k_tail_store(const float* v, const float* gt, float* tail, const int32_t* pos, int n_tail, int dim) {
+    const int t = blockIdx.x;
+    float* dst = tail + (size_t) (pos[t] % n_tail) * 2 * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        dst[i] = v[(size_t) t * dim + i];
+        dst[dim + i] = gt[(size_t) t * dim + i];
+    }
+}
+
+/// Row t's group pooled when the row completes it ((pos + 1) % pool == 0): k_pool's arithmetic on the tail's cells of
+/// the group, into pooled + group * dim.  A block of dim threads per row.
+__global__ void k_pool_rows(const float* tail, int n_tail, int dim, int pool, const float* ape, const float* norm,
+                            float eps, float theta_scale, int n_rot, const int32_t* pos, float* pooled) {
+    __shared__ float sh[32];
+    __shared__ float kk[256];
+    const int p = pos[blockIdx.x], c = threadIdx.x;
+    if ((p + 1) % pool) return;
+    const int grp = p / pool;
+    const float* src = tail + (size_t) ((grp * pool) % n_tail) * 2 * dim;
+    if (c < dim) {
+        float mx = -INFINITY;
+        for (int m = 0; m < pool; ++m) mx = fmaxf(mx, src[((size_t) m * 2 + 1) * dim + c] + ape[(size_t) m * dim + c]);
+        float den = 0.f, num = 0.f;
+        for (int m = 0; m < pool; ++m) {
+            const float e = expf(src[((size_t) m * 2 + 1) * dim + c] + ape[(size_t) m * dim + c] - mx);
+            den += e;
+            num += e * src[((size_t) m * 2) * dim + c];
+        }
+        kk[c] = num / den;
+    }
+    float s = c < dim ? kk[c] * kk[c] : 0.f;
+    s = block_sum(s, sh);
+    const float inv = rsqrtf(s / (float) dim + eps);
+    if (c < dim) kk[c] = kk[c] * inv * norm[c];
+    __syncthreads();
+    const int nope = dim - n_rot;
+    if (c < dim) {
+        float v = kk[c];
+        if (c >= nope) {
+            const int i = (c - nope) / 2;
+            const float theta = (float) (grp * pool) * powf(theta_scale, (float) i);
+            const float cs = cosf(theta), sn = sinf(theta);
+            const float x0 = kk[nope + 2 * i], x1 = kk[nope + 2 * i + 1];
+            v = ((c - nope) & 1) == 0 ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
+        }
+        pooled[(size_t) grp * dim + c] = v;
+    }
+}
+
+/// The indexer's scores of row t over its visible groups 0 .. pos / pool when they outnumber `reach` (else none: the
+/// row attends every cell): s_g = sum_h w[t][h] relu(q[t][h] . k_g).  A warp a group, in a grid-stride loop over
+/// `gridDim.x` blocks of 8 warps (a fixed grid, for the graphs).
+__global__ void __launch_bounds__(256) k_index_scores_pos(const float* q, const float* w, const float* pooled,
+                                                           const int32_t* pos, int pool, int reach, int heads, int dim,
+                                                           float* scores, int ld_scores) {
+    extern __shared__ float qs[];   // [heads][dim], then w [heads]
+    const int t = blockIdx.y;
+    const int vis = pos[t] / pool;
+    if (vis <= reach) return;
+    for (int i = threadIdx.x; i < heads * dim; i += blockDim.x) qs[i] = q[(size_t) t * heads * dim + i];
+    for (int i = threadIdx.x; i < heads; i += blockDim.x) qs[heads * dim + i] = w[(size_t) t * heads + i];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int gidx = blockIdx.x * 8 + warp; gidx < vis; gidx += gridDim.x * 8) {
+        const float* kr = pooled + (size_t) gidx * dim;
+        float kv[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) kv[j] = lane + 32 * j < dim ? kr[lane + 32 * j] : 0.f;
+        float sc = 0.f;
+        for (int h = 0; h < heads; ++h) {
+            float d = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                if (lane + 32 * j < dim) d += qs[h * dim + lane + 32 * j] * kv[j];
+            d = warp_sum(d);
+            sc += qs[heads * dim + h] * fmaxf(d, 0.f);
+        }
+        if (lane == 0) scores[(size_t) t * ld_scores + gidx] = sc;
+    }
+}
+
+__device__ __forceinline__ uint32_t f2key(float f) {   // larger float, larger key
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/// A sparse layer's cells for row t (a block of 1024 per row): every position 0 .. p while its visible groups (pos /
+/// pool) are at most `reach`, else the cells of the `reach` top-scoring groups (a radix select over the scores' keys,
+/// ties by ascending group) in ascending group order, then its own group's cells up to itself.  cells [T][ld].
+__global__ void __launch_bounds__(1024) k_select_cells(const float* scores, int ld_scores, const int32_t* pos, int pool,
+                                                       int reach, int32_t* cells, int ld, int32_t* n) {
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t s_prefix, s_mask, s_need;
+    __shared__ int s_counts[1024];
+    const int t = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    const int p = pos[t], vis = p / pool;
+    int32_t* row = cells + (size_t) t * ld;
+    if (vis <= reach) {
+        for (int i = tid; i <= p; i += nt) row[i] = i;
+        if (tid == 0) n[t] = p + 1;
+        return;
+    }
+    const float* sc = scores + (size_t) t * ld_scores;
+    if (tid == 0) { s_prefix = 0; s_mask = 0; s_need = (uint32_t) reach; }
+    __syncthreads();
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = tid; i < 256; i += nt) hist[i] = 0;
+        __syncthreads();
+        const uint32_t prefix = s_prefix, mask = s_mask;
+        for (int i = tid; i < vis; i += nt) {
+            const uint32_t k = f2key(sc[i]);
+            if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 0xFFu], 1u);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            uint32_t need = s_need, acc = 0;
+            int b = 255;
+            for (; b > 0; --b) {
+                if (acc + hist[b] >= need) break;
+                acc += hist[b];
+            }
+            s_need = need - acc;   // of bin b, the largest still to take
+            s_prefix = prefix | ((uint32_t) b << shift);
+            s_mask = mask | (0xFFu << shift);
+        }
+        __syncthreads();
+    }
+    // the threshold key: every key above it, and the first s_need equal to it in group order; each thread a contiguous
+    // range of groups, so the order is the groups'
+    const uint32_t thr = s_prefix, need_eq = s_need;
+    const int per = (vis + nt - 1) / nt, a = min(vis, tid * per), b = min(vis, a + per);
+    int eq_n = 0;
+    for (int i = a; i < b; ++i) eq_n += f2key(sc[i]) == thr;
+    // the equal keys before each thread's range (an exclusive scan): the first need_eq of them in group order are taken
+    s_counts[tid] = eq_n;
+    __syncthreads();
+    if (tid == 0) {
+        int run = 0;
+        for (int i = 0; i < nt; ++i) {
+            const int v = s_counts[i];
+            s_counts[i] = run;
+            run += v;
+        }
+    }
+    __syncthreads();
+    // the picks in group order: thread i's above-threshold groups and its share of the equal ones; their positions in
+    // `row` follow from the counts of the picks before them, which the two scans give per kind but not interleaved:
+    // the picks are written per thread in its order, then the list is ascending as a whole because a later thread's
+    // groups are all larger - so a pick's slot is (its thread's picks before it) + (picks of earlier threads)
+    __shared__ int s_picked[1024];
+    int my_eq_base = s_counts[tid];
+    int mine = 0;
+    for (int i = a; i < b; ++i) {
+        const uint32_t k = f2key(sc[i]);
+        if (k > thr || (k == thr && (uint32_t) (my_eq_base++) < need_eq)) ++mine;
+    }
+    s_picked[tid] = mine;
+    __syncthreads();
+    if (tid == 0) {
+        int run = 0;
+        for (int i = 0; i < nt; ++i) {
+            const int v = s_picked[i];
+            s_picked[i] = run;
+            run += v;
+        }
+    }
+    __syncthreads();
+    int slot = s_picked[tid];
+    my_eq_base = s_counts[tid];
+    for (int i = a; i < b; ++i) {
+        const uint32_t k = f2key(sc[i]);
+        if (k > thr || (k == thr && (uint32_t) (my_eq_base++) < need_eq)) {
+            for (int c = 0; c < pool; ++c) row[slot * pool + c] = i * pool + c;
+            ++slot;
+        }
+    }
+    const int tail0 = vis * pool;
+    for (int i = tid; i <= p - tail0; i += nt) row[reach * pool + i] = tail0 + i;
+    if (tid == 0) n[t] = reach * pool + (p - tail0 + 1);
+}
+
 /// Group g's pooled key from its `pool` cells' value and gate rows (vg + gsrc[g] * pool * 2 * dim: [pool][2][dim],
 /// value then gate, the members in order): p_m = softmax over the members of (gate_m + ape[m]) per channel, k = sum_m
 /// p_m value_m, RMS-normed * norm, its last n_rot values roped at position gpos[g] (rope_norm) -> out + gdst[g] * dim.
