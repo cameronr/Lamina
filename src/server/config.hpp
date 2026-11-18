@@ -82,6 +82,11 @@ std::optional<std::vector<std::string>> effort_end_args(const json& cfg, const T
 double engine_silence_s(const json& cfg);
 /// the engine's arguments: the config's, with what "vision", "parallel" and "expert_profile_save" ask for
 std::vector<std::string> engine_args(const json& cfg);
+/// the deprecated options a start uses, "FLAG VALUE: what takes its place" each, once: the engine's deprecated
+/// spellings (program::deprecated_option) in its command line `line` (engine_args) and in the replicas' own args, and
+/// --native in place of "model".  `file`: the config as its file has it (the server writes its "model" into the merged
+/// config's args as --native)
+std::vector<std::string> deprecated_options(const json& file, const std::vector<std::string>& line);
 /// An engine option on lamina-server's command line: the flag ("--max-context") and the values that follow it.
 using EngineOption = std::vector<std::string>;
 /// `opts` into the config's args, each in place of the args' own instances of its flag (with their values: the words

@@ -603,6 +603,12 @@ int run(int argc, char** argv) {
             }
             sampling_defaults = sampling_defaults_from_config(cfg);
             if (!sampling_defaults.empty()) say("[lamina] sampling defaults from the config: " + items(sampling_defaults));
+            std::vector<std::string> args = engine_args(cfg);
+            if (const std::vector<std::string> old = deprecated_options(file_cfg, args); !old.empty()) {
+                say("[lamina] deprecated options, still taken (--write-config FILE writes a config with what takes "
+                    "their place; a --gpu card is an item of its \"gpu\"):");
+                for (const std::string& o : old) say("         " + o);
+            }
             lazy = jget(cfg, "lazy_load") == true;
             if (truthy(jget(cfg, "vision"))) {
                 say(lazy ? "vision encoder unloaded; it starts with the model ..." : "loading the vision encoder ...");
@@ -619,7 +625,6 @@ int run(int argc, char** argv) {
                 vision = std::make_shared<Vision>(vcfg, log, venv, lazy);
             }
             say(lazy ? "model unloaded; the first request loads it ..." : "loading the model (the first start takes a minute or two) ...");
-            std::vector<std::string> args = engine_args(cfg);
             const double silence = engine_silence_s(cfg);   // #481: checked before the (minutes-long) start
             effort_end = effort_end_args(cfg, *tok);        // #458
             if (effort_end) args.insert(args.end(), effort_end->begin(), effort_end->end());

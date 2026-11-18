@@ -411,7 +411,28 @@ bool number_list(const char* s, std::vector<double>& out) {
     }
 }
 
-/// --help: the options most runs set; --help-all: every one, then the older spellings the engine still takes.
+/// The deprecated spellings the engine still takes (--help-all's last part; lamina-server names the ones a start uses).
+const lamina::program::DeprecatedOption kDeprecated[] = {
+    {"--main-gpu", "GPU", "the first --gpu's card"},
+    {"--second-gpu", "G[,G,G]", "the later --gpu's cards, or auto (-1: none)"},
+    {"--tier-gpus", "G[,G,G]", "the later --gpu's cards, as --second-gpu"},
+    {"--expert-cache", "N|auto", "the main GPU's cache= (N slots; 0: the profile's count)"},
+    {"--vram-reserve-mib", "M", "the main GPU's reserve= in MiB"},
+    {"--vram-pin-gib", "G", "the main GPU's vram-only= in GiB"},
+    {"--second-gpu-pin-gib", "G", "the first tier's vram-only= in GiB"},
+    {"--second-gpu-gib", "G[,..]", "each tier's cache= in GiB (0: auto)"},
+    {"--second-gpu-reserve-mib", "R[,..]", "each tier's reserve= in MiB"},
+    {"--second-gpu-prefetch-mb", "M[,..]", "each tier's prefetch= in MiB"},
+    {"--second-gpu-clocks", "C[,..]", "each tier's clocks= (0: the driver's)"},
+    {"--second-gpu-sleep-us", "T[,..]", "each tier's sleep= in microseconds (0: none)"},
+    {"--second-gpu-clocks-hold", "S", "--clocks-hold in seconds"},
+    {"--second-gpu-clocks-lead", "S", "--clocks-lead in seconds"},
+    {"--second-gpu-min-mb", "M", "--tier-min in MiB"},
+    {"--second-gpu-adapt", "", "--tier-adapt"},
+    {"--no-second-gpu-adapt", "", "--no-tier-adapt"},
+};
+
+/// --help: the options most runs set; --help-all: every one, then the deprecated spellings the engine still takes.
 void usage(bool all = false) {
     std::fprintf(stderr,
                  "lamina --native MODEL.gguf [options]   (lamina-server runs it; generate mode also takes --tokens)\n"
@@ -621,23 +642,15 @@ void usage(bool all = false) {
                  "  --pool-workers N     the CPU expert pool's workers (default 0: every physical core but the\n"
                  "                       host loop's)\n"
                  "\n"
-                 "Older spellings, still taken (a card's own setting wins over them; a per-tier list's values go to the\n"
-                 "tiers in order, its last one to those past it; of --gpu, --main-gpu and --second-gpu the later takes\n"
-                 "the earlier's place: --second-gpu -1 after the cards, no tiers):\n"
-                 "  --main-gpu GPU       the first --gpu's card\n"
-                 "  --second-gpu G[,G,G] the later --gpu's cards, or auto (--tier-gpus the same; -1: none)\n"
-                 "  --expert-cache N|auto  the main GPU's cache= (N slots; 0: the profile's count; default auto)\n"
-                 "  --vram-reserve-mib M the main GPU's reserve= in MiB\n"
-                 "  --vram-pin-gib G     the main GPU's vram-only= in GiB\n"
-                 "  --second-gpu-pin-gib G  the first tier's vram-only= in GiB\n"
-                 "  --second-gpu-gib G[,..]  each tier's cache= in GiB (0: auto)\n"
-                 "  --second-gpu-reserve-mib R[,..]  each tier's reserve= in MiB\n"
-                 "  --second-gpu-prefetch-mb M[,..]  each tier's prefetch= in MiB\n"
-                 "  --second-gpu-clocks C[,..]  each tier's clocks=\n"
-                 "  --second-gpu-sleep-us T[,..]  each tier's sleep= in microseconds\n"
-                 "  --second-gpu-clocks-hold S, --second-gpu-clocks-lead S  --clocks-hold, --clocks-lead in seconds\n"
-                 "  --second-gpu-min-mb M  --tier-min in MiB\n"
-                 "  --no-second-gpu-adapt  --no-tier-adapt\n");
+                 "Deprecated spellings, still taken (a card's own setting wins over them; a per-tier list's values go\n"
+                 "to the tiers in order, its last one to those past it; of --gpu, --main-gpu and --second-gpu the later\n"
+                 "takes the earlier's place: --second-gpu -1 after the cards, no tiers; lamina-server names the ones a\n"
+                 "start uses):\n");
+    for (const lamina::program::DeprecatedOption& d : kDeprecated) {
+        std::string left = std::string(d.flag) + (*d.value ? " " : "") + d.value;
+        left += std::string(left.size() < 21 ? 21 - left.size() : 2, ' ');
+        std::fprintf(stderr, "  %s%s\n", left.c_str(), d.instead);
+    }
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -1808,6 +1821,12 @@ int lamina::program::check_args(int argc, char** argv) {
     Options o;
     bool help = false;
     return parse_options(argc, argv, o, help, false);
+}
+
+const lamina::program::DeprecatedOption* lamina::program::deprecated_option(const char* flag) {
+    for (const DeprecatedOption& d : kDeprecated)
+        if (std::strcmp(d.flag, flag) == 0) return &d;
+    return nullptr;
 }
 
 const char* lamina::program::option_default(const char* flag) {

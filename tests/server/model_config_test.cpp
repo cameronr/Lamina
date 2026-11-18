@@ -242,14 +242,14 @@ int main() {
     // "gpu": cards (names, objects of "id" and settings) or the earlier numbers; engine_args puts a --gpu each in place
     // of the args' own GPU names
     {
-        const json cfg = {{"gpu", {"GPU-75af3083", "RTX 5070 Ti", {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"},
-                                                                  {"sleep", "55us"}}}},
-                          {"args", {"--native", "m.gguf", "--main-gpu", "0", "--kv", "int8"}}};
-        CHECK((lamina::gpu_cards(cfg) == std::vector<std::string>{"GPU-75af3083", "RTX 5070 Ti",
-                                                                  "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
-        CHECK(lamina::gpu_list(cfg).empty() && (lamina::gpu_list({{"gpu", "0,2"}}) == std::vector<int>{0, 2}) &&
+        const json carded = {{"gpu", {"GPU-75af3083", "RTX 5070 Ti",
+                                      {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"}, {"sleep", "55us"}}}},
+                             {"args", {"--native", "m.gguf", "--main-gpu", "0", "--kv", "int8"}}};
+        CHECK((lamina::gpu_cards(carded) == std::vector<std::string>{"GPU-75af3083", "RTX 5070 Ti",
+                                                                     "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
+        CHECK(lamina::gpu_list(carded).empty() && (lamina::gpu_list({{"gpu", "0,2"}}) == std::vector<int>{0, 2}) &&
               !lamina::gpu_cards({{"gpu", {0, 2}}}));
-        CHECK((lamina::engine_args(cfg) ==
+        CHECK((lamina::engine_args(carded) ==
                std::vector<std::string>{"--native", "m.gguf", "--kv", "int8", "--gpu", "GPU-75af3083", "--gpu",
                                         "RTX 5070 Ti", "--gpu", "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us"}));
         bool refused = false;
@@ -263,22 +263,23 @@ int main() {
     // the form --write-config writes: the older GPU flags as cards, the other older names renamed, the options at the
     // engine's default left out, --native as "model", "args" an object
     {
-        const json old = {{"args", {"--native", "m.gguf", "--expert-cache", "auto", "--prefill", "16384", "--spec", "4",
-                                    "--spec-min-p", "0.5", "--adapt-every", "1", "--max-context", "262144", "--kv", "k8v4",
-                                    "--kv-grow", "--hc-q8", "--arena-place", "--pcie-mode", "kernel", "--pcie-frac", "0",
-                                    "--second-gpu", "RTX 5070 Ti,GPU-f26e9ba6", "--second-gpu-clocks", "0,1395-2100/9751",
-                                    "--second-gpu-clocks-hold", "1", "--second-gpu-clocks-lead", "1.0",
-                                    "--second-gpu-sleep-us", "0,55", "--main-gpu", "GPU-75af3083", "--prompt-split", "26"}},
-                          {"port", 8081}};
-        const json m = lamina::modern_config(old, true);
-        CHECK(m["model"] == "m.gguf");
-        CHECK((m["gpu"] == json{"GPU-75af3083", "RTX 5070 Ti",
-                                {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"}, {"sleep", "55us"}}}));
-        CHECK((m["args"] == json{{"kv", "k8v4"}, {"arena-place", true}, {"clocks-hold", "1s"}, {"clocks-lead", "1s"},
-                                 {"prompt-split", 26}}));
-        CHECK(m["port"] == 8081 && m.begin().key() == "model");
+        const json earlier = {
+            {"args", {"--native", "m.gguf", "--expert-cache", "auto", "--prefill", "16384", "--spec", "4",
+                      "--spec-min-p", "0.5", "--adapt-every", "1", "--max-context", "262144", "--kv", "k8v4",
+                      "--kv-grow", "--hc-q8", "--arena-place", "--pcie-mode", "kernel", "--pcie-frac", "0",
+                      "--second-gpu", "RTX 5070 Ti,GPU-f26e9ba6", "--second-gpu-clocks", "0,1395-2100/9751",
+                      "--second-gpu-clocks-hold", "1", "--second-gpu-clocks-lead", "1.0", "--second-gpu-sleep-us",
+                      "0,55", "--main-gpu", "GPU-75af3083", "--prompt-split", "26"}},
+            {"port", 8081}};
+        const json written = lamina::modern_config(earlier, true);
+        CHECK(written["model"] == "m.gguf");
+        CHECK((written["gpu"] == json{"GPU-75af3083", "RTX 5070 Ti",
+                                      {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"}, {"sleep", "55us"}}}));
+        CHECK((written["args"] == json{{"kv", "k8v4"}, {"arena-place", true}, {"clocks-hold", "1s"},
+                                       {"clocks-lead", "1s"}, {"prompt-split", 26}}));
+        CHECK(written["port"] == 8081 && written.begin().key() == "model");
         // the engine reads the same: the cards, the renamed options
-        const std::vector<std::string> e = lamina::engine_args(m);
+        const std::vector<std::string> e = lamina::engine_args(written);
         CHECK(std::find(e.begin(), e.end(), "GPU-f26e9ba6,clocks=1395-2100/9751,sleep=55us") != e.end() &&
               std::find(e.begin(), e.end(), "--clocks-lead") != e.end());
         // another model's path keeps its options (its defaults are its own), and an auto tier its per-tier lists
@@ -288,6 +289,26 @@ int main() {
         // nothing left: an empty object, not none (a config without "args" is the preset's)
         const json e2 = lamina::modern_config({{"args", {"--native", "m.gguf", "--spec", "4"}}}, true);
         CHECK(e2["args"].is_object() && e2["args"].empty());
+        // the deprecated options a start names: the older config's, in its order; none in the form written
+        CHECK((lamina::deprecated_options(earlier, lamina::engine_args(earlier)) ==
+               std::vector<std::string>{
+                   "--native: the config's \"model\"",
+                   "--expert-cache auto: the main GPU's cache= (N slots; 0: the profile's count)",
+                   "--second-gpu \"RTX 5070 Ti,GPU-f26e9ba6\": the later --gpu's cards, or auto (-1: none)",
+                   "--second-gpu-clocks 0,1395-2100/9751: each tier's clocks= (0: the driver's)",
+                   "--second-gpu-clocks-hold 1: --clocks-hold in seconds",
+                   "--second-gpu-clocks-lead 1.0: --clocks-lead in seconds",
+                   "--second-gpu-sleep-us 0,55: each tier's sleep= in microseconds (0: none)",
+                   "--main-gpu GPU-75af3083: the first --gpu's card"}));
+        CHECK(lamina::deprecated_options(written, lamina::engine_args(written)).empty());
+        // a switch of an object's args, a replica entry's own args, each once
+        const json r = {{"model", "m.gguf"},
+                        {"args", {{"second-gpu-adapt", false}}},
+                        {"replicas", json::array({json{{"args", {"--vram-reserve-mib", "800"}}},
+                                                  json{{"args", {"--vram-reserve-mib", "800"}}}})}};
+        CHECK((lamina::deprecated_options(r, lamina::engine_args(r)) ==
+               std::vector<std::string>{"--no-second-gpu-adapt: --no-tier-adapt",
+                                        "--vram-reserve-mib 800: the main GPU's reserve= in MiB"}));
     }
 
     fs::remove_all(dir, ec);

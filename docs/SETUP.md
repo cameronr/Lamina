@@ -267,8 +267,10 @@ A card's settings, each optional:
 Sizes are binary (`8G`, `700M`), times have their unit (`55us`, `1.5ms`, `1s`). `"gpu"` as numbers alone (`[0, 1]`,
 `--gpu 0,1`) keeps its earlier meaning: the cards the engine sees, the first its main one. An earlier config's
 `--main-gpu`, `--second-gpu` and per-tier lists (`--second-gpu-clocks 0,1395-2100/9751`: a value per tier in their
-order) still work, a card's own setting winning over them; of `--gpu`, `--main-gpu` and `--second-gpu` the later takes
-the earlier's place (`--second-gpu -1` after a config's cards: no tiers).
+order) still work, deprecated (`lamina --help-all` lists them), a card's own setting winning over them; of `--gpu`,
+`--main-gpu` and `--second-gpu` the later takes the earlier's place (`--second-gpu -1` after a config's cards: no tiers).
+lamina-server names the deprecated options a start uses in its window, each with what takes its place (an earlier
+config's `--native` in its `"args"`, in place of `"model"`, too).
 
 **Each GPU is checked** before the engine uses it: one older than the RTX 30 series (compute capability below 8.0), or
 one the programs have no kernels for, stops the start as the main GPU and is left out as a tier or a layer split's GPU,

@@ -599,6 +599,32 @@ std::vector<std::string> engine_args(const json& cfg) {
     return args;
 }
 
+std::vector<std::string> deprecated_options(const json& file, const std::vector<std::string>& line) {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& note) {
+        if (std::find(out.begin(), out.end(), note) == out.end()) out.push_back(note);
+    };
+    if (has(args_of(file), "--native")) add("--native: the config's \"model\"");
+    auto scan = [&](const std::vector<std::string>& args) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            const program::DeprecatedOption* d = program::deprecated_option(args[i].c_str());
+            if (d == nullptr) continue;
+            std::string used = args[i];
+            if (*d->value && i + 1 < args.size()) used += " " + shell_word(args[++i]);
+            add(used + ": " + d->instead);
+        }
+    };
+    scan(line);
+    if (const json& spec = jget(file, "replicas"); spec.is_array())   // an entry's own, added to the config's
+        for (const json& entry : spec) {
+            std::vector<std::string> own;
+            if (entry.is_object())
+                for (const json& a : args_as_list(jget(entry, "args"))) own.push_back(arg_str(a));
+            scan(own);
+        }
+    return out;
+}
+
 void apply_engine_options(json& cfg, const std::vector<EngineOption>& opts) {
     if (opts.empty()) return;
     auto flag = [](const std::string& s) { return s.size() > 2 && starts_with(s, "--"); };
