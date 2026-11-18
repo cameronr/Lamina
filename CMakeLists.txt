@@ -321,7 +321,8 @@ if(LAMINA_ENABLE_CUDA)
   target_include_directories(lamina_serve_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_library(lamina_program STATIC src/program/generate.cpp)
   target_include_directories(lamina_program PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(lamina_program PUBLIC lamina_engine lamina_prefill lamina_spec lamina_serve_io CUDA::cudart)
+  target_link_libraries(lamina_program PUBLIC lamina_engine lamina_prefill lamina_spec lamina_serve_io lamina_cards
+                        CUDA::cudart)
   # src/platform/cpu_floor.cpp: the CPU check before anything else of the program runs
   add_executable(lamina src/program/main.cpp src/platform/cpu_floor.cpp)
   target_link_libraries(lamina PRIVATE lamina_program)
@@ -356,7 +357,7 @@ if(LAMINA_ENABLE_CUDA)
     add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
     add_test(NAME control_vector_test COMMAND control_vector_test)
     add_test(NAME adaptive_policy_test COMMAND adaptive_policy_test)
-    add_test(NAME deterministic_adapt_help COMMAND lamina --deterministic-adapt --help)
+    add_test(NAME deterministic_adapt_help COMMAND lamina --deterministic-adapt --help-all)
     set_tests_properties(deterministic_adapt_help PROPERTIES
                          PASS_REGULAR_EXPRESSION "--deterministic-adapt")
   endif()
@@ -441,6 +442,12 @@ target_include_directories(lamina_spec PUBLIC include)
 add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
 target_link_libraries(suffix_drafter_test PRIVATE lamina_spec)
 add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
+# --gpu's cards and the units of the engine's sizes and times (the engine's parser and the server's config)
+add_library(lamina_cards STATIC src/program/gpu_cards.cpp)
+target_include_directories(lamina_cards PUBLIC include)
+add_executable(gpu_cards_test tests/core/gpu_cards_test.cpp)
+target_link_libraries(gpu_cards_test PRIVATE lamina_cards)
+add_test(NAME gpu_cards_test COMMAND gpu_cards_test)
 if(LAMINA_BUILD_TESTS)
   # the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
@@ -950,7 +957,7 @@ endif()
 
 # The tests that need no GPU (nor a CUDA driver): `ctest -L cpu`, what CI runs (.github/workflows/build.yml)
 if(LAMINA_BUILD_TESTS)
-  foreach(_t suffix_drafter_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
+  foreach(_t suffix_drafter_test gpu_cards_test bf16_bits_test tool_args_test pool_stress expert_multi_test iq_avx2_parity
              q8k_quant_parity draft_pass_test adaptive_policy_test expert_profile_save_test prompt_cache_spread_test
              conversation_cache_test control_vector_test deterministic_adapt_help platform_memory_test
              ple_reader_selftest model_config_test params_test bench_test cpu_floor_test)

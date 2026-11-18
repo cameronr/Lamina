@@ -49,6 +49,8 @@ struct RamFit {
     /// It runs, but less than 6 GiB would stay available once it is taken: other programs' memory goes to the page file
     /// (Linux: the engine may be ended), and the conversation cache parks nothing (its --ram-reserve-mib, 6 GiB).
     bool tight() const;
+    /// The largest need that is neither too_much() nor tight(), in bytes (UINT64_MAX when the RAM cannot be read).
+    uint64_t room() const;
     /// What too_much() or tight() says, `what` the need's name ("the model's experts"), then `remedy`; "" when it fits.
     std::string say(const std::string& what, const std::string& remedy) const;
 };

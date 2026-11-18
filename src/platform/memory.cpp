@@ -228,6 +228,13 @@ bool RamFit::too_much() const { return total > 0 && need + kSystemRam > total; }
 
 bool RamFit::tight() const { return total > 0 && !too_much() && need + kSpareRam > available; }
 
+uint64_t RamFit::room() const {
+    if (total == 0) return UINT64_MAX;
+    const uint64_t all = total > kSystemRam ? total - kSystemRam : 0;
+    const uint64_t spare = available > kSpareRam ? available - kSpareRam : 0;
+    return std::min(all, spare);
+}
+
 std::string RamFit::say(const std::string& what, const std::string& remedy) const {
     if (too_much())
         return "not enough RAM: " + what + " take " + gib(need) + ", and this PC has " + gib(total) +

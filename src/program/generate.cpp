@@ -10,6 +10,7 @@
 #include "lamina/qwen35/engine.hpp"
 #endif
 #include "lamina/program/engine.hpp"
+#include "lamina/program/gpu_cards.hpp"
 #include "lamina/program/serve_io.hpp"
 #include "lamina/core/adaptive_tier.hpp"
 #include "lamina/core/expert_cache.hpp"
@@ -116,7 +117,8 @@ using Clock = std::chrono::steady_clock;
 struct Options {
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
-    int64_t max_context = 4096;
+    /// the K/V's cells; 0 until parse_options settles it: --serve the trained context (kTrainedContext), else 4096
+    int64_t max_context = 0;
     std::string ple_gguf;              // the GGUF holding the PLE table (default: found among --native's)
     /// rope scaling past the trained 262K (upstream main's knobs, through the CLI: the model files carry no
     /// rope.scaling keys).  A process constant, resolved before session_init and any graph capture.
@@ -145,7 +147,7 @@ struct Options {
     std::string dump_routing;
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
     /// the VRAM tier's slots (--expert-cache: 0 = the profile's count, -1 = auto, sized from the free VRAM)
-    int expert_cache = 0;
+    int expert_cache = -1;
     /// R4.2e: a `profile.bin` from `tools/make_profile.py`.  **When given, it decides residency instead of the
     /// compulsory-miss policy**, which is the whole point: a profile ranked by routing frequency over a whole
     /// trace is what the plan's `h = 0.6447` refers to, and compulsory-miss measured 0.4864 because it fills
@@ -161,8 +163,9 @@ struct Options {
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
-    /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
-    int64_t prefill_chunk = 0;
+    /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path); auto, the
+    /// default, 16384, halved until its buffers fit the caches' lendable slots.
+    int64_t prefill_chunk = 16384;
     /// Plan v0.3 P5: the prompt path borrows the last expert-cache slots of each GPU for its buffers and refills
     /// them after the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session.
     bool no_prefill_borrow = false;
@@ -173,7 +176,7 @@ struct Options {
     /// `--no-warmup` leaves that to the first request.
     bool no_warmup = false;
     /// verify windows of up to this many tokens: the last emitted one and spec - 1 drafts
-    int spec = 0;
+    int spec = 4;
     /// Benchmarks: the run emits this continuation (token ids) instead of the window's pick, and a draft is
     /// accepted when it matches it, so runs with different speculation settings process the same text.
     std::string spec_follow;
@@ -196,6 +199,25 @@ struct Options {
     std::vector<std::string> tier_names;
     std::vector<int> tier_gpus;
     int second_gpu = -1;
+    /// --gpu, in order: the first runs the model, the others are the tiers (program/gpu_cards.hpp).  parse_options
+    /// moves them into main_gpu_name and the main GPU's settings, and into tier_names and tier_cards.
+    std::vector<lamina::program::GpuCard> cards;
+    /// per tier, beside tier_names and then tier_gpus as they are resolved: the settings its --gpu gives (an empty
+    /// card for one --second-gpu names); the per-tier lists below stand in for a setting a card leaves out
+    std::vector<lamina::program::GpuCard> tier_cards;
+    /// The tiers' settings once their links are probed (beside tier_gpus): the card's, else the list's, else the probe's.
+    struct TierSet {
+        double gib = 0.0;            ///< its VRAM for experts (0: all but the reserve)
+        double reserve_mib = 0.0;
+        double prefetch_mb = 0.0;
+        std::string clocks;          ///< its clocks' lock while generating ("" or "0": none)
+        double sleep_us = 0.0;
+        uint64_t vram_only = 0;      ///< the profile's experts only in its VRAM, out of the RAM arena
+        bool vram_only_auto = false;
+    };
+    std::vector<TierSet> tier_set;
+    uint64_t expert_cache_bytes = 0;   ///< the main GPU's cache=SIZE: its slots once their size is known
+    bool vram_pin_auto = false;        ///< the main GPU's vram-only=auto
     std::vector<double> second_gpu_gib{0.0};
     /// default (empty): 2048 MiB on a GPU the desktop or another graphics program uses, 512 on a headless one
     /// (gpu_select.hpp's probe)
@@ -246,28 +268,29 @@ struct Options {
     /// streams the later tiers' experts; 2: the tier after it computes the ones its cache holds).
     double prompt_tiers = 1.0;
     /// The elastic K/V (--kv-grow, LAMINA_KV_GROW=1): the K/V takes VRAM as the context grows, the expert cache the rest.
-    bool kv_grow = false;
+    bool kv_grow = true;
     bool no_kv_grow = false;   ///< --no-kv-grow: off whatever LAMINA_KV_GROW says
-    bool hc_q8 = false;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
+    bool hc_q8 = true;   ///< the hyper-connection matrices only in 8 bits (core::HcQ8)
     /// --control-vector*, --cvec-mode, --cvec-dir: a control vector on the residual stream (core::ControlVector)
     lamina::core::ControlVectorSpec cvec;
     double head_split = 0.45;                ///< the second GPU's share of the head's rows (0: all on the main GPU)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
-    double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
-    std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
+    /// 0 by default: over an x4 link the CPU computes them sooner (< 0: 0.55)
+    double pcie_frac = 0.0;
+    std::string pcie_mode = "kernel";   ///< auto (dma) | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
-    int adapt_every = 4;
+    int adapt_every = 1;
     /// Plan v0.3 P6: a draft enters the verify window only while every draft before it (and itself) has at least
     /// this probability under the draft layer; 0 = always --spec-1 drafts.  A sampled request judges each draft by
     /// its chance to pass under the number its position draws with, against the chance a draft of this probability
     /// has under an average number (core/draft_pass.hpp).
-    double spec_min_p = 0.0;
+    double spec_min_p = 0.5;
     /// Prompt lookup: when the text's last N+ tokens occurred before and the tokens after that occurrence are more
     /// drafts than --spec gives the draft layer, the next window verifies up to kVerifyMaxT - 1 of them instead;
     /// 0 = off.
-    int spec_lookup = 0;
+    int spec_lookup = 16;
     /// The verify windows' capacity: --spec, or the kernels' maximum with prompt lookup.
     int max_window() const { return spec_lookup > 0 ? std::max(spec, lamina::kernels::kVerifyMaxT) : spec; }
     /// Stop when the model emits an end-of-turn token (<|endoftext|> 248044, <|im_end|> 248046, or --eos-ids).
@@ -304,7 +327,7 @@ struct Options {
     /// expert-cache slots and reads every expert its tokens use): ~0.55 s with a second GPU, ~1.6 s with IQ3_XXS on
     /// the 3090 alone; verify windows of 8 tokens (--spec-lookup) cost 5-8 ms per token.  They break even at ~73
     /// (UD-Q4_K_XL) and ~113 (IQ3_XXS) tokens with a second GPU, ~400 without (bench/feed_test.py).
-    int64_t feed_max = 128;
+    int64_t feed_max = 46;
     /// --serve (upstream #458): the role token of a short turn the server puts right before the new assistant turn
     /// (the "system" of a trailing reasoning-effort turn, with the config's "effort_position": "end").  When the turn
     /// before the last <|im_start|> opens with it, the turn checkpoint goes in front of that turn, so it holds the
@@ -314,8 +337,62 @@ struct Options {
     float adapt_decay = 0.7f;   ///< --adapt-decay: the routing counts kept after each update (upstream's option)
 };
 
+/// Qwen3.8-Flash-Next's trained context: --serve's --max-context by default.
+constexpr int64_t kTrainedContext = 262144;
+
+/// The tiers by their GPU: the first tier is the second GPU.
+const char* const kTierName[lamina::core::kMaxGpuTiers] = {"second", "third", "fourth"};
+
 /// A per-tier option's value for tier `t` (--second-gpu's order): its list's t-th, the last one for the tiers past it.
 double tier_value(const std::vector<double>& v, size_t t) { return v.empty() ? 0.0 : v[std::min(t, v.size() - 1)]; }
+
+/// --gpu's cards into the options the engine reads: the first card names the main GPU and gives its settings, the
+/// others name the tiers (tier_names, tier_cards).  False (said) for a card's setting its place does not take, or
+/// --gpu beside --main-gpu or --second-gpu.
+bool apply_cards(Options& o, bool named_otherwise) {
+    using lamina::program::GpuCard;
+    if (o.cards.empty()) return true;
+    if (named_otherwise) {
+        std::fprintf(stderr, "lamina: --gpu names the GPUs, and --main-gpu or --second-gpu does too: use --gpu alone\n");
+        return false;
+    }
+    const GpuCard& m = o.cards[0];
+    auto refuse = [&](const GpuCard& c, const char* why) {
+        std::fprintf(stderr, "lamina: --gpu %s: %s\n", lamina::program::gpu_card_text(c).c_str(), why);
+        return false;
+    };
+    if (m.name == "auto") {   // the main GPU as by default, every other one a tier
+        if (o.cards.size() > 1) return refuse(m, "auto stands for every GPU: name the main GPU first, then auto");
+        if (m.has_cache() || m.reserve || m.has_vram_only() || m.prefetch || m.clocks || m.sleep)
+            return refuse(m, "auto as the first card takes no settings (name the main GPU to give it some)");
+        o.main_gpu_name = "0";
+        o.tier_names = {"auto"};
+        o.tier_cards = {GpuCard{"auto"}};
+        return true;
+    }
+    if (m.prefetch || m.clocks || m.sleep)
+        return refuse(m, "the main GPU takes cache, reserve and vram-only (prefetch, clocks and sleep are a tier's)");
+    o.main_gpu_name = m.name;
+    if (m.cache_auto) o.expert_cache = -1;
+    else if (m.cache_slots) o.expert_cache = (int) *m.cache_slots;
+    else if (m.cache_bytes) o.expert_cache_bytes = *m.cache_bytes;
+    if (m.reserve) o.vram_reserve_mib = (int) (*m.reserve >> 20);
+    if (m.vram_only_auto) o.vram_pin_auto = true;
+    else if (m.vram_only) o.vram_pin_gib = (double) *m.vram_only / 1073741824.0;
+    o.tier_names.clear();
+    o.tier_cards.clear();
+    for (size_t i = 1; i < o.cards.size(); ++i) {
+        const GpuCard& c = o.cards[i];
+        if (c.cache_slots) return refuse(c, "a tier's cache is a size (22G) or auto, not a number of slots");
+        if (c.name == "auto" && o.cards.size() > 2)
+            return refuse(c, "auto stands for every other GPU: name the tiers, or give auto alone after the main GPU");
+        if (c.name == "auto" && c.has_vram_only())
+            return refuse(c, "vram-only needs a named card (an auto tier's place is known once its link is probed)");
+        o.tier_names.push_back(c.name);
+        o.tier_cards.push_back(c);
+    }
+    return true;
+}
 
 /// "A,B,C" as numbers; false on anything else.
 bool number_list(const char* s, std::vector<double>& out) {
@@ -331,47 +408,91 @@ bool number_list(const char* s, std::vector<double>& out) {
     }
 }
 
-void usage() {
+/// --help: the options most runs set; --help-all: every one, then the older spellings the engine still takes.
+void usage(bool all = false) {
     std::fprintf(stderr,
-                 "lamina --native MODEL.gguf --spec T --prefill N --tokens \"1,2,3\" [options]\n"
+                 "lamina --native MODEL.gguf [options]   (lamina-server runs it; generate mode also takes --tokens)\n"
                  "\n"
-                 "  --tokens LIST       the prompt as comma-separated token IDS (required)\n"
+                 "The options most runs set (lamina --help-all lists every one; a switch also takes --no-<name>):\n"
+                 "  --native MODEL.gguf  the model's GGUF: its first shard (a split model's others are found by name)\n"
+                 "  --gpu CARD[,key=value...]  a GPU the engine uses, the flag again for each: the first runs the model,\n"
+                 "                       the others hold experts as tiers, in order (up to three).  CARD: a number,\n"
+                 "                       a UUID or its start (GPU-f26e9ba6), a PCI bus id (10:00.0) or a name only one\n"
+                 "                       card has (\"RTX 5070 Ti\"); auto after the main GPU: every other GPU, the fastest\n"
+                 "                       link first.  Its settings, each optional:\n"
+                 "                         cache=auto|SIZE|N  its VRAM for experts (auto, the default: all but its\n"
+                 "                                            reserve; the main GPU's also N expert slots)\n"
+                 "                         reserve=SIZE       the VRAM it leaves free (the main GPU 700M; a tier 2G\n"
+                 "                                            when the desktop uses it, else 512M)\n"
+                 "                         vram-only=SIZE|auto  the profile's experts it holds only in VRAM, left out of\n"
+                 "                                            the RAM (auto: as many as keep the experts within the RAM)\n"
+                 "                         prefetch=SIZE      a tier: each layer's likeliest experts no GPU holds,\n"
+                 "                                            copied ahead (default 12M over a link of 20 GB/s or more)\n"
+                 "                         clocks=MIN-MAX/MEM a tier: its clocks in MHz, locked through NVML while the\n"
+                 "                                            engine generates (1395-2100/9751 for an RTX 3090; needs\n"
+                 "                                            administrator rights, root on Linux; 0: the driver's)\n"
+                 "                         sleep=TIME         a tier after the first: it sleeps while the CPU pool would\n"
+                 "                                            need less than TIME a layer without it\n"
+                 "                       Sizes are binary (8G, 700M), times have their unit (55us, 1.5ms, 1s).  Example:\n"
+                 "                       --gpu GPU-75af3083 --gpu \"RTX 5070 Ti\" --gpu GPU-f26e9ba6,clocks=1395-2100/9751\n"
+                 "                       Qwen3.6-35B-A3B and Qwen3.8-27B: the cards' order is the layer split's\n"
+                 "                       (--layer-split N,N,.. sets the counts), their settings unused\n"
+                 "  --max-context N      the K/V's cells (default: --serve the model's trained 262,144, else 4096; at\n"
+                 "                       most the QSA selection's capacity, set by the GPU's shared memory: 1,466,368\n"
+                 "                       cells on 99 KiB, 630,784 on 48 KiB)\n"
+                 "  --kv fp16|int8|k8v4|q4_0  the K/V's format: int8 codes + fp16 scale per 64 values (half FP16's\n"
+                 "                       VRAM); k8v4: int8 K, 4-bit V of rotated rows (23%% less than int8); q4_0: 4-bit\n"
+                 "                       K and V (45%% less); default fp16.  Qwen3.6-35B-A3B and Qwen3.8-27B: fp16 or q8_0\n"
+                 "  --kv-grow            --serve: the K/V takes VRAM only for the cells the requests reach and the\n"
+                 "                       expert cache holds the rest (the default; LAMINA_KV_GROW=1/0 too); --no-kv-grow:\n"
+                 "                       the whole --max-context allocated at start\n"
+                 "  --prefill CHUNK|auto prompts in chunks of CHUNK tokens (auto, the default: 16384, halved until its\n"
+                 "                       buffers fit the caches' lendable slots)\n"
+                 "  --spec T             verify windows of up to T tokens: the last one and T-1 drafts (2..8; default 4)\n"
+                 "  --mtp FILE           the draft layer, Lamina-Qwen3.8-Flash-Next-MTP.gguf (%s fetches it), or a\n"
+                 "                       folder of its earlier layout; --serve without it: one token a window, or\n"
+                 "                       prompt lookup's drafts\n"
+                 "  --expert-profile P   fill the VRAM tiers from this profile (data/expert-profile.bin, or what\n"
+                 "                       --expert-profile-save wrote; --serve: the built-in one) instead of admitting\n"
+                 "                       experts on first use\n"
+                 "  --serve              stay resident and take requests on stdin, as lamina-server sends them\n"
+                 "  --vision             --serve takes images too (GENI requests; embeddings from lamina-vision)\n"
+                 "  --help-all           every option\n"
+                 "  -v, --version        the program's version\n",
+                 lamina::kDraftLayerScript);
+    if (!all) return;
+    std::fprintf(stderr,
+                 "\n"
+                 "Every other option:\n"
+                 "  --tokens LIST        generate mode: the prompt as comma-separated token IDS\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --ple-gguf PATH      the PLE table: a GGUF holding per_layer_token_embd, such as one of unsloth's\n"
-                 "                       engram tables (default: the --native model's shard that holds it)\n"
-                 "  --ple-io direct|mmap|ram  n-gram table reads. direct (default): unbuffered SSD\n"
-                 "                       reads, the table never enters RAM or the file cache; mmap: A/B arm; ram:\n"
-                 "                       read into RAM once the experts are loaded (the table's size: 28.8 GB as\n"
-                 "                       IQ4_NL), direct reads until then\n"
-                 "  --kv fp16|int8|k8v4|q4_0  KV storage: int8 codes + fp16 scale per 64 values (half FP16's VRAM);\n"
-                 "                       k8v4: int8 K, 4-bit V of rotated rows (23%% less than int8); q4_0: 4-bit K\n"
-                 "                       and V (45%% less; native packs only for both); default fp16. Qwen3.6-35B-A3B\n"
-                 "                       and Qwen3.8-27B: fp16 or q8_0 (int8 codes + fp16 scale per 32, about half)\n"
-                 "  --rope-scaling T      rotate for a context past the trained one: none, linear (position\n"
-                 "                        interpolation) or yarn, as llama.cpp does. Fixed at startup: K in the\n"
-                 "                        cache is post-RoPE.\n"
-                 "  --rope-scale F        the extension factor (>= 1), e.g. 2 for 524288 over a 262144 training run\n"
-                 "  --rope-freq-base N    the rotation base (0 = 1e7)   --rope-freq-scale F  the raw shrink (0 = 1/F)\n"
-                 "  --yarn-orig-ctx N     trained context (0 = 262144)  --yarn-ext-factor F  < 0 = auto (1 for yarn)\n"
-                 "  --yarn-attn-factor F  --yarn-beta-fast F  --yarn-beta-slow F  the remaining YaRN knobs\n"
-                 "  --native MODEL.gguf  the model's GGUF (its first shard; a split model's others are found by\n"
-                 "                       name): the quantized tensors, the head, the embedding and the PLE table\n"
-                 "                       come from it, and the pack the engine computes from it at load (required)\n"
-                 "  --expert-math M      native packs: how the GPU computes the experts it holds. fast (default):\n"
-                 "                       llama.cpp's CUDA q8_1 arithmetic. exact (K-quant files): the CPU pool's ggml\n"
-                 "                       arithmetic (Q8_K/Q8_0 activations, ggml's x86 summation order, one expf on\n"
-                 "                       both sides), so a GPU hit is bit-identical to the CPU's and the output does\n"
-                 "                       not depend on which experts are resident (a prompt's experts stay on the\n"
-                 "                       main GPU); slower, for regression tests\n"
-                 "  --disable-hit        every routed expert on the CPU (the cache stays allocated): exact's reference\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --stop-eos           stop at an end-of-turn token (<|endoftext|>, <|im_end|>; --serve always does)\n"
                  "  --eos-ids LIST       the end-of-turn tokens instead of 248044,248046 (implies --stop-eos)\n"
-                 "  --max-context N      KV/state capacity (default 4096; at most the QSA selection's capacity, set\n"
-                 "                       by the GPU's shared memory: 1,466,368 cells on 99 KiB, 630,784 on 48 KiB)\n"
+                 "  --temperature F      generate mode: sample at this temperature (default 0: greedy), with\n"
+                 "                       --top-p F (1), --top-k N (20), --min-p F (0) and --seed N (0: the clock);\n"
+                 "                       --serve takes each request's\n"
+                 "  --ple-gguf PATH      the PLE table: a GGUF holding per_layer_token_embd, such as one of unsloth's\n"
+                 "                       engram tables (default: the --native model's shard that holds it)\n"
+                 "  --ple-io direct|mmap|ram  n-gram table reads. direct (default): unbuffered SSD reads, the table\n"
+                 "                       never enters RAM or the file cache; mmap: A/B arm; ram: read into RAM once\n"
+                 "                       the experts are loaded (the table's size: 28.8 GB as IQ4_NL), direct reads\n"
+                 "                       until then\n"
+                 "  --rope-scaling T     rotate for a context past the trained one: none, linear (position\n"
+                 "                       interpolation) or yarn, as llama.cpp does.  Fixed at startup: K in the cache is\n"
+                 "                       post-RoPE\n"
+                 "  --rope-scale F       the extension factor (>= 1), e.g. 2 for 524288 over a 262144 training run\n"
+                 "  --rope-freq-base N   the rotation base (0 = 1e7)   --rope-freq-scale F  the raw shrink (0 = 1/F)\n"
+                 "  --yarn-orig-ctx N    trained context (0 = 262144)  --yarn-ext-factor F  < 0 = auto (1 for yarn)\n"
+                 "  --yarn-attn-factor F  --yarn-beta-fast F  --yarn-beta-slow F  the remaining YaRN knobs\n"
+                 "  --expert-math M      how the GPU computes the experts it holds. fast (default): llama.cpp's CUDA\n"
+                 "                       q8_1 arithmetic. exact (K-quant files): the CPU pool's ggml arithmetic\n"
+                 "                       (Q8_K/Q8_0 activations, ggml's x86 summation order, one expf on both sides), so\n"
+                 "                       a GPU hit is bit-identical to the CPU's and the output does not depend on which\n"
+                 "                       experts are resident (a prompt's experts stay on the main GPU); slower, for\n"
+                 "                       regression tests\n"
+                 "  --disable-hit        every routed expert on the CPU (the cache stays allocated): exact's reference\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position\n"
-                 "  --serve              stay resident and take requests on stdin, as lamina-server sends them\n"
-                 "  --vision             --serve takes images too (GENI requests; embeddings from lamina-vision)\n"
                  "  --prompt-cache N     --serve: keep up to N checkpoints of the sequence state per conversation in\n"
                  "                       host memory and continue each request from the longest cached prefix\n"
                  "                       (default 16; 0 = every request starts from an empty sequence)\n"
@@ -387,103 +508,60 @@ void usage() {
                  "                       system, and leave between requests when it runs below (default 6144;\n"
                  "                       0 = only --conversation-cache-mib limits them)\n"
                  "  --feed-max N         --serve: new prompt parts and last prompt chunks of up to N tokens run\n"
-                 "                       through verify windows instead of the batched prompt path (default 128)\n"
+                 "                       through verify windows instead of the batched prompt path (default 46)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn stays out of the\n"
                  "                       turn checkpoint (a trailing reasoning-effort turn; default -1 = off)\n"
-                 "  --spec T             verify windows of up to T tokens: the last one and T-1 MTP drafts (2..8)\n"
                  "  --spec-min-p P       a draft enters the window only while it and the drafts before it have at\n"
-                 "                       least probability P under the draft layer (default 0: always T-1 drafts);\n"
+                 "                       least probability P under the draft layer (default 0.5; 0: always T-1);\n"
                  "                       a sampled request's draft, by the number its position draws with, at least\n"
                  "                       the chance to pass that a draft of probability P has on average\n"
-                 "  --temperature F      generate mode: sample at this temperature (default 0: greedy), with\n"
-                 "                       --top-p F (1), --top-k N (20), --min-p F (0) and --seed N (0: the clock);\n"
-                 "                       --serve takes each request's\n"
                  "  --spec-lookup N      when the text's last N+ tokens occurred before, the next window verifies\n"
                  "                       up to 7 of the tokens that followed there instead, if they are more than\n"
-                 "                       --spec allows the draft layer (windows of up to 8 tokens; 0 = off)\n"
+                 "                       --spec allows the draft layer (windows of up to 8 tokens; default 16; 0 = off)\n"
                  "  --spec-split         a window's tokens in two groups, the GPU's work on one beside the CPU's on\n"
                  "                       the other (exact, ~7%% slower: a measurement arm)\n"
-                 "  --mtp FILE           the MTP draft layer, Lamina-Qwen3.8-Flash-Next-MTP.gguf (%s;\n"
-                 "                       tools/mtp_rt.py writes one), or a folder of its earlier layout;\n"
-                 "                       --serve without it: one token a window, or prompt lookup's drafts\n"
                  "  --mtp-window N       the draft layer attends to the last N cells (default 32768; 0 = every cell)\n"
                  "  --drafts-per-step N  Qwen3.6-35B-A3B and Qwen3.8-27B: at most N drafts (0..7) of the file's own\n"
                  "                       MTP block a step (default 0: none; --spec-min-p as above), --draft-vocab N\n"
                  "                       its head over the first N ids\n"
-                 "  --main-gpu GPU       the GPU to run on (default 0): a CUDA device number of the visible ones (in\n"
-                 "                       nvidia-smi's order unless CUDA_DEVICE_ORDER says otherwise), a UUID or its\n"
-                 "                       start (GPU-f26e9ba6), a PCI bus id (10:00.0) or a name or a part of one\n"
-                 "                       (\"RTX 3090\") that only one GPU has: a number moves when a card is added\n"
-                 "  --second-gpu G[,G,G] GPUs, named as --main-gpu, as further expert tiers, up to three, in order:\n"
-                 "                       each holds the profile's next experts, then the conversation's, and\n"
-                 "                       computes them beside the CPU pool (native packs, verify windows); the first\n"
-                 "                       also takes the prompt path's share, the head's rows and --prompt-split's\n"
-                 "                       stage. One no visible GPU answers to is left out. auto: every other GPU,\n"
-                 "                       the fastest link first (a short probe at startup: host-to-device rate x\n"
-                 "                       multiprocessors) (--tier-gpus: the same; -1: none). Qwen3.6-35B-A3B and\n"
-                 "                       Qwen3.8-27B: the GPUs a layer split may add, in order (auto: CUDA's), the\n"
-                 "                       fewest that hold the model (Qwen3.6 where none do: the main GPU alone, the\n"
-                 "                       CPU computing the experts it lacks); --layer-split N,N,.. sets the counts\n"
-                 "  --second-gpu-gib G[,..]  each tier's VRAM for experts (default: all but its reserve; a list's\n"
-                 "                       last value stands for the tiers past it, as in the two below)\n"
-                 "  --second-gpu-reserve-mib R[,..]  the VRAM each tier leaves free (default 2048 on a GPU the\n"
-                 "                       desktop or another graphics program uses, 512 on a headless one)\n"
-                 "  --second-gpu-min-mb M  a layer's missed experts from which the tiers take their shares (default 4;\n"
-                 "                       below it the CPU is quicker than their ~100 us round trip)\n"
-                 "  --second-gpu-prefetch-mb M[,..]  per layer, copy its likeliest experts that no GPU holds (the next\n"
-                 "                       layer's router on this layer's input), up to M MiB, to a tier while the RAM is\n"
-                 "                       idle, the first tier's budget filled first (default 12 to a GPU whose link\n"
-                 "                       the probe measured at 20 GB/s or more, ~0.28 ms at the 5070 Ti's ~48 GB/s;\n"
-                 "                       none to a slower one; 0 = off)\n"
-                 "  --second-gpu-clocks C[,..]  per tier, lock its clocks through NVML while the engine generates:\n"
-                 "                       <graphics min>-<graphics max>/<memory> in MHz, the card's own (1395-2100/9751\n"
-                 "                       for an RTX 3090; nvidia-smi --query-gpu=name,clocks.max.graphics,\n"
-                 "                       clocks.max.memory --format=csv reads each card's highest; a memory clock of\n"
-                 "                       0: the driver's), 0 = none (the default). For a tier the driver slows\n"
-                 "                       between its short shares; from a prompt's last chunk until a few seconds\n"
-                 "                       after the request. Needs administrator rights (root on Linux)\n"
-                 "  --second-gpu-clocks-hold S  --serve: those locks stay S seconds after a request (default 5)\n"
-                 "  --second-gpu-clocks-lead S  --serve: they are asked for S seconds before a batched prompt part\n"
-                 "                       ends, by its progress, instead of from its last chunk on (a lock is at\n"
+                 "  --clocks-hold TIME   --serve: the tiers' clock locks stay this long after a request (default 5s)\n"
+                 "  --clocks-lead TIME   --serve: they are asked for this long before a batched prompt part ends, by\n"
+                 "                       its progress, instead of from its last chunk on (default off; a lock is at\n"
                  "                       speed ~0.6 s after it is asked for)\n"
-                 "  --second-gpu-sleep-us T[,..]  per tier after the first: it sleeps (its experts to the CPU, its\n"
-                 "                       lock released, its moves stopped) while the CPU pool would need less than\n"
-                 "                       T us a layer without it, averaged over a few seconds of generation, and\n"
-                 "                       wakes when that average passes 1.15 T or text turns heavy (twice T);\n"
-                 "                       such a tier is also left out until a lock of its own is at speed (0 =\n"
-                 "                       never, the default; not with --adapt-every 0 or --deterministic-adapt).\n"
-                 "                       Trades speed for the card's awake power: measure T per model file\n"
-                 "  --no-second-gpu-adapt  with --second-gpu: keep the tiers\' resident expert assignment static while\n"
-                 "                       the main GPU\'s adaptive tier continues to replace experts\n"
+                 "  --tier-min SIZE      a layer's missed experts from which the tiers take their shares (default 4M;\n"
+                 "                       below it the CPU is quicker than their ~100 us round trip)\n"
+                 "  --no-tier-adapt      keep the tiers' experts as the start placed them while the main GPU's\n"
+                 "                       adaptive tier goes on moving its own\n"
                  "  --deterministic-adapt  fixed-epoch adaptive copies and stable equal-gain ordering; default async\n"
-                 "                       adaptation remains unchanged (with --second-gpu, applies to every tier)\n"
+                 "                       adaptation remains unchanged (with tiers, applies to every one)\n"
                  "  --adapt-every N      every N verify rounds the adaptive tiers move the conversation's most-routed\n"
-                 "                       experts they lack in, in place of their least-routed ones (default 4;\n"
+                 "                       experts they lack in, in place of their least-routed ones (default 1;\n"
                  "                       0 = the start's placement stays)\n"
                  "  --adapt-swaps N      an update's moves at most (default 96)\n"
                  "  --adapt-decay F      the share of the routing counts the adaptive tiers keep after each update\n"
                  "                       (default 0.7; between 0 and 1)\n"
-                 "  --vram-pin-gib G     the profile's hottest experts, up to G GiB, live only in the main GPU's\n"
-                 "                       VRAM: its lowest slots keep them for good and the RAM arena leaves them out\n"
-                 "                       (experts that outgrow the RAM then fit)\n"
-                 "  --second-gpu-pin-gib G  the next ones, up to G GiB, only in the second GPU's VRAM\n"
-                 "  --prompt-shift F     with --second-gpu: in prompt chunks of 8K tokens and more the second GPU also\n"
-                 "                       computes the likeliest F (0..1) of each layer's experts the main GPU holds, copied\n"
-                 "                       ahead with the ones it streams (when the main GPU's share is the longer; default 0)\n"
-                 "  --prompt-split L[,M] with --second-gpu: a prompt of more than one chunk runs in two stages, the\n"
-                 "                       second GPU running each chunk's layers L.. whole (their weights and state\n"
-                 "                       copied into its lent cache slots) while the main GPU runs the next chunk\n"
-                 "                       through the first ones (0: off, the default).  L,M with two or more GPU\n"
-                 "                       tiers: three stages, the tier after the first running the layers L..M-1 (the\n"
-                 "                       experts its cache lacks on the second GPU), the second GPU the layers M..;\n"
-                 "                       with one tier, two stages split halfway between L and M\n"
+                 "  --head-split F       with a tier: the first tier's share of the output head's rows (default 0.45;\n"
+                 "                       each GPU streams its part after the last layer; 0 = all on the main GPU)\n"
+                 "  --prompt-shift F     with a tier: in prompt chunks of 8K tokens and more the first tier also\n"
+                 "                       computes the likeliest F (0..1) of each layer's experts the main GPU holds,\n"
+                 "                       copied ahead with the ones it streams (when the main GPU's share is the\n"
+                 "                       longer; default 0)\n"
+                 "  --prompt-split L[,M] with a tier: a prompt of more than one chunk runs in two stages, the first\n"
+                 "                       tier running each chunk's layers L.. whole (their weights and state copied\n"
+                 "                       into its lent cache slots) while the main GPU runs the next chunk through the\n"
+                 "                       first ones (0: off, the default).  L,M with two or more tiers: three stages,\n"
+                 "                       the tier after the first running the layers L..M-1 (the experts its cache\n"
+                 "                       lacks on the first tier), the first tier the layers M..; with one tier, two\n"
+                 "                       stages split halfway between L and M\n"
                  "  --prompt-split-from N  with --prompt-split: a prompt part of N tokens or more that fits one chunk\n"
                  "                       (--prefill) is read in two chunks of one size through the stages too (the\n"
                  "                       stages' own costs set N: by default, 0, such a part is read in one chunk)\n"
-                 "  --prompt-tiers N     with two or more GPU tiers: the first N of them compute their experts in\n"
-                 "                       prompts (default 1: the first tier alone, the experts of the later ones\n"
-                 "                       streaming to it; 2: the tier after it computes the ones its cache holds,\n"
-                 "                       their input and sums over its own link)\n"
+                 "  --prompt-tiers N     with two or more tiers: the first N of them compute their experts in prompts\n"
+                 "                       (default 1: the first tier alone, the experts of the later ones streaming to\n"
+                 "                       it; 2: the tier after it computes the ones its cache holds, their input and\n"
+                 "                       sums over its own link)\n"
+                 "  --no-prompt-offload  with a tier: the prompt path streams the experts the main GPU's cache lacks\n"
+                 "                       to the main GPU instead of computing them on the first tier\n"
                  "  --arena-place        at the start, time each expert's place in the RAM arena and move the experts\n"
                  "                       no GPU holds out of the slow places, into the GPU-resident ones' (RAM with\n"
                  "                       slower regions, as unpaired DIMMs make; ~2-4 s).  Off by default\n"
@@ -491,16 +569,10 @@ void usage() {
                  "                       keeps no second copy of them on RAM the next starts' arenas would have had\n"
                  "                       (where the arena and the cached file fill the faster RAM); each start reads\n"
                  "                       them from the drive.  Off by default\n"
-                 "  --kv-grow            with --serve: the K/V takes VRAM only for the cells the requests\n"
-                 "                       reach and the expert cache holds the rest, giving slots up as a conversation\n"
-                 "                       grows and taking them back after (LAMINA_KV_GROW=1/0 too).  Default: the\n"
-                 "                       whole --max-context allocated at start\n"
-                 "  --no-kv-grow         the whole --max-context allocated at start, whatever LAMINA_KV_GROW says\n"
-                 "  --hc-q8              with --native: the hyper-connection projections only in 8 bits (int8, an\n"
-                 "                       f16 scale a 32: the GGUF's Q8_0 as stored, BF16 ones rounded so); the verify\n"
-                 "                       windows read them, the prompt path takes them in BF16 a layer at a time\n"
-                 "  --head-split F       with --second-gpu: its share of the output head's rows (default 0.45;\n"
-                 "                       each GPU streams its part after the last layer; 0 = all on the main GPU)\n"
+                 "  --hc-q8              the hyper-connection projections only in 8 bits (int8, an f16 scale a 32: the\n"
+                 "                       GGUF's Q8_0 as stored, BF16 ones rounded so); the verify windows read them,\n"
+                 "                       the prompt path takes them in BF16 a layer at a time (the default;\n"
+                 "                       --no-hc-q8: BF16 copies, 1.27 GiB of VRAM instead of 644 MiB)\n"
                  "  --control-vector F[,F]  a control vector in llama.cpp's GGUF format (direction.<layer> tensors),\n"
                  "                       applied to every hyper-connection stream after each layer's FFN write\n"
                  "  --control-vector-scaled F:S[,F:S]  the same at scale S (the vectors of several files add up)\n"
@@ -509,24 +581,21 @@ void usage() {
                  "                       v = d / |d| (the cvec-hooks fork's: a unit direction at S 1 is removed)\n"
                  "  --cvec-dir per-layer|single:L  project: each layer's own direction (default) or layer L's in every\n"
                  "                       layer\n"
-                 "  --no-prompt-offload  with --second-gpu: the prompt path streams the experts the main GPU's cache\n"
-                 "                       lacks to the main GPU instead of computing them on the second\n"
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the argmax and\n"
                  "                       accept the drafts that match it, so speculation settings compare on the\n"
                  "                       same text (not --serve)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native; auto: 16384)\n"
                  "  --no-prefill-borrow  the prompt path's buffers keep VRAM of their own for the whole session\n"
                  "                       instead of borrowing the expert caches' last slots while a prompt runs\n"
                  "  --no-warmup          --serve: no throw-away prompt part before READY (the first request then\n"
                  "                       loads the prompt path's kernels)\n"
                  "  --stats              print the per-stage breakdown\n"
-                 "  --window-hashes PATH per verify window, a line with its round, first position and size, a 64-bit hash\n"
-                 "                       of its final residual rows and its argmaxes: two builds that do the same\n"
+                 "  --window-hashes PATH per verify window, a line with its round, first position and size, a 64-bit\n"
+                 "                       hash of its final residual rows and its argmaxes: two builds that do the same\n"
                  "                       arithmetic write the same file (fixed text through --spec-follow,\n"
                  "                       --adapt-every 0; not --serve)\n"
                  "  --window-logits PATH per token the verify windows emit, a line with its index among the generated\n"
-                 "                       tokens, the token and the 64 likeliest as id:log-probability, from the\n"
-                 "                       head's logits (comparisons with llama.cpp, bench/parity.py; not --serve)\n"
+                 "                       tokens, the token and the 64 likeliest as id:log-probability, from the head's\n"
+                 "                       logits (comparisons with llama.cpp, bench/parity.py; not --serve)\n"
                  "  --dump-draft-data DIR  with --serve: each request's positions for the draft layer's training: the\n"
                  "                       final residual rows, and the verify windows' 64 likeliest next tokens and\n"
                  "                       drafts (scratch/bg; the prompt read in batches whatever --feed-max)\n"
@@ -534,26 +603,37 @@ void usage() {
                  "                       inside the graph; each costs ~2 us)\n"
                  "  --prefill-profile    the GPU time of each section of the batched prompt path (--serve: each\n"
                  "                       batched part's)\n"
-                 "  --expert-profile P   fill the VRAM tiers from this profile (data/expert-profile.bin, or what\n"
-                 "                       --expert-profile-save wrote) instead of admitting experts on first use\n"
-                 "  --expert-profile-save P  --serve: save what the run learned (the routing counted since\n"
-                 "                       the start, blended with the profile it started from) as a profile at P,\n"
-                 "                       at QUIT (or Ctrl+C) and between requests once --expert-profile-save-every\n"
-                 "                       MIN minutes have passed since the last save (default 10; 0 = at QUIT\n"
-                 "                       only); start from it with --expert-profile P\n"
-                 "  --expert-cache N|auto  the main GPU's VRAM tier, in expert slots (auto: sized from the free\n"
-                 "                       VRAM, leaving --vram-reserve-mib; 0: the profile's count)\n"
-                 "  --vram-reserve-mib M the main GPU's VRAM --expert-cache auto leaves free (default 700)\n"
+                 "  --expert-profile-save P  --serve: save what the run learned (the routing counted since the start,\n"
+                 "                       blended with the profile it started from) as a profile at P, at QUIT (or\n"
+                 "                       Ctrl+C) and between requests once --expert-profile-save-every MIN minutes\n"
+                 "                       have passed since the last save (default 10; 0 = at QUIT only); start from it\n"
+                 "                       with --expert-profile P\n"
                  "  --pcie-frac F        in verify windows, the share of each layer's missed experts that the main\n"
                  "                       GPU reads from RAM over its link instead of the CPU computing them\n"
-                 "                       (default 0.55; the GPU tiers take theirs first)\n"
-                 "  --pcie-mode M        how that share reaches the main GPU: dma (default: the copy engine stages\n"
-                 "                       it), kernel (a copy kernel stages it inside the window's graph) or direct\n"
-                 "                       (the expert kernels read the mapped RAM)\n"
+                 "                       (default 0: over an x4 link the CPU computes them sooner; the GPU tiers\n"
+                 "                       take theirs first)\n"
+                 "  --pcie-mode M        how that share reaches the main GPU: kernel (default: a copy kernel stages it\n"
+                 "                       inside the window's graph), dma (the copy engine stages it) or direct (the\n"
+                 "                       expert kernels read the mapped RAM)\n"
                  "  --pool-workers N     the CPU expert pool's workers (default 0: every physical core but the\n"
                  "                       host loop's)\n"
-                 "  -v, --version        the program's version\n",
-                 lamina::kDraftLayerScript);
+                 "\n"
+                 "Older spellings, still taken (a card's own setting wins over them; a per-tier list's values go to the\n"
+                 "tiers in order, its last one to those past it):\n"
+                 "  --main-gpu GPU       the first --gpu's card\n"
+                 "  --second-gpu G[,G,G] the later --gpu's cards, or auto (--tier-gpus the same; -1: none)\n"
+                 "  --expert-cache N|auto  the main GPU's cache= (N slots; 0: the profile's count; default auto)\n"
+                 "  --vram-reserve-mib M the main GPU's reserve= in MiB\n"
+                 "  --vram-pin-gib G     the main GPU's vram-only= in GiB\n"
+                 "  --second-gpu-pin-gib G  the first tier's vram-only= in GiB\n"
+                 "  --second-gpu-gib G[,..]  each tier's cache= in GiB (0: auto)\n"
+                 "  --second-gpu-reserve-mib R[,..]  each tier's reserve= in MiB\n"
+                 "  --second-gpu-prefetch-mb M[,..]  each tier's prefetch= in MiB\n"
+                 "  --second-gpu-clocks C[,..]  each tier's clocks=\n"
+                 "  --second-gpu-sleep-us T[,..]  each tier's sleep= in microseconds\n"
+                 "  --second-gpu-clocks-hold S, --second-gpu-clocks-lead S  --clocks-hold, --clocks-lead in seconds\n"
+                 "  --second-gpu-min-mb M  --tier-min in MiB\n"
+                 "  --no-second-gpu-adapt  --no-tier-adapt\n");
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -1289,6 +1369,23 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
         const char* what;
     };
     bool have_tokens = false;
+    bool named_otherwise = false;   // --main-gpu or --second-gpu, which --gpu replaces
+    // the switches, each also as --no-<name>; a negative one (--no-warmup) as --<name> too (--warmup): the later wins
+    struct Switch {
+        const char* name;
+        bool* field;
+        bool negative;   // the field is the --no- form's
+    };
+    const Switch switches[] = {
+        {"hc-q8", &o.hc_q8, false},           {"arena-place", &o.arena_place, false},
+        {"file-cache", &o.no_file_cache, true}, {"prefill-borrow", &o.no_prefill_borrow, true},
+        {"prompt-offload", &o.no_prompt_offload, true}, {"warmup", &o.no_warmup, true},
+        {"tier-adapt", &o.no_second_gpu_adapt, true}, {"second-gpu-adapt", &o.no_second_gpu_adapt, true},
+        {"disable-hit", &o.disable_hit, false}, {"deterministic-adapt", &o.deterministic_adapt, false},
+        {"stop-eos", &o.stop_eos, false},     {"spec-split", &o.spec_split, false},
+        {"window-profile", &o.window_profile, false}, {"prefill-profile", &o.prefill_profile, false},
+        {"serve", &o.serve, false},           {"vision", &o.vision, false},
+        {"stats", &o.stats, false}};
     try {
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -1297,12 +1394,49 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                 return argv[++i];
             };
             {   // switches outside the chain below: MSVC refuses one this long (C1061)
-                bool* on = a == "--hc-q8" ? &o.hc_q8 : a == "--arena-place" ? &o.arena_place
-                         : a == "--no-file-cache" ? &o.no_file_cache : nullptr;
-                if (on != nullptr) {
-                    *on = true;
-                    continue;
+                const bool no = a.rfind("--no-", 0) == 0;
+                const std::string name = a.substr(no ? 5 : 2);
+                bool hit = false;
+                for (const Switch& s : switches)
+                    if (a.rfind("--", 0) == 0 && name == s.name) {
+                        *s.field = no == s.negative;
+                        hit = true;
+                    }
+                if (hit) continue;
+            }
+            if (a == "--gpu") {   // a card: the first runs the model, the others are the tiers
+                lamina::program::GpuCard card;
+                std::string e;
+                if (!lamina::program::parse_gpu_card(next("--gpu"), card, e)) {
+                    std::fprintf(stderr, "lamina: --gpu %s\n", e.c_str());
+                    return 2;
                 }
+                o.cards.push_back(std::move(card));
+                continue;
+            }
+            if (a == "--clocks-hold" || a == "--clocks-lead") {   // a time with its unit (the lead: or off)
+                const std::string v = next(a.c_str());
+                double s = 0.0;
+                std::string e;
+                if (a == "--clocks-lead" && v == "off") {
+                    o.clocks_lead = -1.0;
+                } else if (!lamina::program::parse_seconds(v, s, e)) {
+                    std::fprintf(stderr, "lamina: %s %s\n", a.c_str(), e.c_str());
+                    return 2;
+                } else {
+                    (a == "--clocks-hold" ? o.clocks_hold : o.clocks_lead) = s;
+                }
+                continue;
+            }
+            if (a == "--tier-min") {   // a size with its unit
+                uint64_t b = 0;
+                std::string e;
+                if (!lamina::program::parse_size(next("--tier-min"), b, e)) {
+                    std::fprintf(stderr, "lamina: --tier-min %s\n", e.c_str());
+                    return 2;
+                }
+                o.second_gpu_min_mb = (double) b / 1048576.0;
+                continue;
             }
             if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // core/control_vector.hpp
                 std::string e;
@@ -1365,6 +1499,7 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                     continue;
                 }
                 if (a == "--second-gpu" || a == "--tier-gpus") {   // names, as --main-gpu's (a negative number: none)
+                    named_otherwise = true;
                     o.tier_names.clear();
                     std::stringstream names(next(a.c_str()));
                     for (std::string s; std::getline(names, s, ',');) {
@@ -1396,7 +1531,7 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                     continue;
                 }
             }
-            if (a == "--help" || a == "-h") { usage(); help = true; return 0; }
+            if (a == "--help" || a == "-h" || a == "--help-all") { usage(a == "--help-all"); help = true; return 0; }
             else if (a == "--tokens") {
                 if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
                 std::string e;
@@ -1421,7 +1556,6 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
             else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
             else if (a == "--ple-io") o.ple_io = next("--ple-io");
             else if (a == "--kv") o.kv = next("--kv");
-            else if (a == "--disable-hit") o.disable_hit = true;
             else if (a == "--expert-math") o.expert_math = next("--expert-math");
             else if (a == "--native") o.native_preset = next("--native");
             else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
@@ -1434,9 +1568,6 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                 const std::string v = next("--prefill");
                 o.prefill_chunk = v == "auto" ? 16384 : std::atoll(v.c_str());
             }
-            else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
-            else if (a == "--no-prompt-offload") o.no_prompt_offload = true;
-            else if (a == "--no-warmup") o.no_warmup = true;
             else if (a == "--spec") o.spec = std::atoi(next("--spec"));
             else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
             else if (a == "--temperature") o.temperature = std::atof(next("--temperature"));
@@ -1446,10 +1577,8 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
             else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
             else if (a == "--mtp") o.mtp = next("--mtp");
             else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-            else if (a == "--main-gpu") o.main_gpu_name = next("--main-gpu");
+            else if (a == "--main-gpu") { o.main_gpu_name = next("--main-gpu"); named_otherwise = true; }
             else if (a == "--second-gpu-min-mb") o.second_gpu_min_mb = std::atof(next("--second-gpu-min-mb"));
-            else if (a == "--no-second-gpu-adapt") o.no_second_gpu_adapt = true;
-            else if (a == "--deterministic-adapt") o.deterministic_adapt = true;
             else if (a == "--vram-pin-gib") o.vram_pin_gib = std::atof(next("--vram-pin-gib"));
             else if (a == "--second-gpu-pin-gib") o.second_gpu_pin_gib = std::atof(next("--second-gpu-pin-gib"));
             else if (a == "--kv-grow") { o.kv_grow = true; o.no_kv_grow = false; }
@@ -1459,15 +1588,9 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
             else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
             else if (a == "--spec-min-p") o.spec_min_p = std::atof(next("--spec-min-p"));
             else if (a == "--spec-lookup") o.spec_lookup = std::max(0, std::atoi(next("--spec-lookup")));
-            else if (a == "--stop-eos") o.stop_eos = true;
-            else if (a == "--spec-split") o.spec_split = true;
-            else if (a == "--window-profile") o.window_profile = true;
-            else if (a == "--prefill-profile") o.prefill_profile = true;
             else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
             else if (a == "--window-logits") o.window_logits = next("--window-logits");
             else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
-            else if (a == "--serve") o.serve = true;
-            else if (a == "--vision") o.vision = true;
             else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
             else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max<int64_t>(1, std::atoll(next("--prompt-cache-every")));
             else if (a == "--conversation-cache-mib") o.conversation_cache_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-mib")));
@@ -1491,7 +1614,6 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                 }
             }
             else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
-            else if (a == "--stats") o.stats = true;
             else {
                 // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
                 // tokens would look like a working run.
@@ -1504,6 +1626,8 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
         std::fprintf(stderr, "lamina: %s needs a value\n", m.what);
         return 2;
     }
+    if (!apply_cards(o, named_otherwise)) return 2;
+    if (o.max_context == 0) o.max_context = o.serve ? kTrainedContext : 4096;
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;
@@ -1545,6 +1669,8 @@ constexpr int kNotQwen35 = -1;
 struct Qwen35Line {
     lamina::ModelFamily family = lamina::ModelFamily::Unknown;
     std::string main_gpu = "0", second;
+    std::string bad;       ///< a --gpu it cannot read
+    std::string skipped;   ///< --gpu cards whose settings this path has no use for
     std::vector<char*> rest;
     bool qwen35() const { return family == lamina::ModelFamily::Qwen35Moe || family == lamina::ModelFamily::Qwen35; }
 };
@@ -1552,13 +1678,29 @@ Qwen35Line qwen35_line(int argc, char** argv) {
     Qwen35Line q;
     std::string model;
     q.rest.push_back(argv[0]);
+    int cards = 0;   // --gpu: the first the main GPU, the others the split's in order (their settings are a tier's)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--main-gpu") == 0 && i + 1 < argc) {
             q.main_gpu = argv[++i];
             continue;
         }
-        if (std::strcmp(argv[i], "--second-gpu") == 0 && i + 1 < argc) {
+        if ((std::strcmp(argv[i], "--second-gpu") == 0 || std::strcmp(argv[i], "--tier-gpus") == 0) && i + 1 < argc) {
             q.second = argv[++i];
+            continue;
+        }
+        if (std::strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+            lamina::program::GpuCard c;
+            std::string e;
+            const char* text = argv[++i];
+            if (!lamina::program::parse_gpu_card(text, c, e)) {
+                q.bad = "--gpu " + e;
+                continue;
+            }
+            if (lamina::program::gpu_card_text(c) != c.name)
+                q.skipped += (q.skipped.empty() ? "" : "; ") + lamina::program::gpu_card_text(c);
+            if (cards++ == 0) q.main_gpu = c.name == "auto" ? "0" : c.name;
+            if (c.name == "auto") q.second = "auto";
+            else if (cards > 1) q.second += (q.second.empty() ? "" : ",") + c.name;
             continue;
         }
         if ((std::strcmp(argv[i], "--native") == 0 || std::strcmp(argv[i], "--model") == 0) && i + 1 < argc)
@@ -1577,6 +1719,13 @@ Qwen35Line qwen35_line(int argc, char** argv) {
 int qwen35_switch(int argc, char** argv) {
     Qwen35Line q = qwen35_line(argc, argv);
     if (!q.qwen35()) return kNotQwen35;
+    if (!q.bad.empty()) {
+        std::fprintf(stderr, "lamina: %s\n", q.bad.c_str());
+        return 2;
+    }
+    if (!q.skipped.empty())
+        std::fprintf(stderr, "lamina: %s: this model's path takes the cards' order alone, their settings left out "
+                             "(its own flags size its experts' VRAM)\n", q.skipped.c_str());
     const lamina::ModelFamily family = q.family;
     const std::string main_gpu = q.main_gpu, second = q.second;
     std::vector<char*>& rest = q.rest;
@@ -1641,8 +1790,13 @@ int qwen35_switch(int argc, char** argv) {
 
 int lamina::program::check_args(int argc, char** argv) {
 #if defined(LAMINA_HAVE_QWEN35)
-    if (Qwen35Line q = qwen35_line(argc, argv); q.qwen35())
+    if (Qwen35Line q = qwen35_line(argc, argv); q.qwen35()) {
+        if (!q.bad.empty()) {
+            std::fprintf(stderr, "lamina: %s\n", q.bad.c_str());
+            return 2;
+        }
         return lamina::qwen35::check_args((int) q.rest.size(), q.rest.data());
+    }
 #endif
     Options o;
     bool help = false;
@@ -1680,6 +1834,7 @@ int lamina::program::run(int argc, char** argv) {
     if (o.disable_hit && (!o.tier_names.empty() || o.adapt_every > 0)) {
         std::fprintf(stderr, "lamina: --disable-hit: no second GPU, no adaptive tier\n");
         o.tier_names.clear();
+        o.tier_cards.clear();
         o.adapt_every = 0;
     }
     // before anything builds an expert layout or runs an expert: the GPU's kernels and the CPU pool's SwiGLU
@@ -1691,14 +1846,16 @@ int lamina::program::run(int argc, char** argv) {
     // every CUDA call from here on uses this device; the adaptive tier sets it on its own thread too
     const std::vector<lamina::core::GpuInfo> gpus = lamina::core::list_gpus();
     std::string gpu_why;
+    const char* const main_flag = o.cards.empty() ? "--main-gpu" : "--gpu";   // the flag that named it, for its words
+    const char* const tier_flag = o.cards.empty() ? "--second-gpu" : "--gpu";
     o.main_gpu = lamina::core::find_gpu(gpus, o.main_gpu_name, gpu_why);
     if (o.main_gpu < 0 || cudaSetDevice(o.main_gpu) != cudaSuccess) {
-        std::fprintf(stderr, "lamina: --main-gpu %s: %s\n", o.main_gpu_name.c_str(),
+        std::fprintf(stderr, "lamina: %s %s: %s\n", main_flag, o.main_gpu_name.c_str(),
                      o.main_gpu < 0 ? gpu_why.c_str() : "cannot use it");
         return 2;
     }
     if (const std::string no = lamina::core::gpu_unusable(o.main_gpu); !no.empty()) {
-        std::fprintf(stderr, "lamina: --main-gpu %s: GPU %d, %s: %s\n", o.main_gpu_name.c_str(), o.main_gpu,
+        std::fprintf(stderr, "lamina: %s %s: GPU %d, %s: %s\n", main_flag, o.main_gpu_name.c_str(), o.main_gpu,
                      gpus[(size_t) o.main_gpu].name.c_str(), no.c_str());
         return 2;
     }
@@ -1710,10 +1867,18 @@ int lamina::program::run(int argc, char** argv) {
     // the GPU tiers: the ones named, a name no visible GPU answers to (a card taken out, a failed driver) left out, or
     // with "auto" every other GPU, ordered by the probe below (and one this build's kernels do not run on left out
     // once its context is made)
+    // (each tier's card goes with it: its settings stay its own whichever tiers are left out)
     const bool tier_auto = o.tier_names.size() == 1 && o.tier_names[0] == "auto";
+    std::vector<lamina::program::GpuCard> kept_cards;
+    auto card_of = [&](size_t i) {
+        return i < o.tier_cards.size() ? o.tier_cards[i] : lamina::program::GpuCard{o.tier_names[i]};
+    };
     for (const lamina::core::GpuInfo& gi : gpus)
-        if (tier_auto && gi.ordinal != o.main_gpu) o.tier_gpus.push_back(gi.ordinal);
-    if (tier_auto && o.tier_gpus.empty()) std::fprintf(stderr, "lamina: --second-gpu auto: no other GPU\n");
+        if (tier_auto && gi.ordinal != o.main_gpu) {
+            o.tier_gpus.push_back(gi.ordinal);
+            kept_cards.push_back(card_of(0));
+        }
+    if (tier_auto && o.tier_gpus.empty()) std::fprintf(stderr, "lamina: %s auto: no other GPU\n", tier_flag);
     for (size_t i = 0; i < o.tier_names.size() && !tier_auto; ++i) {
         const int d = lamina::core::find_gpu(gpus, o.tier_names[i], gpu_why);
         const bool twice = std::find(o.tier_gpus.begin(), o.tier_gpus.end(), d) != o.tier_gpus.end();
@@ -1723,12 +1888,21 @@ int lamina::program::run(int argc, char** argv) {
                                     : d == o.main_gpu ? "it is the main GPU"
                                     : twice ? "it is named twice"
                                     : "the tiers are at most " + std::to_string(lamina::core::kMaxGpuTiers);
-            std::fprintf(stderr, "lamina: --second-gpu %s left out: %s\n", o.tier_names[i].c_str(),
-                         why.c_str());
+            std::fprintf(stderr, "lamina: %s %s left out: %s\n", tier_flag, o.tier_names[i].c_str(), why.c_str());
+            if (card_of(i).has_vram_only()) {   // the experts it would hold have no other home
+                std::fprintf(stderr, "lamina: --gpu %s: its vram-only experts need that GPU\n",
+                             lamina::program::gpu_card_text(card_of(i)).c_str());
+                return 2;
+            }
             continue;
         }
         o.tier_gpus.push_back(d);
+        kept_cards.push_back(card_of(i));
     }
+    o.tier_cards = std::move(kept_cards);
+    // --second-gpu-pin-gib: the first tier's vram-only, unless its card gives one
+    if (o.second_gpu_pin_gib > 0 && !o.tier_cards.empty() && !o.tier_cards[0].has_vram_only())
+        o.tier_cards[0].vram_only = (uint64_t) (o.second_gpu_pin_gib * 1073741824.0);
     o.second_gpu = o.tier_gpus.empty() ? -1 : o.tier_gpus[0];
     if (!set_stack_limit(o.main_gpu, o.main_gpu)) {   // the second GPU's before its tier sizes itself
         std::fprintf(stderr, "lamina: cannot set the CUDA stack limit\n");
@@ -2169,24 +2343,50 @@ int lamina::program::run(int argc, char** argv) {
     // R2.1: the experts are read from the model's GGUF into a resident arena (ArenaExpertSource): memory the engine
     // owns, which the OS has no cheaper reason to evict.  A mapping of the experts' file ran the pool 1.8x slower warm
     // and 3.7x cold: mapped file pages are the first the OS reclaims.
-    // ---- --vram-pin-gib / --second-gpu-pin-gib: the profile's hottest experts live only in VRAM.  The main GPU's
-    // go into its lowest slots, the second's into the second GPU's lowest, where nothing evicts them, lends them to
-    // the prompt path or gives them to the K/V; a GPU computes them whenever they are routed, and the arena leaves
-    // them out (each GiB pinned is a GiB of RAM).  The main GPU's are the profile's first, the second GPU's the ones
-    // right after the main GPU's cache: each card holds the experts it holds without pins (the main one, the faster,
-    // the hottest).  So with pins the arena loads once the main GPU's cache is sized, just before its fill.
-    std::vector<std::pair<int32_t, int32_t>> pin1, pin2;
-    std::vector<uint8_t> vram_only;   // per (layer, expert): 1 only in the main GPU's VRAM, 2 only in the second's
-    const bool pinning = o.vram_pin_gib > 0 || o.second_gpu_pin_gib > 0;
-    if (pinning) {
-        const char* why = o.expert_profile.empty() ? "it needs --expert-profile (its first experts are the ones pinned)"
-                        : o.disable_hit ? "--disable-hit computes every expert on the CPU, which has no copy of them"
-                        : o.second_gpu_pin_gib > 0 && o.second_gpu < 0 ? "--second-gpu-pin-gib needs --second-gpu"
-                        : o.second_gpu_pin_gib > 0 && o.no_prompt_offload
-                            ? "--second-gpu-pin-gib needs the prompt path's share on the second GPU (no --no-prompt-offload)"
-                        : nullptr;
-        if (why != nullptr) {
-            std::fprintf(stderr, "lamina: --vram-pin-gib: %s\n", why);
+    // ---- vram-only (--gpu's key; --vram-pin-gib, --second-gpu-pin-gib): the profile's hottest experts live only in
+    // VRAM.  Each card's go into its lowest slots, where nothing evicts them, lends them to the prompt path or gives
+    // them to the K/V; that GPU computes them whenever they are routed, and the arena leaves them out (each GiB pinned
+    // is a GiB of RAM).  The main GPU's are the profile's first, a tier's the ones right after the cards' before it:
+    // each card holds the experts it holds without pins (the main one, the faster, the hottest).  So with pins the
+    // arena loads once the main GPU's cache is sized, just before its fill.  A tier's pins need its share of the
+    // prompts: the first tier's is the prompt path's offload, the second's --prompt-tiers 2 (a fourth GPU has none).
+    std::vector<std::pair<int32_t, int32_t>> pin1;                    // the main GPU's
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> tier_pins;   // per tier (o.tier_gpus's order at the pins)
+    std::vector<uint8_t> vram_only;   // per (layer, expert): 1 only in the main GPU's VRAM, 2 + t only in tier t's
+    int pin_auto = -2;                // the card with vram-only=auto: -1 the main GPU, t a tier, -2 none
+    bool pinning = o.vram_pin_gib > 0 || o.vram_pin_auto;
+    {
+        std::string why;
+        if (o.vram_pin_auto) pin_auto = -1;
+        for (size_t t = 0; t < o.tier_cards.size() && why.empty(); ++t) {
+            const lamina::program::GpuCard& c = o.tier_cards[t];
+            if (!c.has_vram_only()) continue;
+            pinning = true;
+            const std::string card = "--gpu " + lamina::program::gpu_card_text(c) + ": ";
+            const double sleep_us = c.sleep ? *c.sleep * 1e6 : tier_value(o.second_gpu_sleep_us, t);
+            if (c.vram_only_auto && pin_auto != -2) why = "vram-only=auto on one card only";
+            else if (t >= 2) why = card + "vram-only on the fourth GPU: it computes no prompts, so they would have no home";
+            else if (o.no_prompt_offload) why = card + "a tier's vram-only experts need the prompt path's share there "
+                                                       "(not --no-prompt-offload, nor --expert-math exact)";
+            else if (sleep_us > 0) why = card + "a card with vram-only experts does not sleep (they have no other home)";
+            else if (t == 1 && o.prompt_split > 0 && o.prompt_split2 > o.prompt_split)
+                why = card + "--prompt-split L,M runs the third GPU's own layers there: its vram-only experts of the "
+                             "other layers would have no home in prompts";
+            if (c.vram_only_auto) pin_auto = (int) t;
+            // its pins are its own to compute in prompts (auto's, once it knows it pins any)
+            if (t == 1 && why.empty() && o.prompt_tiers < 2 && !c.vram_only_auto) {
+                o.prompt_tiers = 2;
+                std::fprintf(stderr, "lamina: --gpu %s: its vram-only experts are its own to compute in prompts too: "
+                                     "--prompt-tiers 2\n", lamina::program::gpu_card_text(c).c_str());
+            }
+        }
+        if (why.empty() && pinning)
+            why = o.expert_profile.empty() ? "vram-only needs --expert-profile (its first experts are the ones pinned)"
+                : o.disable_hit           ? "vram-only: --disable-hit computes every expert on the CPU, which has no copy "
+                                            "of them"
+                                          : "";
+        if (!why.empty()) {
+            std::fprintf(stderr, "lamina: %s\n", why.c_str());
             return 2;
         }
     }
@@ -2194,19 +2394,17 @@ int lamina::program::run(int argc, char** argv) {
     lamina::core::ExpertSource* srcp = nullptr;
     // The RAM the model takes against this PC's, before the arena takes it: the experts in it and, with --ple-io ram,
     // the PLE table (read in after them).  False when they cannot fit, said; a warning when they leave little.
-    auto ram_fits = [&](uint64_t arena_bytes) {
-        uint64_t need = arena_bytes;
-        std::string what = "the model's experts";
-        if (o.ple_io == "ram") {
-            try {
-                const lamina::GgufFile f(o.ple_gguf);
-                if (const lamina::TensorInfo* t = f.find("per_layer_token_embd.weight")) {
-                    need += lamina::tensor_payload_bytes(*t);
-                    what += " and its PLE table";
-                }
-            } catch (const std::exception&) {   // the table's open has said what is wrong with the file
-            }
+    uint64_t ple_ram = 0;   // --ple-io ram: the PLE table's bytes in RAM beside the arena
+    if (o.ple_io == "ram") {
+        try {
+            const lamina::GgufFile f(o.ple_gguf);
+            if (const lamina::TensorInfo* t = f.find("per_layer_token_embd.weight")) ple_ram = lamina::tensor_payload_bytes(*t);
+        } catch (const std::exception&) {   // the table's open has said what is wrong with the file
         }
+    }
+    auto ram_fits = [&](uint64_t arena_bytes) {
+        const uint64_t need = arena_bytes + ple_ram;
+        const std::string what = ple_ram > 0 ? "the model's experts and its PLE table" : "the model's experts";
         const lamina::platform::RamFit ram = lamina::platform::ram_fit(need);
         if (ram.total > 0)
             std::fprintf(stderr, "lamina: RAM: %s take %.1f GiB, %.1f of this PC's %.1f GiB available\n", what.c_str(),
@@ -2214,8 +2412,8 @@ int lamina::program::run(int argc, char** argv) {
                          (double) ram.total / 1073741824.0);
         if (ram.too_much()) {
             std::fprintf(stderr, "lamina: %s\n",
-                         ram.say(what, "a smaller quant of the model takes less, and --vram-pin-gib keeps experts in "
-                                       "VRAM instead").c_str());
+                         ram.say(what, "a smaller quant of the model takes less, and a card's vram-only=auto (--gpu) "
+                                       "keeps experts in VRAM instead").c_str());
             return false;
         }
         if (ram.tight())
@@ -2256,6 +2454,27 @@ int lamina::program::run(int argc, char** argv) {
         srcp = &arena_src;
         return true;
     };
+    // vram-only=auto: only when the experts would not fit the RAM (and leave its spare) beside the other cards' pins;
+    // then they load once the main GPU's cache is sized, as with any pins, and take() works out how many
+    if (pin_auto != -2) {
+        const lamina::kernels::cpu::ExpertLayout& lay = lamina::kernels::cpu::expert_layout();
+        uint64_t named = (uint64_t) (o.vram_pin_gib * 1073741824.0);
+        for (const lamina::program::GpuCard& c : o.tier_cards) named += c.vram_only.value_or(0);
+        const uint64_t in_ram = lay.total > named ? lay.total - named : 0;
+        const uint64_t room = lamina::platform::ram_fit(0).room();
+        if (in_ram + ple_ram <= room) {
+            std::fprintf(stderr, "lamina: vram-only=auto: the experts (%.1f GiB%s) fit the RAM, none only in VRAM\n",
+                         (double) in_ram / 1073741824.0, ple_ram > 0 ? " and the PLE table" : "");
+            pin_auto = -2;
+            bool named_pins = o.vram_pin_gib > 0;
+            for (const lamina::program::GpuCard& c : o.tier_cards) named_pins = named_pins || c.vram_only.value_or(0) > 0;
+            pinning = named_pins;
+        } else if (pin_auto == 1 && o.prompt_tiers < 2) {
+            o.prompt_tiers = 2;
+            std::fprintf(stderr, "lamina: --gpu %s: its vram-only experts are its own to compute in prompts too: "
+                                 "--prompt-tiers 2\n", lamina::program::gpu_card_text(o.tier_cards[1]).c_str());
+        }
+    }
     if (!pinning && !load_experts()) return 1;
     // The experts only in VRAM go from the model's files straight into their slots: (slot, layer, expert) each,
     // read by a few threads at once, each through a pinned block of its own.
@@ -2323,18 +2542,29 @@ int lamina::program::run(int argc, char** argv) {
     if (!o.tier_gpus.empty()) {
         second_ctx.join();
         std::vector<int> usable;
+        std::vector<lamina::program::GpuCard> usable_cards;
         for (size_t i = 0; i < o.tier_gpus.size(); ++i) {
             const int d = o.tier_gpus[i];
-            if (tier_unusable[i].empty()) usable.push_back(d);
-            else std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(),
-                              tier_unusable[i].c_str());
+            if (tier_unusable[i].empty()) {
+                usable.push_back(d);
+                usable_cards.push_back(o.tier_cards[i]);
+                continue;
+            }
+            std::fprintf(stderr, "lamina: GPU %d, %s, left out: %s\n", d, gpus[(size_t) d].name.c_str(),
+                         tier_unusable[i].c_str());
+            if (o.tier_cards[i].has_vram_only()) {
+                std::fprintf(stderr, "lamina: --gpu %s: its vram-only experts need that GPU\n",
+                             lamina::program::gpu_card_text(o.tier_cards[i]).c_str());
+                return 2;
+            }
         }
         o.tier_gpus = usable;
+        o.tier_cards = usable_cards;
         o.second_gpu = usable.empty() ? -1 : usable[0];
-        if (o.second_gpu < 0 && o.second_gpu_pin_gib > 0) {
-            std::fprintf(stderr, "lamina: --second-gpu-pin-gib needs a GPU tier, and none is left\n");
-            return 2;
-        }
+    }
+    if (o.second_gpu_pin_gib > 0 && o.tier_cards.empty()) {
+        std::fprintf(stderr, "lamina: --second-gpu-pin-gib needs a GPU tier, and none is left\n");
+        return 2;
     }
     // The GPU tiers' links measured, and whether the desktop uses each, while no load reads the RAM: "auto" puts the
     // fastest first (host-to-device rate x multiprocessors) and keeps the first kMaxGpuTiers; a reserve or a prefetch
@@ -2351,7 +2581,8 @@ int lamina::program::run(int argc, char** argv) {
         if (tier_auto)
             std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return score(a) > score(b); });
         std::vector<int> devs;
-        std::vector<double> reserve, prefetch;
+        std::vector<lamina::program::GpuCard> dev_cards;
+        std::vector<double> reserve, prefetch;   // the probe's, for a tier whose card and the lists give none
         for (const size_t i : order) {
             const int d = o.tier_gpus[i];
             if ((int) devs.size() == lamina::core::kMaxGpuTiers) {   // "auto" past the third: its context goes
@@ -2362,14 +2593,36 @@ int lamina::program::run(int argc, char** argv) {
                 continue;
             }
             devs.push_back(d);
+            dev_cards.push_back(o.tier_cards[i]);
             reserve.push_back(probe[i].display ? 2048.0 : 512.0);
             prefetch.push_back(probe[i].h2d_gbps >= 20.0 ? 12.0 : 0.0);
         }
         cudaSetDevice(o.main_gpu);
         o.tier_gpus = devs;
+        o.tier_cards = dev_cards;
         o.second_gpu = devs[0];
-        if (o.second_gpu_reserve_mib.empty()) o.second_gpu_reserve_mib = reserve;
-        if (o.second_gpu_prefetch_mb.empty()) o.second_gpu_prefetch_mb = prefetch;
+        // each tier's settings: its card's, else the per-tier list's (its last value for the tiers past it), else the
+        // probe's
+        o.tier_set.assign(devs.size(), Options::TierSet{});
+        for (size_t t = 0; t < devs.size(); ++t) {
+            const lamina::program::GpuCard& c = o.tier_cards[t];
+            Options::TierSet& s = o.tier_set[t];
+            s.gib = c.cache_auto    ? 0.0
+                  : c.cache_bytes ? (double) *c.cache_bytes / 1073741824.0
+                                  : tier_value(o.second_gpu_gib, t);
+            s.reserve_mib = c.reserve ? (double) *c.reserve / 1048576.0
+                          : !o.second_gpu_reserve_mib.empty() ? tier_value(o.second_gpu_reserve_mib, t)
+                                                              : reserve[t];
+            s.prefetch_mb = c.prefetch ? (double) *c.prefetch / 1048576.0
+                          : !o.second_gpu_prefetch_mb.empty() ? tier_value(o.second_gpu_prefetch_mb, t)
+                                                              : prefetch[t];
+            s.clocks = c.clocks ? *c.clocks
+                     : o.second_gpu_clocks.empty() ? std::string()
+                                                   : o.second_gpu_clocks[std::min(t, o.second_gpu_clocks.size() - 1)];
+            s.sleep_us = c.sleep ? *c.sleep * 1e6 : tier_value(o.second_gpu_sleep_us, t);
+            s.vram_only = c.vram_only.value_or(0);
+            s.vram_only_auto = c.vram_only_auto && pin_auto != -2;
+        }
         for (size_t t = 0; t < devs.size(); ++t) {
             const lamina::core::GpuInfo& gi = gpus[(size_t) devs[t]];
             const lamina::core::GpuProbe& pr = probe[order[t]];
@@ -2377,7 +2630,7 @@ int lamina::program::run(int argc, char** argv) {
                                  "multiprocessors, %s; reserve %.0f MiB, prefetch %.0f MiB\n", t + 1, gi.ordinal,
                          gi.name.c_str(), gi.bus_id.c_str(), gi.uuid.c_str(), pr.h2d_gbps, gi.sms,
                          !pr.display_known ? "its use unknown" : pr.display ? "a desktop" : "headless",
-                         tier_value(o.second_gpu_reserve_mib, t), tier_value(o.second_gpu_prefetch_mb, t));
+                         o.tier_set[t].reserve_mib, o.tier_set[t].prefetch_mb);
         }
     }
     // --ple-io ram: the table goes into RAM once the SSD has delivered the experts and the draft layer (with pinned
@@ -2436,6 +2689,8 @@ int lamina::program::run(int argc, char** argv) {
     mem_mark("the weights, the session, the drafter and the head");
     lamina::core::ExpertCache xcache;
     std::vector<std::pair<int32_t, int32_t>> profile;
+    if (o.expert_cache_bytes > 0)   // the main GPU's cache=SIZE: slots of the largest blob, each sized for its pair below
+        o.expert_cache = (int) std::max<uint64_t>(1, o.expert_cache_bytes / lamina::kernels::cpu::expert_layout().max_blob);
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
         if (!lamina::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
@@ -2563,25 +2818,103 @@ int lamina::program::run(int argc, char** argv) {
     if (pinning) {
         const auto& lay = lamina::kernels::cpu::expert_layout();
         const size_t n_main = (size_t) std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        auto take = [&](size_t from, size_t to, double gib, std::vector<std::pair<int32_t, int32_t>>& out) {
-            const uint64_t budget = (uint64_t) (gib * 1073741824.0);
-            uint64_t used = 0;
-            for (size_t i = from; i < to; ++i) {
-                const uint64_t b = (uint64_t) lamina::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(profile[i].first));
-                if (used + b > budget) break;
-                used += b;
-                out.push_back(profile[i]);
-            }
-            return used;
-        };
-        const uint64_t b1 = take(0, n_main, o.vram_pin_gib, pin1);
-        const uint64_t b2 = take(n_main, profile.size(), o.second_gpu_pin_gib, pin2);
+        tier_pins.assign(o.tier_gpus.size(), {});
         vram_only.assign((size_t) (g.n_layers * g.n_expert), 0);
-        for (const auto& pr : pin1) vram_only[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
-        for (const auto& pr : pin2) vram_only[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 2;
-        std::fprintf(stderr, "lamina: %zu experts (%.2f GiB) live only in the main GPU's VRAM (its cache's "
-                             "hottest, of %zu), %zu (%.2f GiB) only in the second GPU's; the RAM holds the others\n",
-                     pin1.size(), (double) b1 / 1073741824.0, n_main, pin2.size(), (double) b2 / 1073741824.0);
+        auto stride = [&](int64_t l) { return (uint64_t) lamina::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l)); };
+        // the RAM a pin saves: the main GPU's of the layers --prompt-split's later stages run stay in the arena too
+        // (load_experts), a tier's leave it
+        auto saves = [&](uint8_t code, int64_t l) -> uint64_t {
+            return code == 1 && o.prompt_split > 0 && l >= (int64_t) o.prompt_split ? 0 : lay.blob_bytes(l);
+        };
+        // into `out`: the profile's entries from `from` on, up to `budget` bytes of slots, or until `want` bytes of RAM
+        // are saved (0: no such goal), past those pinned already and those of layers from `below` on
+        struct Took {
+            uint64_t slots = 0, saved = 0;
+        };
+        auto take = [&](size_t from, size_t to, uint64_t budget, uint64_t want, uint8_t code, int64_t below,
+                        std::vector<std::pair<int32_t, int32_t>>& out) {
+            Took t;
+            for (size_t i = from; i < to && (want == 0 || t.saved < want); ++i) {
+                const auto& pr = profile[i];
+                const size_t at = (size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second;
+                if (vram_only[at] != 0 || pr.first >= below) continue;
+                const uint64_t b = stride(pr.first);
+                if (t.slots + b > budget) break;
+                t.slots += b;
+                t.saved += saves(code, pr.first);
+                vram_only[at] = code;
+                out.push_back(pr);
+            }
+            return t;
+        };
+        // where each tier's experts begin in the profile: after the main GPU's cache and the tiers' before it, each
+        // tier's cache estimated from its VRAM now (its card's size, else what is free less its reserve)
+        std::vector<size_t> tier_from(o.tier_gpus.size(), n_main);
+        std::vector<uint64_t> tier_room(o.tier_gpus.size(), 0);
+        for (size_t t = 0; t < o.tier_gpus.size(); ++t) {
+            size_t free_b = 0, total_b = 0;
+            cudaSetDevice(o.tier_gpus[t]);
+            cudaMemGetInfo(&free_b, &total_b);
+            const uint64_t reserve = (uint64_t) (o.tier_set[t].reserve_mib * 1048576.0);
+            tier_room[t] = o.tier_set[t].gib > 0 ? (uint64_t) (o.tier_set[t].gib * 1073741824.0)
+                                                 : (free_b > reserve ? (uint64_t) free_b - reserve : 0);
+            if (t + 1 == o.tier_gpus.size()) break;
+            uint64_t used = 0;
+            size_t i = tier_from[t];
+            for (; i < profile.size() && used + stride(profile[i].first) <= tier_room[t]; ++i) used += stride(profile[i].first);
+            tier_from[t + 1] = i;
+        }
+        cudaSetDevice(o.main_gpu);
+        // with --prompt-split the third GPU takes the layers before the split: the later stages stream theirs
+        const int64_t third_below = o.prompt_split > 0 ? (int64_t) o.prompt_split : g.n_layers;
+        auto below_of = [&](size_t t) { return t == 1 ? third_below : g.n_layers; };
+        Took main_took, tier_took[lamina::core::kMaxGpuTiers];
+        if (pin_auto != -1) main_took = take(0, n_main, (uint64_t) (o.vram_pin_gib * 1073741824.0), 0, 1, g.n_layers, pin1);
+        for (size_t t = 0; t < o.tier_gpus.size(); ++t)
+            if (o.tier_set[t].vram_only > 0)
+                tier_took[t] = take(tier_from[t], profile.size(), o.tier_set[t].vram_only, 0, (uint8_t) (2 + t), below_of(t),
+                                    tier_pins[t]);
+        // vram-only=auto: what keeps the arena, beside the PLE table in RAM, within the RAM's room (and its spare)
+        if (pin_auto != -2) {
+            uint64_t saved = main_took.saved;
+            for (size_t t = 0; t < o.tier_gpus.size(); ++t) saved += tier_took[t].saved;
+            const uint64_t in_ram = lay.total - std::min(lay.total, saved);
+            const uint64_t room = lamina::platform::ram_fit(0).room();
+            const uint64_t margin = 256ull << 20;   // the RAM's availability as it moves until the arena takes it
+            const uint64_t need = room == UINT64_MAX || in_ram + ple_ram + margin <= room ? 0
+                                                                                          : in_ram + ple_ram + margin - room;
+            size_t at = 0;   // the auto card, tier `at` (pin_auto >= 0)
+            for (size_t t = 0; t < o.tier_set.size(); ++t)
+                if (o.tier_set[t].vram_only_auto) at = t;
+            const Took got = need == 0 ? Took{}
+                           : pin_auto == -1 ? (main_took = take(0, n_main, UINT64_MAX, need, 1, g.n_layers, pin1))
+                                            : (tier_took[at] = take(tier_from[at], profile.size(), tier_room[at], need,
+                                                                     (uint8_t) (2 + at), below_of(at), tier_pins[at]));
+            const std::string who = pin_auto == -1 ? std::string("main") : kTierName[at];
+            std::fprintf(stderr, "lamina: vram-only=auto: the experts in RAM %.1f GiB%s, its room %.1f GiB: %.2f GiB "
+                                 "of them only in the %s GPU's VRAM\n", (double) in_ram / 1073741824.0,
+                         ple_ram > 0 ? " beside the PLE table" : "", (double) room / 1073741824.0,
+                         (double) got.saved / 1073741824.0, who.c_str());
+            if (got.saved < need) {
+                std::fprintf(stderr, "lamina: vram-only=auto: %.2f GiB of experts must leave the RAM, and the %s GPU "
+                                     "holds %.2f GiB of them: a smaller quant of the model, or vram-only on another card "
+                                     "too\n", (double) need / 1073741824.0, who.c_str(), (double) got.saved / 1073741824.0);
+                return 1;
+            }
+        }
+        std::string line;
+        auto put = [&](const char* who, size_t n, const Took& t) {
+            if (n == 0) return;
+            char b[160];
+            std::snprintf(b, sizeof b, "%s%s %zu (%.2f GiB of slots, %.2f GiB fewer in RAM)", line.empty() ? "" : ", ",
+                          who, n, (double) t.slots / 1073741824.0, (double) t.saved / 1073741824.0);
+            line += b;
+        };
+        put("the main GPU", pin1.size(), main_took);
+        for (size_t t = 0; t < o.tier_gpus.size(); ++t)
+            put((std::string("the ") + kTierName[t] + " GPU").c_str(), tier_pins[t].size(), tier_took[t]);
+        std::fprintf(stderr, "lamina: experts only in VRAM: %s; the RAM holds the others (the main GPU's cache holds "
+                             "the profile's first %zu)\n", line.empty() ? "none" : line.c_str(), n_main);
         if (!load_experts()) return 1;
         start_ple_ram();
     }
@@ -2614,8 +2947,8 @@ int lamina::program::run(int argc, char** argv) {
         // the pinned experts are the cache's lowest slots, in order (the rest of the engine keeps away from them)
         for (size_t k = 0; k < pin1.size(); ++k)
             if (xcache.slot_of(pin1[k].first, pin1[k].second) != (int32_t) k) {
-                std::fprintf(stderr, "lamina: the main GPU's cache holds %lld slots, fewer than the %zu experts "
-                                     "--vram-pin-gib pins there: lower it\n", (long long) xcache.slots(), pin1.size());
+                std::fprintf(stderr, "lamina: the main GPU's cache holds %lld slots, fewer than its %zu vram-only "
+                                     "experts: lower vram-only\n", (long long) xcache.slots(), pin1.size());
                 return 1;
             }
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
@@ -2679,7 +3012,7 @@ int lamina::program::run(int argc, char** argv) {
     lamina::core::TokenHits thits;
     const bool graph_hits = o.expert_cache > 0 && !profile.empty();
     if (pinning && !graph_hits) {   // the residency table is their only path (checked with the options above)
-        std::fprintf(stderr, "lamina: --vram-pin-gib: the experts only in VRAM need the GPU hit path\n");
+        std::fprintf(stderr, "lamina: vram-only: the experts only in VRAM need the GPU hit path\n");
         return 2;
     }
     if (graph_hits) {
@@ -2729,16 +3062,17 @@ int lamina::program::run(int argc, char** argv) {
         lamina::core::AdaptiveTier adapt;
     };
     std::array<TierSlot, lamina::core::kMaxGpuTiers> tiers;
+    // the vram-only experts of each tier that works, by its place among them (their lowest slots, frozen)
+    std::array<std::vector<std::pair<int32_t, int32_t>>, lamina::core::kMaxGpuTiers> work_pins;
     lamina::core::GpuClocks clocks;   // --second-gpu-clocks: the tiers' clocks held while the engine generates
     int n_tiers = 0;
     // the first (the "second GPU"): the prompt path's share, the head's rows, --prompt-split's second stage
     lamina::core::SecondGpu& gpu2 = tiers[0].gpu;
     std::vector<int32_t>& host_res2 = tiers[0].res;
     lamina::core::AdaptiveTier& tier2 = tiers[0].adapt;
-    static const char* const kTierName[lamina::core::kMaxGpuTiers] = {"second", "third", "fourth"};
     second_ctx.join();
     if (!o.tier_gpus.empty() && (host_res.empty() || o.spec < 2)) {
-        std::fprintf(stderr, "lamina: --second-gpu needs --expert-profile and --spec\n");
+        std::fprintf(stderr, "lamina: the GPU tiers need --expert-profile and --spec\n");
         return 2;
     }
     {
@@ -2749,14 +3083,19 @@ int lamina::program::run(int argc, char** argv) {
         for (size_t ti = 0; ti < o.tier_gpus.size(); ++ti) {
             const int dev = o.tier_gpus[ti];
             const int t = n_tiers;        // its place among the tiers that work
-            const bool first = t == 0;    // the --second-gpu-pin-gib pins and the prompt path's own buffers are the first's
+            const bool first = t == 0;    // the prompt path's own buffers are the first's
             TierSlot& ts = tiers[(size_t) t];
             lamina::core::SecondGpu& gp = ts.gpu;
             cudaDeviceProp prop{};
             cudaGetDeviceProperties(&prop, dev);
-            const uint64_t pf_bytes = (uint64_t) (std::max(0.0, tier_value(o.second_gpu_prefetch_mb, ti)) * 1048576.0);
-            const double gib = tier_value(o.second_gpu_gib, ti);
-            const int reserve_mib = (int) tier_value(o.second_gpu_reserve_mib, ti);
+            const Options::TierSet& set = o.tier_set[ti];
+            const uint64_t pf_bytes = (uint64_t) (std::max(0.0, set.prefetch_mb) * 1048576.0);
+            const double gib = set.gib;
+            const int reserve_mib = (int) set.reserve_mib;
+            // its vram-only experts: the lowest slots, read from the model's files
+            static const std::vector<std::pair<int32_t, int32_t>> kNone;
+            const std::vector<std::pair<int32_t, int32_t>>& own = ti < tier_pins.size() ? tier_pins[ti] : kNone;
+            const uint8_t own_code = (uint8_t) (2 + ti);
             // its context made here (or by the head's rows): one made at startup took the RAM the pinned arena gets,
             // and the CPU pool read IQ3_S's experts 5-10% slower
             if (!set_stack_limit(dev, main_dev)) {
@@ -2779,12 +3118,18 @@ int lamina::program::run(int argc, char** argv) {
                 const uint64_t budget = gib > 0 ? (uint64_t) (gib * 1073741824.0)
                                                 : (free_b > reserve ? (uint64_t) free_b - reserve : 0);
                 uint64_t used = 0;
+                for (const auto& pr : own) {   // first: its own, in the lowest slots
+                    used += (uint64_t) lamina::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first));
+                    sizes.push_back((int64_t) lay.blob_bytes(pr.first));
+                    pre.push_back(pr);
+                }
                 for (size_t i = (size_t) prefilled; i < profile.size(); ++i) {
                     const auto& pr = profile[i];
                     const size_t at = (size_t) (pr.first * g.n_expert + pr.second);
                     bool held = host_res[at] >= 0;   // the main GPU or a tier before it holds it
                     for (int j = 0; j < t && !held; ++j) held = tiers[(size_t) j].res[at] >= 0;
-                    if (held) continue;
+                    // its own pins are in already; another card's live there only (no RAM copy to fill from)
+                    if (held || (!vram_only.empty() && vram_only[at] != 0)) continue;
                     const uint64_t b = (uint64_t) lamina::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(pr.first));
                     if (used + b > budget) break;
                     used += b;
@@ -2795,7 +3140,7 @@ int lamina::program::run(int argc, char** argv) {
                     uint64_t round = 0;
                     for (int64_t l = 0; l < g.n_layers; ++l)
                         round += (uint64_t) lamina::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l));
-                    for (uint64_t q = (budget - used) / round; q > 0; --q)
+                    for (uint64_t q = budget > used ? (budget - used) / round : 0; q > 0; --q)
                         for (int64_t l = 0; l < g.n_layers; ++l) {
                             sizes.push_back((int64_t) lay.blob_bytes(l));
                             empty.push_back((int32_t) l);
@@ -2816,16 +3161,15 @@ int lamina::program::run(int argc, char** argv) {
                     gp.cache().close();
                     bool pins_short = false;
                     for (uint64_t cut = 0; !sizes.empty() && cut < reserve - free_b + (64ull << 20);) {
-                        if (empty.empty() && pre.size() <= (first ? pin2.size() : 0)) { pins_short = true; break; }
+                        if (empty.empty() && pre.size() <= own.size()) { pins_short = true; break; }
                         cut += (uint64_t) lamina::core::ExpertCache::slot_stride(sizes.back());
                         sizes.pop_back();
                         if (!empty.empty()) empty.pop_back();
                         else pre.pop_back();
                     }
-                    if (pins_short && first && !pin2.empty()) {   // pins stay
+                    if (pins_short && !own.empty()) {   // pins stay
                         ok = false;
-                        err = "too little VRAM for the experts --second-gpu-pin-gib pins there once its slots are "
-                              "written: lower it";
+                        err = "too little VRAM for its vram-only experts once its slots are written: lower vram-only";
                         break;
                     }
                     if (sizes.empty()) err = "no VRAM for experts once the slots are written";
@@ -2834,7 +3178,8 @@ int lamina::program::run(int argc, char** argv) {
                 std::vector<std::array<int32_t, 3>> from_model;   // (slot, layer, expert): only in this GPU's VRAM
                 for (size_t i = 0; ok && i < pre.size(); ++i) {
                     const int32_t slot = gp.cache().admit(pre[i].first, pre[i].second);
-                    if (slot != lamina::core::kNotResident && is_vram_only(pre[i].first, pre[i].second)) {
+                    if (slot != lamina::core::kNotResident &&
+                        vram_only.size() > 0 && vram_only[(size_t) (pre[i].first * g.n_expert + pre[i].second)] == own_code) {
                         from_model.push_back({slot, pre[i].first, pre[i].second});
                         continue;
                     }
@@ -2844,16 +3189,15 @@ int lamina::program::run(int argc, char** argv) {
                 }
                 ok = ok && fill_from_model(gp.cache(), dev, from_model, err);
                 cudaSetDevice(dev);
-                for (size_t k = 0; ok && first && k < pin2.size(); ++k)
-                    if (gp.cache().slot_of(pin2[k].first, pin2[k].second) != (int32_t) k) {
+                for (size_t k = 0; ok && k < own.size(); ++k)
+                    if (gp.cache().slot_of(own[k].first, own[k].second) != (int32_t) k) {
                         ok = false;
-                        err = "its cache holds " + std::to_string(gp.cache().slots()) + " slots, fewer than the " +
-                              std::to_string(pin2.size()) + " experts --second-gpu-pin-gib pins there: lower it";
+                        err = "its cache holds " + std::to_string(gp.cache().slots()) + " slots, fewer than its " +
+                              std::to_string(own.size()) + " vram-only experts: lower vram-only";
                     }
-                if (ok && first && !pin2.empty())
-                    ok = verify_from_model(gp.cache(), 0, pin2[0].first, pin2[0].second, err) &&
-                         verify_from_model(gp.cache(), (int32_t) pin2.size() - 1, pin2.back().first, pin2.back().second,
-                                           err);
+                if (ok && !own.empty())
+                    ok = verify_from_model(gp.cache(), 0, own[0].first, own[0].second, err) &&
+                         verify_from_model(gp.cache(), (int32_t) own.size() - 1, own.back().first, own.back().second, err);
                 cudaSetDevice(main_dev);
             }
             if (ok) {
@@ -2865,7 +3209,7 @@ int lamina::program::run(int argc, char** argv) {
                 ok = ts.adapt.init(gp.cache(), *srcp, ts.res, g.n_layers, g.n_expert, o.adapt_swaps, err, dev, main_dev,
                                    o.deterministic_adapt);
                 if (ok) {
-                    if (first) ts.adapt.set_frozen((int64_t) pin2.size());
+                    ts.adapt.set_frozen((int64_t) own.size());
                     // lowest slots first: the last ones, which the prompt path borrows, stay empty longest
                     for (size_t i = empty.size(); i-- > 0;) ts.adapt.add_free(empty[i], (int32_t) (pre.size() + i));
                     // behind the main GPU's tier and the tiers before it
@@ -2880,13 +3224,10 @@ int lamina::program::run(int argc, char** argv) {
                     drive.copies_end.emplace_back();
                 }
             }
-            if (const std::string cs = o.second_gpu_clocks.empty()
-                                           ? std::string()
-                                           : o.second_gpu_clocks[std::min(ti, o.second_gpu_clocks.size() - 1)];
-                ok && !cs.empty() && cs != "0") {
+            if (const std::string& cs = set.clocks; ok && !cs.empty() && cs != "0") {
                 std::string why;
                 if (!clocks.add(dev, cs, why)) {
-                    std::fprintf(stderr, "lamina: --second-gpu-clocks: %s\n", why.c_str());
+                    std::fprintf(stderr, "lamina: the %s GPU's clocks %s: %s\n", kTierName[t], cs.c_str(), why.c_str());
                     return 2;
                 }
                 std::fprintf(stderr, "lamina: %s GPU %d: its clocks locked at %s MHz while the engine generates\n",
@@ -2896,12 +3237,13 @@ int lamina::program::run(int argc, char** argv) {
                 drive.d.tiers[t].gpu = &gp;
                 drive.d.tiers[t].res = ts.res.data();
                 drive.d.tiers[t].prefetch_bytes = pf_bytes;
-                // --second-gpu-sleep-us: a tier after the first may sleep, in a run whose experts move
+                // sleep: a tier after the first may sleep, in a run whose experts move
                 drive.power[t].device = dev;
                 drive.power[t].adapt = &ts.adapt;
-                if (const double us = tier_value(o.second_gpu_sleep_us, ti); us > 0) {
+                work_pins[(size_t) t] = own;
+                if (const double us = set.sleep_us; us > 0) {
                     if (t == 0 || o.adapt_every <= 0 || o.deterministic_adapt) {
-                        std::fprintf(stderr, "lamina: --second-gpu-sleep-us: the %s GPU does not sleep (%s)\n", kTierName[t],
+                        std::fprintf(stderr, "lamina: the %s GPU does not sleep (%s)\n", kTierName[t],
                                      t == 0 ? "the first tier carries the prompts' share, the head's rows and the prefetch"
                                             : "--adapt-every 0 and --deterministic-adapt keep the experts in place");
                     } else {
@@ -2918,8 +3260,8 @@ int lamina::program::run(int argc, char** argv) {
             } else {
                 // another process may hold its VRAM (a model, a desktop app): the engine runs without it
                 std::fprintf(stderr, "lamina: %s GPU %d unused: %s\n", kTierName[t], dev, err.c_str());
-                if (first && !pin2.empty()) {   // its pinned experts are in no RAM: nothing else can compute them
-                    std::fprintf(stderr, "lamina: the experts --second-gpu-pin-gib pins have no other home\n");
+                if (!own.empty()) {   // its pinned experts are in no RAM: nothing else can compute them
+                    std::fprintf(stderr, "lamina: the %s GPU's vram-only experts have no other home\n", kTierName[t]);
                     return 1;
                 }
                 // a fresh slot for the next GPU (the adaptive tier before the cache it points to)
@@ -2998,7 +3340,7 @@ int lamina::program::run(int argc, char** argv) {
             while (stay1 > (int64_t) pin1.size() && top - xcache.slot_offset(stay1) < kv) --stay1;
         }
         stay2 = host_res2.empty() ? 0 : !(off && borrow) ? gpu2.cache().slots()
-                                      : below_loan(gpu2.cache(), pin2.size(), need2);
+                                      : below_loan(gpu2.cache(), work_pins[0].size(), need2);
         profile_rank.assign((size_t) (g.n_layers * g.n_expert), -1);
         for (size_t k = 0; k < profile.size(); ++k) {
             int32_t& r = profile_rank[(size_t) profile[k].first * (size_t) g.n_expert + (size_t) profile[k].second];
@@ -3182,13 +3524,14 @@ int lamina::program::run(int argc, char** argv) {
             pbuf.loan2.res = &host_res2;
             pbuf.loan2.device = o.second_gpu;
             pbuf.loan2.main_device = o.main_gpu;
-            pbuf.loan2.keep = (int64_t) pin2.size();
+            pbuf.loan2.keep = (int64_t) work_pins[0].size();
         }
         if (pbuf.help || pbuf.mid) {
             pbuf.loan3.cache = &tiers[1].gpu.cache();
             pbuf.loan3.res = &tiers[1].res;
             pbuf.loan3.device = o.tier_gpus[1];
             pbuf.loan3.main_device = o.main_gpu;
+            pbuf.loan3.keep = (int64_t) work_pins[1].size();
         }
         if (pbuf.help) {
             // its own buffers where the card has the room beside its cache and its reserve: nothing to refill
@@ -3204,9 +3547,14 @@ int lamina::program::run(int argc, char** argv) {
                          pbuf.own3 ? "of its own" : "in its cache's last slots");
         }
         if (!pbuf.init(o.prefill_chunk, !o.no_prefill_borrow, e)) return false;
-        if (pin1.empty() && pin2.empty()) return true;
-        if (!pin2.empty() && !off) {   // the main GPU's share would stream them from RAM
-            e = "--second-gpu-pin-gib needs the prompt path's share on the second GPU";
+        if (pin1.empty() && work_pins[0].empty() && work_pins[1].empty()) return true;
+        if (!work_pins[0].empty() && !off) {   // the main GPU's share would stream them from RAM
+            e = "the second GPU's vram-only experts need the prompt path's share there";
+            return false;
+        }
+        if (!work_pins[1].empty() && !pbuf.help) {   // the main GPU's stage would stream them to the second GPU
+            e = std::string("the ") + kTierName[1] + " GPU's vram-only experts need its share of prompts "
+                "(--prompt-tiers 2), which is off";
             return false;
         }
         // With experts pinned in the lowest slots, the largest loan each GPU's prompt path can take must fit above
@@ -3218,7 +3566,7 @@ int lamina::program::run(int argc, char** argv) {
             stride = std::max<uint64_t>(stride, (uint64_t) lamina::core::ExpertCache::slot_stride((int64_t) lay.blob_bytes(l)));
         std::vector<int64_t> held1((size_t) g.n_layers, 0), held12((size_t) g.n_layers, 0);
         for (const auto& pr : pin1) { ++held1[(size_t) pr.first]; ++held12[(size_t) pr.first]; }
-        for (const auto& pr : pin2) ++held12[(size_t) pr.first];
+        for (const auto& pr : work_pins[0]) ++held12[(size_t) pr.first];
         int64_t miss1 = 0, miss12 = 0;
         for (int64_t l = 0; l < g.n_layers; ++l) {
             miss1 = std::max<int64_t>(miss1, g.n_expert - held1[(size_t) l]);
@@ -3246,12 +3594,12 @@ int lamina::program::run(int argc, char** argv) {
             !check(pbuf.lend, xcache, (int64_t) pin1.size(),
                    lamina::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, off) +
                        (off ? 0 : pre_area(miss1, false)),
-                   "main GPU's", "--vram-pin-gib"))
+                   "main GPU's", "its vram-only"))
             return false;
-        if (!o.no_prefill_borrow && !pin2.empty() &&
-            !check(pbuf.lend2, gpu2.cache(), (int64_t) pin2.size(),
+        if (!o.no_prefill_borrow && !work_pins[0].empty() &&
+            !check(pbuf.lend2, gpu2.cache(), (int64_t) work_pins[0].size(),
                    lamina::prefill::ExpertRunner::bytes_needed(o.prefill_chunk, g.n_expert, true, true) +
-                       pre_area(miss12, true), "second GPU's", "--second-gpu-pin-gib"))
+                       pre_area(miss12, true), "second GPU's", "its vram-only"))
             return false;
         return true;
     };
@@ -3389,7 +3737,7 @@ int lamina::program::run(int argc, char** argv) {
                     const double gib = (double) G / 1073741824.0;
                     char pins[64] = "";
                     if (!pin1.empty())
-                        std::snprintf(pins, sizeof pins, ", or --vram-pin-gib %.2f lower",
+                        std::snprintf(pins, sizeof pins, ", or the main GPU's vram-only %.2f GiB lower",
                                       (double) (need(o.max_context) - room) * gib + 0.05);
                     std::fprintf(stderr, "lamina serve: the elastic K/V needs %.2f GiB for the whole context and the main "
                                          "GPU has %.2f for it (its cache's slots%s, the VRAM free past "
