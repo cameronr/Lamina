@@ -108,6 +108,9 @@ public:
     /// next window's PLE rows start there.
     std::function<void(int j, int32_t token, bool kept)> on_draft;
 
+    /// Every round's and chain step's graph, captured now, not at their first draft (Verifier::capture_all).
+    bool capture_all(std::string& err);
+
     double ms_draft = 0;
     int64_t rounds = 0;
 

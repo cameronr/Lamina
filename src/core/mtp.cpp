@@ -694,6 +694,14 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 }
 }  // namespace
 
+bool MtpDrafter::capture_all(std::string& err) {
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture_round(T, err)) return false;
+    for (int j = 1; j <= max_t_ - 2; ++j)
+        if (!capture_step(j, err)) return false;
+    return true;
+}
+
 bool MtpDrafter::capture_round(int T, std::string& err) {
     if (round_exec_[T]) return true;
     using namespace lamina::kernels;

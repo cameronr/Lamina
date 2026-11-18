@@ -3855,6 +3855,17 @@ int lamina::program::run(int argc, char** argv) {
             return stop_req.load();
         };
         {
+            // every verify window's graph and the draft layer's, captured now rather than by the first request that
+            // needs each: the VRAM line below counts their instantiates and the kernels they load
+            const Clock::time_point c0 = Clock::now();
+            if (!ver.capture_all(err) || (use_mtp && !mtp.capture_all(err))) {
+                std::fprintf(stderr, "lamina serve: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "lamina serve: the windows' graphs captured in %.0f ms\n",
+                         std::chrono::duration<double, std::milli>(Clock::now() - c0).count());
+        }
+        {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;

@@ -181,6 +181,10 @@ public:
     /// returns the reason.  Set before the first `run`.
     void set_watch(WatchFn fn, void* user) { watch_ = fn; watch_user_ = user; }
 
+    /// Every window size's graph and the commit's, captured and uploaded now, not at their first window: the
+    /// instantiates and the kernels they load take VRAM, which a start then counts.  After the hooks above are set.
+    bool capture_all(std::string& err);
+
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0, ms_predict = 0;
     int64_t windows = 0, predict_late = 0;
     /// Per GPU tier: the layers whose rows came after the CPU's, and the host time from the CPU's rows to theirs.

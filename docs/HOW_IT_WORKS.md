@@ -113,7 +113,9 @@ kernels: those the main GPU holds where they are; with a tier, the first tier co
 the chunk's input sent to it and the sums back in pieces of 2,048 tokens, so neither GPU waits for the other's whole
 share. Without a tier, the main GPU streams them from RAM, ahead of use. In a chunk each expert serves about 320
 tokens on average, so every expert is worth bringing to a GPU; the CPU computes none in a prompt. The buffers a chunk
-needs borrow the expert caches' last slots, refilled after the prompt.
+needs borrow the expert caches' last slots, refilled after the prompt. Before the server reports ready, the engine
+reads a throw-away part of 2,048 tokens this way and captures every verify window's graph: a GPU loads each kernel
+at its first launch, which would otherwise slow the first request (`--no-warmup` skips the part).
 
 A short new part of a prompt, up to 46 tokens in the configs (`--feed-max`), runs through verify windows instead,
 where the batched path's fixed cost would be the larger.

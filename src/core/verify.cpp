@@ -1084,6 +1084,12 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
+bool Verifier::capture_all(std::string& err) {
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture(T, err)) return false;
+    return capture_commit(err);
+}
+
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     using namespace lamina::kernels;
