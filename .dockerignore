@@ -2,7 +2,8 @@
 # folders are big and none of them belong in the image.
 .git/
 .worktrees/
-build*/
+build/
+build-*/
 dist/
 bin/
 .venv/
