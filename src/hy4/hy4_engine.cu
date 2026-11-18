@@ -18,6 +18,7 @@
 #include "lamina/artifact/gguf_split.hpp"
 #include "lamina/core/cuda_host.hpp"
 #include "lamina/core/gpu_select.hpp"
+#include "lamina/core/vmm.hpp"
 #include "lamina/hy4/engine.hpp"
 #include "lamina/hy4/geometry.hpp"
 #include "lamina/kernels/bf16_gemv.hpp"
@@ -188,6 +189,8 @@ struct Layer {
     // caches
     __half* kv = nullptr;       // latent rows: the context's cells (sparse) or the window's ring
     int64_t kv_cells = 0;
+    // the K/V grown with the context (Engine::ensure): the sparse layer's cells and pooled keys; the main GPU's slots
+    std::shared_ptr<lamina::core::VmmRange> kv_vm, pooled_vm, slot_vm;
     float* pooled = nullptr;    // the indexer's pooled keys [ctx / pool][idx_dim]
     float* tail = nullptr;      // the indexer's last kTail cells' value and gate rows [kTail][2][idx_dim]
 };
@@ -615,20 +618,33 @@ struct Engine {
         h_miss = hmapped<int32_t>(n_ent, &h_miss_d);
         rinq = dalloc<uint8_t>(T * (size_t) g.n_latent / 32 * q81);
         escr = dalloc<uint8_t>(K::native_expert_scratch_bytes((int64_t) n_ent, g.n_ff_exp));
-        // the caches
+        // the caches: the window layers' rings; the sparse layers' cells and pooled keys for the whole context, or (grown)
+        // address ranges for it that ensure() maps as the positions come
+        elastic = elastic && lamina::core::vmm_available();
         size_t kv_bytes = 0;
         for (Layer& l : m->layers) {
             l.kv_cells = l.swa ? ring : ctx;
-            l.kv = dalloc<__half>((size_t) l.kv_cells * hy4k::kKvRow);
-            kv_bytes += (size_t) l.kv_cells * hy4k::kKvRow * 2;
-            if (l.has_idx) {
-                l.pooled = dalloc<float>((size_t) (ctx / g.idx_pool) * idd);
-                l.tail = dalloc<float>((size_t) kTail * 2 * idd);
-                kv_bytes += (size_t) (ctx / g.idx_pool) * idd * 4;
+            const size_t kb = (size_t) l.kv_cells * hy4k::kKvRow * 2, pb = (size_t) (ctx / g.idx_pool) * idd * 4;
+            if (!l.swa && elastic) {
+                l.kv_vm = std::make_shared<lamina::core::VmmRange>();
+                l.pooled_vm = std::make_shared<lamina::core::VmmRange>();
+                if (!l.kv_vm->reserve(kb) || !l.pooled_vm->reserve(pb)) {
+                    std::fprintf(stderr, "lamina: the K/V's address range could not be reserved\n");
+                    throw Fatal{1};
+                }
+                l.kv = (__half*) l.kv_vm->base();
+                l.pooled = (float*) l.pooled_vm->base();
+            } else {
+                l.kv = dalloc<__half>((size_t) l.kv_cells * hy4k::kKvRow);
+                if (l.has_idx) l.pooled = dalloc<float>((size_t) (ctx / g.idx_pool) * idd);
             }
+            kv_bytes += kb + (l.has_idx ? pb : 0);
+            if (l.has_idx) l.tail = dalloc<float>((size_t) kTail * 2 * idd);
         }
-        std::fprintf(stderr, "lamina: %lld cells of context: K/V and pooled keys %.2f GiB\n", (long long) ctx,
-                     (double) kv_bytes / (double) (1ull << 30));
+        if (elastic) ensure(std::min<int64_t>(ctx, kKvStep));
+        std::fprintf(stderr, "lamina: %lld cells of context: K/V and pooled keys %.2f GiB%s\n", (long long) ctx,
+                     (double) kv_bytes / (double) (1ull << 30),
+                     elastic ? ", mapped as the context grows (the main GPU's expert slots give way)" : "");
         pool = std::make_unique<C::ExpertPool>(threads);
         std::string err;
         if (!reader.open(m->table_path, m->table_off, m->g.eng_rows, 256, (uint64_t) 1 << 20, err, true,
@@ -640,6 +656,183 @@ struct Engine {
     }
 
     int64_t pos() const { return (int64_t) seq.size(); }
+
+    // ---- the K/V grown with the context: the sparse layers' cells mapped up to kv_mapped (a multiple of kKvStep), the
+    // physical chunks taken from the free VRAM above kReserve, else from the main GPU's slots (shrink_main)
+    bool elastic = true;
+    static constexpr int64_t kKvStep = 16384;
+    static constexpr size_t kReserve = (size_t) 1536 << 20;
+    int64_t kv_mapped = 0;
+    std::vector<lamina::core::VmmChunk> spare;
+    ~Engine() {   // (the ranges free their own chunks with the model)
+        for (const lamina::core::VmmChunk h : spare) lamina::core::vmm_chunk_free(h);
+    }
+    int s_max = 0;   // the main GPU's slots at the start
+    /// Chunks the sparse layers' ranges need mapped for `cells` cells that they do not have
+    int64_t kv_need(int64_t cells) const {
+        const uint64_t G = lamina::core::vmm_granularity();
+        int64_t n = 0;
+        for (const Layer& l : m->layers) {
+            if (!l.kv_vm) continue;
+            const int64_t kc = (int64_t) (((uint64_t) cells * hy4k::kKvRow * 2 + G - 1) / G);
+            const int64_t pc = (int64_t) (((uint64_t) (cells / m->g.idx_pool) * (uint64_t) m->g.idx_dim * 4 + G - 1) / G);
+            for (int64_t c = 0; c < std::min(kc, l.kv_vm->chunks()); ++c) n += l.kv_vm->mapped(c) ? 0 : 1;
+            for (int64_t c = 0; c < std::min(pc, l.pooled_vm->chunks()); ++c) n += l.pooled_vm->mapped(c) ? 0 : 1;
+        }
+        return n;
+    }
+    /// Room for `cells` cells (a step at a time): chunks from the free VRAM above the reserve, then the main GPU's
+    /// slots'.  The GPU is idle first (its slots may be read).
+    void ensure(int64_t cells) {
+        if (!elastic || cells <= kv_mapped) return;
+        const int64_t target = std::min<int64_t>(ctx, (cells + kKvStep - 1) / kKvStep * kKvStep);
+        const int64_t need = kv_need(target);
+        CK(cudaStreamSynchronize(st));
+        const uint64_t G = lamina::core::vmm_granularity();
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const int64_t free_chunks = fr > kReserve ? (int64_t) ((fr - kReserve) / G) : 0;
+        if ((int64_t) spare.size() + free_chunks < need) shrink_main(need - (int64_t) spare.size() - free_chunks);
+        auto take = [&]() -> lamina::core::VmmChunk {
+            if (spare.empty()) return 0;
+            const lamina::core::VmmChunk h = spare.back();
+            spare.pop_back();
+            return h;
+        };
+        for (Layer& l : m->layers) {
+            if (!l.kv_vm) continue;
+            const int64_t kc = (int64_t) (((uint64_t) target * hy4k::kKvRow * 2 + G - 1) / G);
+            const int64_t pc = (int64_t) (((uint64_t) (target / m->g.idx_pool) * (uint64_t) m->g.idx_dim * 4 + G - 1) / G);
+            if (!l.kv_vm->map_range(0, kc, take) || !l.pooled_vm->map_range(0, pc, take)) {
+                std::fprintf(stderr, "lamina: no VRAM for %lld cells of context\n", (long long) target);
+                throw Fatal{1};
+            }
+        }
+        kv_mapped = target;
+    }
+    /// The main GPU's slots fewer by enough for `chunks` chunks: each MoE layer keeps its most used residents in the
+    /// slots that stay (moved down there), the others go; the chunks past the slots that stay go to `spare`.
+    void shrink_main(int64_t chunks) {
+        if (gpus.empty() || gpus[0].S <= 0) {
+            std::fprintf(stderr, "lamina: no VRAM left for the context\n");
+            throw Fatal{1};
+        }
+        const uint64_t G = lamina::core::vmm_granularity();
+        int S = gpus[0].S;
+        auto freed = [&](int s2) {   // chunks past s2 slots in every layer
+            int64_t n = 0;
+            for (const Layer& l : m->layers)
+                if (l.slot_vm)
+                    for (int64_t c = (int64_t) (((uint64_t) s2 * l.stride + G - 1) / G); c < l.slot_vm->chunks(); ++c)
+                        n += l.slot_vm->mapped(c) ? 1 : 0;
+            return n;
+        };
+        int s2 = S;
+        while (s2 > 0 && freed(s2) < chunks) --s2;
+        if (freed(s2) < chunks) {
+            std::fprintf(stderr, "lamina: no VRAM left for the context\n");
+            throw Fatal{1};
+        }
+        int moved = 0, gone = 0;
+        for (Layer& l : m->layers) {
+            if (l.dense || l.held.empty() || !l.slot_vm) continue;
+            SlotSet& sl = l.held[0];
+            std::vector<int32_t> res;   // the residents, most used first
+            for (int k = 0; k < sl.n; ++k)
+                if (sl.slot_expert[(size_t) k] >= 0) res.push_back(sl.slot_expert[(size_t) k]);
+            std::stable_sort(res.begin(), res.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
+            std::vector<char> keep(l.use.size(), 0);
+            for (size_t i = 0; i < res.size() && (int) i < s2; ++i) keep[(size_t) res[i]] = 1;
+            std::vector<int> holes;   // slots that stay, not holding a kept expert
+            for (int k = 0; k < s2; ++k) {
+                const int32_t e = sl.slot_expert[(size_t) k];
+                if (e < 0 || !keep[(size_t) e]) holes.push_back(k);
+            }
+            size_t hi = 0;
+            for (int k = s2; k < sl.n; ++k) {   // a kept expert above the line moves into a hole
+                const int32_t e = sl.slot_expert[(size_t) k];
+                if (e < 0) continue;
+                if (keep[(size_t) e] && hi < holes.size()) {
+                    const int h = holes[hi++];
+                    if (sl.slot_expert[(size_t) h] >= 0) {
+                        sl.slot_of[(size_t) sl.slot_expert[(size_t) h]] = -1;
+                        ++gone;
+                    }
+                    CK(cudaMemcpyAsync(sl.slots + (size_t) h * l.stride, sl.slots + (size_t) k * l.stride, l.fmt.bytes,
+                                       cudaMemcpyDeviceToDevice, st));
+                    sl.slot_expert[(size_t) h] = e;
+                    sl.slot_of[(size_t) e] = h;
+                    ++moved;
+                } else {
+                    sl.slot_of[(size_t) e] = -1;
+                    ++gone;
+                }
+                sl.slot_expert[(size_t) k] = -1;
+            }
+            sl.n = s2;
+            sl.slot_expert.resize((size_t) s2);
+            upload_table(l, 0);
+        }
+        CK(cudaStreamSynchronize(st));
+        for (Layer& l : m->layers)
+            if (l.slot_vm)
+                for (int64_t c = (int64_t) (((uint64_t) s2 * l.stride + G - 1) / G); c < l.slot_vm->chunks(); ++c)
+                    if (l.slot_vm->mapped(c)) spare.push_back(l.slot_vm->unmap(c));
+        gpus[0].S = s2;
+        std::fprintf(stderr, "lamina: the context takes the main GPU's expert slots %d -> %d a layer (%d experts moved "
+                     "down, %d gone)\n", S, s2, moved, gone);
+    }
+    /// After a request: the K/V's chunks past what the state needs (two steps of room) go back to the main GPU's slots,
+    /// which come back empty (the rebalance fills them); chunks no slot takes are freed.
+    void relax() {
+        if (!elastic || gpus.empty()) return;
+        const uint64_t G = lamina::core::vmm_granularity();
+        const int64_t target = std::min<int64_t>(ctx, (pos() + 2 * kKvStep + kKvStep - 1) / kKvStep * kKvStep);
+        if (kv_mapped <= target || gpus[0].S >= s_max) return;
+        CK(cudaDeviceSynchronize());
+        for (Layer& l : m->layers) {
+            if (!l.kv_vm) continue;
+            const int64_t kc = (int64_t) (((uint64_t) target * hy4k::kKvRow * 2 + G - 1) / G);
+            const int64_t pc = (int64_t) (((uint64_t) (target / m->g.idx_pool) * (uint64_t) m->g.idx_dim * 4 + G - 1) / G);
+            for (int64_t c = kc; c < l.kv_vm->chunks(); ++c)
+                if (l.kv_vm->mapped(c)) spare.push_back(l.kv_vm->unmap(c));
+            for (int64_t c = pc; c < l.pooled_vm->chunks(); ++c)
+                if (l.pooled_vm->mapped(c)) spare.push_back(l.pooled_vm->unmap(c));
+        }
+        kv_mapped = target;
+        // the slots back while the spare chunks cover a whole slot more in every layer
+        const int S = gpus[0].S;
+        int s2 = S;
+        auto needs = [&](int n) {
+            int64_t k = 0;
+            for (const Layer& l : m->layers)
+                if (l.slot_vm) {
+                    const int64_t hi = (int64_t) (((uint64_t) n * l.stride + G - 1) / G);
+                    for (int64_t c = 0; c < std::min(hi, l.slot_vm->chunks()); ++c) k += l.slot_vm->mapped(c) ? 0 : 1;
+                }
+            return k;
+        };
+        while (s2 < s_max && needs(s2 + 1) <= (int64_t) spare.size()) ++s2;
+        auto take = [&]() -> lamina::core::VmmChunk {
+            if (spare.empty()) return 0;
+            const lamina::core::VmmChunk h = spare.back();
+            spare.pop_back();
+            return h;
+        };
+        if (s2 > S) {
+            for (Layer& l : m->layers) {
+                if (!l.slot_vm) continue;
+                const int64_t hi = (int64_t) (((uint64_t) s2 * l.stride + G - 1) / G);
+                if (!l.slot_vm->map_range(0, hi, take)) break;
+                l.held[0].n = s2;
+                l.held[0].slot_expert.resize((size_t) s2, -1);
+            }
+            gpus[0].S = s2;
+            std::fprintf(stderr, "lamina: the main GPU's expert slots back %d -> %d a layer\n", S, s2);
+        }
+        for (const lamina::core::VmmChunk h : spare) lamina::core::vmm_chunk_free(h);
+        spare.clear();
+    }
 
     // ---- a prompt part: chunks through the prompt path (Prompt, when it is set up and the part has chunk_min tokens
     // or more: pieces as even as chunk_cap allows), else forwards of kMaxT rows
@@ -838,6 +1031,7 @@ struct Engine {
     void unpark(Parked c) {
         const auto& g = m->g;
         const int64_t p = (int64_t) c.seq.size(), groups = p / g.idx_pool;
+        ensure(p);
         size_t at = 0;
         for (const Layer& l : m->layers) {
             if (l.swa) continue;
@@ -874,6 +1068,7 @@ struct Engine {
     /// T rows (tokens toks, at positions pos() ..) through the model; logits of every row into `logits`.
     void forward(const int32_t* toks, int T) {
         const auto& g = m->g;
+        ensure(pos() + T);
         const int64_t p0 = pos();
         for (int t = 0; t < T; ++t) seq.push_back(toks[t]);
         // Engram's rows: hashed now, read from the SSD while this forward's inputs go to the GPU
@@ -1249,7 +1444,17 @@ struct Engine {
                 s.slot_of_d = dalloc<int32_t>((size_t) g.n_expert);
                 if (!ok || gpus[gi].S <= 0) continue;
                 s.n = gpus[gi].S;
-                s.slots = dalloc<uint8_t>((size_t) s.n * l.stride);
+                if (gi == 0 && elastic) {   // a range the K/V can take the last slots' chunks from
+                    l.slot_vm = std::make_shared<lamina::core::VmmRange>();
+                    if (!l.slot_vm->reserve((uint64_t) s.n * l.stride + kWeightPad) ||
+                        !l.slot_vm->map_range(0, l.slot_vm->chunks(), [] { return (lamina::core::VmmChunk) 0; })) {
+                        std::fprintf(stderr, "lamina: the main GPU's expert slots could not be mapped\n");
+                        throw Fatal{1};
+                    }
+                    s.slots = l.slot_vm->base();
+                } else {
+                    s.slots = dalloc<uint8_t>((size_t) s.n * l.stride);
+                }
                 s.slot_expert.assign((size_t) s.n, -1);
             }
             const std::vector<int32_t> order = ranking(l);
@@ -1263,6 +1468,7 @@ struct Engine {
             CK(cudaDeviceSynchronize());
         }
         tier_used.assign(gpus.size(), 0);
+        s_max = gpus.empty() ? 0 : std::max(gpus[0].S, 0);
         for (size_t gi = 0; gi < gpus.size(); ++gi)
             std::fprintf(stderr, "lamina: GPU %d, %s: %d of %lld routed experts a layer (%.2f GiB)%s\n", gpus[gi].dev,
                          gpus[gi].name.c_str(), std::max(gpus[gi].S, 0), (long long) g.n_expert,
@@ -1735,6 +1941,7 @@ struct Prompt {
     void run(const int32_t* toks, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, hc = (int) g.hc;
+        E.ensure(E.pos() + T);
         const int64_t p0 = E.pos();
         for (int t = 0; t < T; ++t) E.seq.push_back(toks[t]);
         const auto tt = Clock::now();
@@ -2325,6 +2532,7 @@ struct Serve {
         serve_print("DONE %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, reuse, hits, lookups, (long long) fresh);
         const auto r0 = Clock::now();
+        E.relax();
         const int swaps = E.rebalance(512, [&] {
             std::lock_guard<std::mutex> lk(mu);
             return eof || !lines.empty();
@@ -2398,6 +2606,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     int prefill = 4096, prefill_min = 24;
     double arena_pin = 72;
     double park_mib = 16384, reserve_mib = 6144;
+    bool kv_grow = true;
     std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2434,6 +2643,8 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--arena-pin") arena_pin = std::atof(next());        // GiB of the arena in pinned memory at most
         else if (a == "--park-mib" || a == "--conversation-cache-mib") park_mib = std::atof(next());
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
+        else if (a == "--no-kv-grow") kv_grow = false;
+        else if (a == "--kv-grow") kv_grow = true;
         else if (a == "--tier-gpus") {   // the expert tiers' GPUs (CUDA ordinals, the family switch's)
             for (const int32_t d : lamina::program::parse_ids(next())) tier_devs.push_back((int) d);
         }
@@ -2455,6 +2666,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.save_path = profile_save;
     E.save_every_min = save_every;
     E.use_graphs = graphs;
+    E.elastic = kv_grow;
     E.init(m, max_ctx, threads);
     E.park_budget = (size_t) (std::max(0.0, park_mib) * (double) (1 << 20));
     E.ram_reserve = (size_t) (std::max(0.0, reserve_mib) * (double) (1 << 20));
