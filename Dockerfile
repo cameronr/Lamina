@@ -28,6 +28,9 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 NVIDIA_DRIVER_CAPABILITIES
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libgomp1 libssl3 tini \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/lamina
+# the base expert profile the configs' "--expert-profile ./data/expert-profile.bin" reads relative to this folder,
+# the same file the old COPY . . layout baked in; the learned profile under /data replaces it at start when it fits
+COPY data/expert-profile.bin data/
 # (the image encoder beside the server, which takes it from its own folder)
 COPY --from=build /opt/lamina/dist/lamina /opt/lamina/dist/lamina-server /opt/lamina/dist/lamina-vision build/
 VOLUME ["/data"]
