@@ -12,6 +12,7 @@
 //   * generate mode: --tokens IDS [--n N] [--force IDS] [--dump-full-logits F] (bench/parity.py's interface through
 //     scratch/q36/logits_to_parity.py).
 #include "hy4_kernels.cuh"
+#include "hy4_dfly_file.hpp"
 #include "hy4_prompt.cuh"
 
 #include "lamina/artifact/gguf_reader.hpp"
@@ -49,6 +50,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -158,7 +160,7 @@ struct SlotSet {
 };
 
 struct Layer {
-    int il = 0;
+    int il = 0;   // its layer (a DFly layer: the trunk layer it reads)
     bool mtp = false, swa = false, has_idx = false, dense = false;
     int eng = -1;   // its Engram module, or -1
     int H = 0;
@@ -168,6 +170,9 @@ struct Layer {
     Mat q_a, q_b, kv_a, k_b, v_b, wo, gate;
     const float *hca_fn = nullptr, *hca_base = nullptr, *hca_scale = nullptr;
     const float *hcf_fn = nullptr, *hcf_base = nullptr, *hcf_scale = nullptr;
+    // a DFly layer's cells (Engine::dfly_draft's: the trunk layer's picks and the block), ld apart
+    const int32_t *ext_cells = nullptr, *ext_n = nullptr;
+    int ext_ld = 0;
     // the indexer
     Mat iq_b, ik, icv, icg;
     const float *ik_norm = nullptr, *ape = nullptr, *ipool_norm = nullptr, *iproj = nullptr;
@@ -205,6 +210,19 @@ struct Model {
     Layer mtp;
     Mat eh_proj;
     const float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
+    // DFly2 (--dfly FILE; the MTP block is then not loaded): layers as the trunk's sparse ones with dense FFNs, each on
+    // the K/V and the index picks of its trunk layer (target); the block's first row fused with the trunk's state, each
+    // draft's state corrected with the last draft's embedding
+    struct DFly {
+        bool on = false;
+        std::vector<Layer> layers;
+        std::vector<int> target;
+        Mat eh_proj, hc_gate, hc_up, hc_down;
+        const float *enorm = nullptr, *hnorm = nullptr, *fgate = nullptr, *hc_hnorm = nullptr, *hc_enorm = nullptr,
+                    *norm = nullptr;
+        int32_t mask = -1;
+        int width = 0;   // the block's rows: the bonus token and width - 1 masks
+    } dfly;
     const uint8_t* embd = nullptr;
     int embd_type = -1;
     size_t embd_row = 0;
@@ -216,6 +234,27 @@ struct Model {
     size_t pinned = 0;   // the arena's bytes in pinned memory
     int32_t eos = -1;   // tokenizer.ggml.eos_token_id: the end of an answer
 };
+
+/// Rows of floats as a Q8_0 matrix on the device (ggml's quantizer; kWeightPad zero bytes after it)
+Mat q8_mat(const float* w, int64_t rows, int64_t cols) {
+    Mat m;
+    m.type = 8;
+    m.n_in = (int) cols;
+    m.n_out = (int) rows;
+    const size_t bytes = (size_t) rows * (size_t) (cols / 32) * 34;
+    std::vector<uint8_t> q(bytes);
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, w, q.data(), 0, rows, cols, nullptr);
+    uint8_t* d = dalloc<uint8_t>(bytes + kWeightPad);
+    CK(cudaMemcpy(d, q.data(), bytes, cudaMemcpyHostToDevice));
+    CK(cudaMemset(d + bytes, 0, kWeightPad));
+    m.d = d;
+    return m;
+}
+const float* f32_dev(const std::vector<float>& h) {
+    float* d = dalloc<float>(h.size());
+    CK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    return d;
+}
 
 struct Loader {
     const lamina::GgufModel& gm;
@@ -265,17 +304,11 @@ struct Loader {
                          "Q8_0)\n", name.c_str(), t->type_name());
             throw Fatal{1};
         }
-        const size_t n = (size_t) rows * (size_t) m.n_in, bytes = (size_t) rows * (size_t) (m.n_in / 32) * 34;
+        const size_t n = (size_t) rows * (size_t) m.n_in;
         std::vector<float> f(n);
         if (t->type == 0) std::memcpy(f.data(), src, n * 4);
         else ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(src), f.data(), (int64_t) n);
-        std::vector<uint8_t> q(bytes);
-        ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), q.data(), 0, (int64_t) rows, m.n_in, nullptr);
-        uint8_t* d = dalloc<uint8_t>(bytes + kWeightPad);
-        CK(cudaMemcpy(d, q.data(), bytes, cudaMemcpyHostToDevice));
-        CK(cudaMemset(d + bytes, 0, kWeightPad));
-        m.d = d;
-        return m;
+        return q8_mat(f.data(), (int64_t) rows, m.n_in);
     }
     /// an F32 tensor on the device (BF16 / F16 widened)
     const float* f32(const std::string& name) {
@@ -293,9 +326,7 @@ struct Loader {
             std::fprintf(stderr, "lamina: %s is %s, expected F32 or BF16\n", name.c_str(), t->type_name());
             throw Fatal{1};
         }
-        float* d = dalloc<float>(n);
-        CK(cudaMemcpy(d, h.data(), n * 4, cudaMemcpyHostToDevice));
-        return d;
+        return f32_dev(h);
     }
 };
 
@@ -489,10 +520,119 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     std::vector<std::thread> th;
     for (int i = 0; i < std::max(1, threads); ++i) th.emplace_back(copy);
     for (auto& t : th) t.join();
-    std::fprintf(stderr, "lamina: Hy4-flash: %lld layers (+%lld MTP), dense weights on the GPU in %.1f s, the routed "
-                 "experts (%.1f GiB, %.1f of it pinned) in host memory in %.1f s\n", (long long) g.n_layers,
-                 (long long) g.n_mtp, dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30),
+    std::fprintf(stderr, "lamina: Hy4-flash: %lld layers%s, dense weights on the GPU in %.1f s, the routed experts "
+                 "(%.1f GiB, %.1f of it pinned) in host memory in %.1f s\n", (long long) g.n_layers,
+                 m.has_mtp ? " and the MTP block" : "", dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30),
                  ms_since(t0) / 1000.0 - dense_s);
+    return true;
+}
+
+// ------------------------------------------------------------------------------------------------ DFly2
+/// DFly2 from the checkpoint's model.dfly_layers (the safetensors file at `path`, its config.json beside it): its
+/// layers as the trunk's sparse layers (MLA with the gate, the sinks and the post-projection norm; kv_b split per
+/// head into k_b, each head's transposed, and v_b, as llama.cpp's converter splits the trunk's) with dense FFNs, each
+/// reading the K/V and the index picks of its trunk layer; the fusion of the block's first row, the hidden
+/// correction, the final norm.  Matrices made Q8_0 as the MTP block's.
+bool load_dfly(const std::string& path, Model& m, std::string& err) {
+    const auto t0 = Clock::now();
+    const auto& g = m.g;
+    lamina::hy4::DFlyConfig c;
+    lamina::hy4::SafeTensors st;
+    if (!lamina::hy4::read_dfly_config(std::filesystem::path(path).parent_path().string(), c, err) ||
+        !st.open(path, err))
+        return false;
+    if (c.top_k != g.idx_top_k || c.width < 2 || c.width > kMaxT || c.mask < 0 || c.mask >= g.n_vocab) {
+        err = "DFly: its top-k " + std::to_string(c.top_k) + " (the trunk's " + std::to_string(g.idx_top_k) +
+              "), its block of " + std::to_string(c.width) + " rows or its mask token " + std::to_string(c.mask) +
+              " does not fit this model";
+        return false;
+    }
+    Model::DFly& d = m.dfly;
+    d.target = c.kv_layers;
+    d.mask = c.mask;
+    d.width = c.width;
+    const std::string P = "model.dfly_layers.";
+    std::vector<float> v;
+    std::vector<int64_t> sh;
+    auto read = [&](const std::string& name, size_t dims) {
+        if (!st.read(P + name, v, sh) || sh.size() != dims)
+            throw std::runtime_error("DFly: " + name + " is missing, or not BF16 / F32 of " + std::to_string(dims) +
+                                     " dimensions");
+    };
+    auto vec = [&](const std::string& name) -> const float* {
+        read(name, 1);
+        return f32_dev(v);
+    };
+    auto mat = [&](const std::string& name) -> Mat {
+        read(name, 2);
+        return q8_mat(v.data(), sh[0], sh[1]);
+    };
+    try {
+        d.layers.resize(d.target.size());
+        for (size_t i = 0; i < d.target.size(); ++i) {
+            const int t = d.target[i];
+            if (t < 0 || t >= g.n_layers || g.swa[(size_t) t] || !g.has_indexer(t)) {
+                err = "DFly: its target layer " + std::to_string(t) + " is not a sparse layer with an indexer";
+                return false;
+            }
+            Layer& y = d.layers[i];
+            const Layer& tl = m.layers[(size_t) t];
+            const std::string p = std::to_string(i) + ".";
+            y.il = t;   // the trunk layer it reads
+            y.H = tl.H;
+            y.theta = tl.theta;
+            y.attn_norm = vec(p + "input_layernorm.weight");
+            y.ffn_norm = vec(p + "post_attention_layernorm.weight");
+            y.q_a = mat(p + "self_attn.q_a_proj.weight");
+            y.q_a_norm = vec(p + "self_attn.q_a_layernorm.weight");
+            y.q_b = mat(p + "self_attn.q_b_proj.weight");
+            y.kv_a = mat(p + "self_attn.kv_a_proj_with_mqa.weight");
+            y.kv_a_norm = vec(p + "self_attn.kv_a_layernorm.weight");
+            y.wo = mat(p + "self_attn.o_proj.weight");
+            y.gate = mat(p + "self_attn.linear_gate.weight");
+            y.sinks = vec(p + "self_attn.learnable_sink_param");
+            y.post_attn = vec(p + "self_attn.post_proj_norm.weight");
+            y.f_gate = mat(p + "mlp.gate_proj.weight");
+            y.f_up = mat(p + "mlp.up_proj.weight");
+            y.f_down = mat(p + "mlp.down_proj.weight");
+            // kv_b [H (nope + v), latent] -> k_b [H][latent][nope] (each head's block transposed), v_b [H][v][latent]
+            read(p + "self_attn.kv_b_proj.weight", 2);
+            const int64_t H = y.H, nope = g.nope(), vh = g.v_head, lat = hy4k::kLatent;
+            if (sh[0] != H * (nope + vh) || sh[1] != lat) {
+                err = "DFly: layer " + std::to_string(i) + "'s kv_b_proj is not [" + std::to_string(H * (nope + vh)) +
+                      ", " + std::to_string(lat) + "]";
+                return false;
+            }
+            std::vector<float> kb((size_t) (H * lat * nope)), vb((size_t) (H * vh * lat));
+            for (int64_t h = 0; h < H; ++h) {
+                const float* blk = v.data() + (size_t) (h * (nope + vh) * lat);
+                for (int64_t j = 0; j < lat; ++j)
+                    for (int64_t k = 0; k < nope; ++k)
+                        kb[(size_t) ((h * lat + j) * nope + k)] = blk[(size_t) (k * lat + j)];
+                std::memcpy(vb.data() + (size_t) (h * vh * lat), blk + (size_t) (nope * lat), (size_t) (vh * lat) * 4);
+            }
+            y.k_b = q8_mat(kb.data(), H * lat, nope);
+            y.v_b = q8_mat(vb.data(), H * vh, lat);
+        }
+        d.eh_proj = mat("mtp_fusion.eh_proj.weight");
+        d.enorm = vec("mtp_fusion.enorm.weight");
+        d.hnorm = vec("mtp_fusion.hnorm.weight");
+        d.fgate = vec("mtp_fusion.gate");
+        d.hc_gate = mat("hidden_correction.gate_proj.weight");
+        d.hc_up = mat("hidden_correction.up_proj.weight");
+        d.hc_down = mat("hidden_correction.down_proj.weight");
+        d.hc_hnorm = vec("hidden_correction.hidden_norm.weight");
+        d.hc_enorm = vec("hidden_correction.embed_norm.weight");
+        d.norm = vec("final_norm.weight");
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    CK(cudaDeviceSynchronize());
+    d.on = true;
+    std::fprintf(stderr, "lamina: DFly2: %zu layers on the trunk's layers %d .. %d, its FFN %d, a block of %d rows, in "
+                 "%.1f s\n", d.layers.size(), d.target.front(), d.target.back(), d.layers[0].f_gate.n_out, d.width,
+                 ms_since(t0) / 1000.0);
     return true;
 }
 
@@ -578,10 +718,16 @@ struct Engine {
     double cpu_ms = 0, table_ms = 0;
     int64_t forwards = 0;
 
-    int n_chunks_max() const { return std::max<int>((int) (m->g.idx_top_k / hy4k::kAttnChunk), (int) ((m->g.n_swa + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk)); }
+    int n_chunks_max() const {
+        const auto chunks = [](int64_t cells) { return (int) ((cells + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk); };
+        return std::max({chunks(m->g.idx_top_k), chunks(m->g.n_swa), chunks(dfly_ld)});
+    }
 
     void init(Model& model, int64_t max_ctx, int threads) {
         m = &model;
+        if (m->dfly.on)
+            dfly_ld = (int) ((m->g.idx_top_k + m->dfly.width + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk *
+                             hy4k::kAttnChunk);
         const auto& g = m->g;
         ctx = (max_ctx + g.idx_pool - 1) / g.idx_pool * g.idx_pool;
         ring = g.n_swa + kMaxT;
@@ -699,9 +845,32 @@ struct Engine {
             if (l.has_idx) l.tail = dalloc<float>((size_t) kTail * 2 * idd);
         }
         if (elastic) ensure(std::min<int64_t>(ctx, kKvStep));
-        if (m->has_mtp) {
+        if (m->dfly.on) {
+            const size_t nl = m->dfly.layers.size(), W = (size_t) m->dfly.width;
+            snap_cells = dalloc<int32_t>(nl * T * (size_t) g.idx_top_k);
+            snap_n = dalloc<int32_t>(nl * T);
+            dfly_cells = dalloc<int32_t>(nl * W * (size_t) dfly_ld);
+            dfly_n = dalloc<int32_t>(nl * W);
+            dfly_h = dalloc<float>(W * N);
+            dfly_res = dalloc<float>(W * N);
+            dfly_out = dalloc<float>(W * N);
+            dfly_cat = dalloc<float>(2 * N);
+            dfly_catq = dalloc<uint8_t>(2 * N / 32 * q81);
+            dfly_d = dalloc<float>(N);
+            dfly_lg = dalloc<float>((size_t) g.n_vocab);
+            for (size_t i = 0; i < nl; ++i) {   // the K/V of its trunk layer; its cells from the block's pass
+                Layer& d = m->dfly.layers[i];
+                d.kv = m->layers[(size_t) m->dfly.target[i]].kv;
+                d.ext_cells = dfly_cells + i * W * (size_t) dfly_ld;
+                d.ext_n = dfly_n + i * W;
+                d.ext_ld = dfly_ld;
+            }
+        }
+        if (m->has_mtp || m->dfly.on) {
             hring = dalloc<float>((size_t) kHRing * N);
             CK(cudaMemset(hring, 0, (size_t) kHRing * N * 4));
+        }
+        if (m->has_mtp) {
             mtp_cat = dalloc<float>(T * 2 * N);
             mtp_catq = dalloc<uint8_t>(T * 2 * N / 32 * q81);
             mtp_x = dalloc<float>(T * N);
@@ -736,13 +905,28 @@ struct Engine {
     int64_t kv_mapped = 0;
     std::vector<lamina::core::VmmChunk> spare;
     std::vector<std::reference_wrapper<Layer>> cl;   // the layers with caches: the trunk, then the MTP block
-    // the MTP block: the trunk's normed final hidden rows of the last kHRing positions (its input), its rows' buffers
+    // the drafters' input: the trunk's normed final hidden rows of the last kHRing positions; the MTP block's buffers
     static constexpr int kHRing = 16;
     float *hring = nullptr, *mtp_cat = nullptr, *mtp_x = nullptr, *mtp_hs = nullptr, *mtp_h = nullptr, *mtp_lg = nullptr;
     uint8_t* mtp_catq = nullptr;
     int32_t *mtp_src = nullptr, *h_src = nullptr;
-    bool mtp_on = false;   // the MTP block kept up with the trunk (drafts on)
-    float spec_min_p = 0.f;   // a window's drafts while their joint probability under the MTP head stays at or above this
+    bool drafts_on = false;   // drafted windows: the MTP block kept up with the trunk, or DFly's inputs kept (m->dfly)
+    // DFly2: the trunk's picks of its target layers for the rows of the last pass (snap_rows of them from position
+    // snap_base; -1: none), its block's cells, rows and buffers
+    int dfly_ld = 0;   // a block row's cells: the trunk's top-k picks and the block, in whole attention chunks
+    int32_t *snap_cells = nullptr, *snap_n = nullptr, *dfly_cells = nullptr, *dfly_n = nullptr;
+    float *dfly_h = nullptr, *dfly_res = nullptr, *dfly_out = nullptr, *dfly_cat = nullptr, *dfly_d = nullptr,
+          *dfly_lg = nullptr;
+    uint8_t* dfly_catq = nullptr;
+    int64_t snap_base = -1;
+    int snap_rows = 0;
+    /// The DFly snapshot slot of trunk layer il, or -1
+    int dfly_slot(int il) const {
+        for (size_t i = 0; i < m->dfly.target.size(); ++i)
+            if (m->dfly.target[i] == il) return (int) i;
+        return -1;
+    }
+    float spec_min_p = 0.f;   // a window's drafts while their joint probability under the drafter's head stays >= this
     cudaEvent_t ev_moe = nullptr, ev_mtp = nullptr;   // the MoE block's routing event: ev (the decode's), ev_mtp
     ~Engine() {   // (the ranges free their own chunks with the model)
         for (const lamina::core::VmmChunk h : spare) lamina::core::vmm_chunk_free(h);
@@ -936,7 +1120,7 @@ struct Engine {
                 } else {
                     const int64_t p0 = pos();
                     forward(toks + done + sd, T);
-                    if (mtp_on) mtp_catch_up(toks + done + sd, T, p0);
+                    if (drafts_on && m->has_mtp) mtp_catch_up(toks + done + sd, T, p0);
                 }
                 sd += T;
                 last = chunks ? 0 : T - 1;
@@ -1039,6 +1223,7 @@ struct Engine {
                 CK(cudaStreamSynchronize(st));
                 seq.resize((size_t) best->pos);
             }
+            snap_base = -1;   // DFly's picks are not a snapshot's
         }
         snaps.erase(std::remove_if(snaps.begin(), snaps.end(), [&](const Snap& s) { return s.pos > pos(); }), snaps.end());
         return pos();
@@ -1160,6 +1345,8 @@ struct Engine {
         const auto& g = m->g;
         ensure(pos() + T);
         const int64_t p0 = pos();
+        snap_base = p0;
+        snap_rows = T;
         for (int t = 0; t < T; ++t) seq.push_back(toks[t]);
         // Engram's rows: hashed now, read from the SSD while this forward's inputs go to the GPU
         const auto tt = Clock::now();
@@ -1285,11 +1472,20 @@ struct Engine {
         const int32_t* cells = cells_swa;
         const int32_t* counts = n_swa;
         int ld = (int) g.n_swa;
-        if (!l.swa) {
+        if (l.ext_cells) {   // a DFly layer
+            cells = l.ext_cells;
+            counts = l.ext_n;
+            ld = l.ext_ld;
+        } else if (!l.swa) {
             indexer(l, T);
             cells = cells_sel;
             counts = n_sel;
             ld = (int) g.idx_top_k;
+            if (const int sl = m->dfly.on ? dfly_slot(l.il) : -1; sl >= 0) {   // a layer DFly reads: its picks kept
+                CK(cudaMemcpyAsync(snap_cells + (size_t) sl * kMaxT * g.idx_top_k, cells_sel,
+                                   (size_t) T * g.idx_top_k * 4, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(snap_n + (size_t) sl * kMaxT, n_sel, (size_t) T * 4, cudaMemcpyDeviceToDevice, st));
+            }
         }
         const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
         const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
@@ -1489,6 +1685,145 @@ struct Engine {
         hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(xl, N, m->mtp_shnorm, mtp_h, N, N, g.eps);
         K::bf16_gemv_fp32_mmvf_multi(mtp_h, m->head, mtp_lg, N, g.n_vocab, 1, st);
     }
+    /// DFly2's greedy drafts after `bonus`, the token at `anchor` (the state's end): one pass of its layers over
+    /// the block [bonus, masks] at anchor .., row 0 fused with the trunk's state of anchor - 1, each layer's cells the
+    /// trunk layer's picks of that row and the block's own (its K/V written into the trunk layer's cells past the
+    /// state); then draft k from row k + 1's state corrected with the embedding of draft k - 1 (the bonus token's for
+    /// the first), through the trunk's head.  None when the last pass did not end at anchor - 1 (a restored state),
+    /// fewer than n past --spec-min-p.
+    std::vector<int32_t> dfly_draft(int32_t bonus, int64_t anchor, int n) {
+        const auto& g = m->g;
+        const auto& d = m->dfly;
+        const int N = (int) g.n_embd;
+        std::vector<int32_t> out;
+        n = std::min(n, d.width - 1);
+        const int W = n + 1;   // the block's rows needed (causal: row k + 1 sees rows 0 .. k + 1 alone)
+        const int64_t src = anchor - 1 - snap_base;
+        if (n < 1 || snap_base < 0 || src < 0 || src >= snap_rows || anchor + W > ctx) return out;
+        ensure(anchor + W);
+        for (int t = 0; t < W; ++t) {
+            h_tok[t] = t == 0 ? bonus : d.mask;
+            h_pos[t] = (int32_t) (anchor + t);
+        }
+        CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) W * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) W * 4, cudaMemcpyHostToDevice, st));
+        for (size_t i = 0; i < d.layers.size(); ++i)
+            hy4k::k_dfly_cells<<<W, 256, 0, st>>>(snap_cells + (i * kMaxT + (size_t) src) * g.idx_top_k,
+                                                  snap_n + i * kMaxT + src, (int) anchor,
+                                                  dfly_cells + i * d.width * (size_t) dfly_ld, dfly_n + i * d.width,
+                                                  dfly_ld);
+        // the block's rows; row 0 += gate * eh_proj([enorm(row 0) | hnorm(the trunk's state of anchor - 1)])
+        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, W, N, dfly_h, st);
+        const bool dump = dfly_dump_path != nullptr;
+        if (dump) {
+            dfly_dump_emb.resize((size_t) W * N);
+            CK(cudaMemcpyAsync(dfly_dump_emb.data(), dfly_h, dfly_dump_emb.size() * 4, cudaMemcpyDeviceToHost, st));
+        }
+        hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(dfly_h, N, d.enorm, dfly_cat, 2 * N, N, g.eps);
+        hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(hring + (size_t) ((anchor - 1) % kHRing) * N, N, d.hnorm,
+                                                  dfly_cat + N, 2 * N, N, g.eps);
+        quant(dfly_cat, 1, 2 * N, dfly_catq);
+        mmvq(d.eh_proj, dfly_catq, dfly_d, 1);
+        hy4k::k_gated_add<<<blocks(N), hy4k::kThreads, 0, st>>>(dfly_h, d.fgate, dfly_d, N);
+        // the layers (pre-norm, one residual stream): h = attention(norm(h)) + h, h = FFN(norm(h)) + h; the sum normed
+        const int64_t WN = (int64_t) W * N;
+        for (size_t i = 0; i < d.layers.size(); ++i) {
+            Layer& l = m->dfly.layers[i];
+            if (i > 0) hy4k::k_add<<<blocks(WN), hy4k::kThreads, 0, st>>>(dfly_h, dfly_res, WN);
+            CK(cudaMemcpyAsync(dfly_res, dfly_h, (size_t) WN * 4, cudaMemcpyDeviceToDevice, st));
+            hy4k::k_rms<<<W, hy4k::kThreads, 0, st>>>(dfly_h, N, l.attn_norm, xn, N, N, g.eps);
+            attend(l, W);
+            hy4k::k_add<<<blocks(WN), hy4k::kThreads, 0, st>>>(dfly_res, y, WN);
+            hy4k::k_rms<<<W, hy4k::kThreads, 0, st>>>(dfly_res, N, l.ffn_norm, xn, N, N, g.eps);
+            quant(xn, W, N, xq);
+            const int F = l.f_gate.n_out;
+            mmvq(l.f_gate, xq, fg, W);
+            mmvq(l.f_up, xq, fu, W);
+            hy4k::k_swiglu<<<blocks((int64_t) W * F), hy4k::kThreads, 0, st>>>(fg, fu, fh, (int64_t) W * F);
+            quant(fh, W, F, hq);
+            mmvq(l.f_down, hq, dfly_h, W);
+        }
+        hy4k::k_add<<<blocks(WN), hy4k::kThreads, 0, st>>>(dfly_h, dfly_res, WN);
+        hy4k::k_rms<<<W, hy4k::kThreads, 0, st>>>(dfly_h, N, d.norm, dfly_out, N, N, g.eps);
+        // the drafts: row k + 1's state + down(silu(gate) * up([hidden_norm(it) | embed_norm(the last token)]))
+        std::vector<float> lg((size_t) g.n_vocab);
+        double joint = 1.0;
+        for (int k = 0; k < n; ++k) {
+            const float* hk = dfly_out + (size_t) (k + 1) * N;
+            if (k > 0) {   // the last draft's embedding (tok_d row 0 held the bonus token for the first)
+                h_tok[0] = out.back();
+                CK(cudaMemcpyAsync(tok_d, h_tok, 4, cudaMemcpyHostToDevice, st));
+            }
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, 1, N, emb, st);
+            hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(hk, N, d.hc_hnorm, dfly_cat, 2 * N, N, g.eps);
+            hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(emb, N, d.hc_enorm, dfly_cat + N, 2 * N, N, g.eps);
+            quant(dfly_cat, 1, 2 * N, dfly_catq);
+            const int F = d.hc_gate.n_out;
+            mmvq(d.hc_gate, dfly_catq, fg, 1);
+            mmvq(d.hc_up, dfly_catq, fu, 1);
+            hy4k::k_swiglu<<<blocks(F), hy4k::kThreads, 0, st>>>(fg, fu, fh, F);
+            quant(fh, 1, F, hq);
+            mmvq(d.hc_down, hq, dfly_d, 1);
+            hy4k::k_add<<<blocks(N), hy4k::kThreads, 0, st>>>(dfly_d, hk, N);
+            if (dump && k == 0) dfly_dump(anchor, bonus, W, src);
+            K::bf16_gemv_fp32_mmvf_multi(dfly_d, m->head, dfly_lg, N, g.n_vocab, 1, st);
+            CK(cudaMemcpyAsync(lg.data(), dfly_lg, lg.size() * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            const auto top = std::max_element(lg.begin(), lg.end());
+            if (spec_min_p > 0.f) {   // the draft's probability under the head: 1 / sum exp(l - max)
+                const float mx = *top;
+                float z = 0.f;
+                for (const float v : lg) z += expf(v - mx);
+                joint /= (double) z;
+                if (joint < spec_min_p) break;
+            }
+            out.push_back((int32_t) (top - lg.begin()));
+        }
+        return out;
+    }
+    // LAMINA_HY4_DFLY_DUMP=FILE: DFly's first pass written for scratch/hy4/dfly_ref.py (its reference from the BF16
+    // weights): the sizes, the trunk's state, the block's embeddings, each layer's picks and its trunk layer's K/V rows
+    // up to the block's end (the block's own written by the pass), the block's final states, the first draft's state
+    const char* dfly_dump_path = std::getenv("LAMINA_HY4_DFLY_DUMP");
+    std::vector<float> dfly_dump_emb;
+    void dfly_dump(int64_t anchor, int32_t bonus, int W, int64_t src) {
+        const auto& g = m->g;
+        const auto& d = m->dfly;
+        const int N = (int) g.n_embd;
+        CK(cudaStreamSynchronize(st));
+        std::FILE* f = std::fopen(dfly_dump_path, "wb");
+        dfly_dump_path = nullptr;
+        if (!f) return;
+        const int32_t head[12] = {N, W, (int32_t) d.layers.size(), d.layers[0].H, (int32_t) g.nope(), (int32_t) g.n_rot,
+                                  (int32_t) g.v_head, hy4k::kLatent, (int32_t) anchor, bonus, d.mask, hy4k::kKvRow};
+        std::fwrite(head, 4, 12, f);
+        std::vector<float> h((size_t) N);
+        CK(cudaMemcpy(h.data(), hring + (size_t) ((anchor - 1) % kHRing) * N, (size_t) N * 4, cudaMemcpyDeviceToHost));
+        std::fwrite(h.data(), 4, h.size(), f);
+        std::fwrite(dfly_dump_emb.data(), 4, dfly_dump_emb.size(), f);
+        for (size_t i = 0; i < d.layers.size(); ++i) {
+            int32_t n = 0;
+            CK(cudaMemcpy(&n, snap_n + i * kMaxT + src, 4, cudaMemcpyDeviceToHost));
+            std::vector<int32_t> picks((size_t) n);
+            CK(cudaMemcpy(picks.data(), snap_cells + (i * kMaxT + (size_t) src) * g.idx_top_k, (size_t) n * 4,
+                          cudaMemcpyDeviceToHost));
+            std::vector<__half> kv((size_t) (anchor + W) * hy4k::kKvRow);
+            CK(cudaMemcpy(kv.data(), d.layers[i].kv, kv.size() * 2, cudaMemcpyDeviceToHost));
+            const int32_t t = d.target[i];
+            std::fwrite(&t, 4, 1, f);
+            std::fwrite(&n, 4, 1, f);
+            std::fwrite(picks.data(), 4, picks.size(), f);
+            std::fwrite(kv.data(), 2, kv.size(), f);
+        }
+        std::vector<float> rows((size_t) W * N);
+        CK(cudaMemcpy(rows.data(), dfly_out, rows.size() * 4, cudaMemcpyDeviceToHost));
+        std::fwrite(rows.data(), 4, rows.size(), f);
+        CK(cudaMemcpy(h.data(), dfly_d, (size_t) N * 4, cudaMemcpyDeviceToHost));
+        std::fwrite(h.data(), 4, h.size(), f);
+        std::fclose(f);
+        std::fprintf(stderr, "lamina: DFly's pass at %lld written for its reference\n", (long long) anchor);
+    }
+
     /// The state source of position p's MTP row: the ring's slot of p - 1, zeros at 0
     static int32_t ring_src(int64_t p) { return p == 0 ? hy4k::kNoState : (int32_t) ((p - 1) % kHRing); }
     /// The MTP block caught up with the trunk over n tokens at positions p0 .. (their states in the ring): its attention
@@ -1502,8 +1837,9 @@ struct Engine {
         }
     }
     /// One drafted window after x, the token at pos() (`rows`: the tokens the MTP block has not caught up with, x last):
-    /// up to n drafts, the window [x, drafts] through the trunk, row k's target token from `pick` (its logits; the
-    /// history of the tokens kept so far) while it matches draft k; the state then ends after the kept drafts.
+    /// up to n drafts (the MTP block's or DFly's), the window [x, drafts] through the trunk, row k's target token from
+    /// `pick` (its logits; the history of the tokens kept so far) while it matches draft k; the state then ends after
+    /// the kept drafts.
     /// `rows` becomes the window's kept tokens (x and the drafts kept), `next` the first target token not a draft (or
     /// -1: sample it from `lg`, the window's last row's logits), and `kept` the drafts kept, each passed to `keep` first
     /// (false: stop there, the state up to it).
@@ -1516,7 +1852,7 @@ struct Engine {
     Window drafted(std::vector<int32_t>& rows, int n, std::vector<float>& lg, Pick pick, Keep keep) {
         Window w;
         const int64_t P = pos();
-        w.drafts = draft(rows, P - (int64_t) rows.size() + 1, n);
+        w.drafts = m->dfly.on ? dfly_draft(rows.back(), P, n) : draft(rows, P - (int64_t) rows.size() + 1, n);
         std::vector<int32_t> win{rows.back()};
         win.insert(win.end(), w.drafts.begin(), w.drafts.end());
         forward(win.data(), (int) win.size());
@@ -2212,8 +2548,9 @@ struct Prompt {
             else moe(l, T);
             mark(5);
         }
-        // the head over the last row; with the MTP block kept up, every row's normed final hidden (y) for its catch-up
-        if (E.mtp_on) {
+        // the head over the last row; with the MTP block kept up, every row's normed final hidden (y) for its catch-up;
+        // with DFly's, the last row's in the ring (its picks kept above)
+        if (E.drafts_on && m->has_mtp) {
             hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, m->ohc_fn, m->ohc_scale, m->ohc_base, hc, N, hc, g.eps, g.hc_eps, 0.f,
                                               nullptr, xh, m->out_norm, y, g.eps);
             K::bf16_gemv_fp32_mmvf_multi(y + (size_t) (T - 1) * N, m->head, E.logits, N, g.n_vocab, 1, st);
@@ -2223,6 +2560,11 @@ struct Prompt {
             hy4k::k_hc_pre<<<1, 256, 0, st>>>(Xl, m->ohc_fn, m->ohc_scale, m->ohc_base, hc, N, hc, g.eps, g.hc_eps, 0.f,
                                               nullptr, xh, m->out_norm, xn, g.eps);
             K::bf16_gemv_fp32_mmvf_multi(xn, m->head, E.logits, N, g.n_vocab, 1, st);
+            if (E.drafts_on) {
+                hy4k::k_ring_store<<<1, 256, 0, st>>>(xn, E.hring, pos_d + (T - 1), Engine::kHRing, N);
+                E.snap_base = p0 + T - 1;
+                E.snap_rows = 1;
+            }
         }
         ++E.forwards;
         if (trace) {
@@ -2303,6 +2645,12 @@ struct Prompt {
         } else {
             hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, 0, 0, l.theta, g.eps);
             indexer(l, T, p0);
+            if (const int sl = m->dfly.on ? E.dfly_slot(l.il) : -1; sl >= 0) {   // DFly reads it: the last row's picks
+                CK(cudaMemcpyAsync(E.snap_cells + (size_t) sl * kMaxT * g.idx_top_k,
+                                   cells + (size_t) (T - 1) * g.idx_top_k, (size_t) g.idx_top_k * 4,
+                                   cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(E.snap_n + (size_t) sl * kMaxT, ncells + (T - 1), 4, cudaMemcpyDeviceToDevice, st));
+            }
         }
         const float scale = 1.0f / sqrtf((float) g.k_head);
         const size_t kb_bytes = (size_t) hy4k::kLatent * ((size_t) g.nope() / 32 * 34);
@@ -2693,7 +3041,7 @@ struct Serve {
     std::atomic<bool> stop{false};
 
     Serve(Engine& e, int32_t eos_id, int drafts_) : E(e), eos(eos_id), drafts(drafts_) {}
-    int drafts = 0;   // the MTP block's drafts a window (E.mtp_on)
+    int drafts = 0;   // the drafts a window (E.drafts_on)
 
     void request(const std::string& line) {
         const auto& g = E.m->g;
@@ -2803,7 +3151,7 @@ struct Serve {
             if (nx < 0) { finish = "nonfinite"; break; }
             if (!emit(nx)) break;
             const long long before = produced;
-            if (E.mtp_on) {
+            if (E.drafts_on) {
                 rows.push_back(nx);
                 const int n = (int) std::min<long long>(drafts, max_new - produced);
                 bool going = true;
@@ -2821,7 +3169,7 @@ struct Serve {
             }
             if (produced / 128 != before / 128) E.rebalance(32);
         }
-        if (E.mtp_on && !rows.empty() && E.pos() >= (int64_t) rows.size())   // the MTP block caught up with the state
+        if (E.drafts_on && E.m->has_mtp && !rows.empty() && E.pos() >= (int64_t) rows.size())   // the block caught up
             E.mtp_catch_up(rows.data(), (int64_t) rows.size(), E.pos() - (int64_t) rows.size());
         const double decode_ms = ms_since(d0);
         const long long hits = E.hits - hits0, lookups = E.lookups - lookups0;
@@ -2905,6 +3253,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     double park_mib = 16384, reserve_mib = 6144;
     bool kv_grow = true;
     bool use_mtp = true;
+    std::string dfly_path;
     int drafts = 0;
     float spec_min_p = 0.f;
     std::vector<int> tier_devs;
@@ -2945,6 +3294,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
         else if (a == "--no-kv-grow") kv_grow = false;
         else if (a == "--no-mtp") use_mtp = false;   // the MTP block not loaded (no drafts)
+        else if (a == "--dfly") dfly_path = next();   // DFly2's drafts (the checkpoint's last shard); no MTP block
         else if (a == "--drafts-per-step") drafts = std::max(0, std::min(kMaxT - 1, std::atoi(next())));
         else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next());
         else if (a == "--kv-grow") kv_grow = true;
@@ -2957,10 +3307,20 @@ int run_engine(int argc, char** argv, bool check_only) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "lamina: --native MODEL is required\n"); return 2; }
+    std::string err;
+    if (!dfly_path.empty()) {   // DFly's file read now: its config and the shard's header
+        lamina::hy4::DFlyConfig c;
+        lamina::hy4::SafeTensors st;
+        if (!lamina::hy4::read_dfly_config(std::filesystem::path(dfly_path).parent_path().string(), c, err) ||
+            !st.open(dfly_path, err)) {
+            std::fprintf(stderr, "lamina: %s\n", err.c_str());
+            return 2;
+        }
+    }
     if (check_only) return 0;
     Model m;
-    std::string err;
-    if (!load(model, m, 8, arena_pin, use_mtp, err)) {
+    if (!load(model, m, 8, arena_pin, use_mtp && dfly_path.empty(), err) ||
+        (!dfly_path.empty() && !load_dfly(dfly_path, m, err))) {
         std::fprintf(stderr, "lamina: %s\n", err.c_str());
         return 1;
     }
@@ -2970,7 +3330,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.save_every_min = save_every;
     E.use_graphs = graphs;
     E.elastic = kv_grow;
-    E.mtp_on = m.has_mtp && drafts > 0;
+    E.drafts_on = (m.has_mtp || m.dfly.on) && drafts > 0;
     E.spec_min_p = spec_min_p;
     E.init(m, max_ctx, threads);
     E.park_budget = (size_t) (std::max(0.0, park_mib) * (double) (1 << 20));
@@ -3013,7 +3373,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     const auto t1 = Clock::now();
     std::vector<int32_t> gen;
     int64_t offered = 0, kept = 0, windows = 0;
-    if (E.mtp_on && forced.empty()) {   // drafted: windows of the token and the MTP block's drafts, greedy
+    if (E.drafts_on && forced.empty()) {   // drafted: windows of the token and the drafter's drafts, greedy
         std::vector<int32_t> rows;
         int32_t x = argmax(lg);
         while (true) {

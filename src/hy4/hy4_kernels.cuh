@@ -807,4 +807,21 @@ __global__ void k_gather_states(const float* ring, const float* own, const int32
     for (int i = threadIdx.x; i < n; i += blockDim.x) hs[(size_t) t * n + i] = from ? from[i] : 0.f;
 }
 
+// ------------------------------------------------------------------------------------------------ DFly2
+/// A DFly layer's cells for block row r (blockIdx.x): the trunk layer's n picks of the row before the block (every one
+/// before it), then the block's positions anchor .. anchor + r
+__global__ void k_dfly_cells(const int32_t* picks, const int32_t* n_picks, int anchor, int32_t* cells, int32_t* n_out,
+                             int ld) {
+    const int r = blockIdx.x, n = *n_picks;
+    int32_t* row = cells + (size_t) r * ld;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] = picks[i];
+    for (int i = threadIdx.x; i <= r; i += blockDim.x) row[n + i] = anchor + i;
+    if (threadIdx.x == 0) n_out[r] = n + r + 1;
+}
+/// x += g * f over n values (DFly's fusion gate)
+__global__ void k_gated_add(float* x, const float* g, const float* f, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = x[i] + g[i] * f[i];
+}
+
 }  // namespace hy4k
