@@ -6,7 +6,6 @@ Supported models:
 - [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (unsloth UD-IQ1_M through Q8_0, ISTA-DASLab's GSQ-RCO IQ3_S, Gyro-L)
 - [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (unsloth)
 - [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) (unsloth)
-- [Hy4 flash](https://huggingface.co/AngelSlim/Hy4-flash-GGUF) (AngelSlim)
 
 Speeds against llama.cpp and Strata on one PC are in [docs/COMPARISON.md](docs/COMPARISON.md).
 
