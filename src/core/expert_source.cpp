@@ -707,6 +707,11 @@ bool ArenaExpertSource::open(int64_t n_layers, int64_t n_expert, int threads, st
         }
         void* m = mmap(nullptr, (size_t) total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m != MAP_FAILED) {
+            // its layers are pinned as they load: kept out of the children the server starts later (fork() would
+            // copy every pinned page into each of them: nvidia-smi once loaded took another 56 GiB on Flash-Next)
+            if (!lamina::platform::keep_from_children(m, total))
+                std::fprintf(stderr, "lamina: madvise(MADV_DONTFORK) refused for the expert arena: a program started "
+                                     "after the load takes a copy of it\n");
             anon_ = m;
             anon_bytes_ = total;
             anon = true;

@@ -93,6 +93,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : capacity(bytes) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note);
+    if (base) (void) lamina::platform::keep_from_children(base, bytes);   // pinned below: fork() would copy it
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.

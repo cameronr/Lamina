@@ -588,6 +588,9 @@ int run(int argc, char** argv) {
     std::optional<std::vector<std::string>> effort_end;
     std::vector<std::vector<int>> groups;
     bool lazy = false;
+    // the Monitor's cards (#112), read before the engine loads: engine_gpus runs nvidia-smi when the args name a card,
+    // and on Linux a child started once the engine has pinned its expert arena cost a copy of the arena (fork())
+    std::optional<std::vector<int>> engine_cards;
     try {
         if (!mock) {
             groups = gpu_groups(cfg);   // replicas: engines of their own, each a child with its cards and its log
@@ -601,6 +604,7 @@ int run(int argc, char** argv) {
                 apply_engine_env(cfg, offline);   // the engine runs in this process: its environment is this one
                 if (!log.empty()) redirect_stderr(log);   // the engine's messages go to its log; the server's stay here
             }
+            engine_cards = engine_gpus(cfg);   // in the config's "env", before the engine and the image encoder start
             sampling_defaults = sampling_defaults_from_config(cfg);
             if (!sampling_defaults.empty()) say("[lamina] sampling defaults from the config: " + items(sampling_defaults));
             std::vector<std::string> args = engine_args(cfg);
@@ -784,7 +788,7 @@ int run(int argc, char** argv) {
         if (loop != false && loop != "stop" && loop != "recover")
             throw ConfigError("\"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", not " + py_repr_value(loop));
         svc.reasoning_loop_recovery = loop.is_string() ? loop.get<std::string>() : "";
-        svc.gpu_indices = engine_gpus(cfg);   // the Monitor reads every card the engine uses (#112), the first its own (#51)
+        svc.gpu_indices = engine_cards ? *engine_cards : engine_gpus(cfg);   // the Monitor reads every card the engine uses (#112), the first its own (#51)
         if (!groups.empty()) {               // replicas: every card of every group
             svc.gpu_indices.clear();
             for (const auto& g : groups) svc.gpu_indices.insert(svc.gpu_indices.end(), g.begin(), g.end());
