@@ -194,8 +194,10 @@ struct Layer {
     std::vector<float> total;          // the run's routing counts (the learned profile's)
     std::vector<float> start;          // the start profile's shares (empty: none)
     // caches
-    __half* kv = nullptr;       // latent rows: the context's cells (sparse) or the window's ring
+    uint8_t* kv = nullptr;      // latent rows: the context's cells (sparse) or the window's ring
     int64_t kv_cells = 0;
+    bool kv_q8 = false;         // its rows in q8_0 (--kv q8_0: the sparse layers'), else halves
+    size_t kv_row() const { return kv_q8 ? (size_t) hy4k::kKvQ8Row : (size_t) hy4k::kKvRow * sizeof(__half); }
     // the K/V grown with the context (Engine::ensure): the sparse layer's cells and pooled keys; the main GPU's slots
     std::shared_ptr<lamina::core::VmmRange> kv_vm, pooled_vm, slot_vm;
     float* pooled = nullptr;    // the indexer's pooled keys [ctx / pool][idx_dim]
@@ -981,7 +983,8 @@ struct Engine {
         size_t kv_bytes = 0;
         for (Layer& l : cl) {
             l.kv_cells = l.swa ? ring : ctx;
-            const size_t kb = (size_t) l.kv_cells * hy4k::kKvRow * 2, pb = (size_t) (ctx / g.idx_pool) * idd * 4;
+            l.kv_q8 = kv_q8 && !l.swa;   // the window layers' rings stay halves (512 cells each)
+            const size_t kb = (size_t) l.kv_cells * l.kv_row(), pb = (size_t) (ctx / g.idx_pool) * idd * 4;
             if (!l.swa && elastic) {
                 l.kv_vm = std::make_shared<lamina::core::VmmRange>();
                 l.pooled_vm = std::make_shared<lamina::core::VmmRange>();
@@ -989,10 +992,10 @@ struct Engine {
                     std::fprintf(stderr, "lamina: the K/V's address range could not be reserved\n");
                     throw Fatal{1};
                 }
-                l.kv = (__half*) l.kv_vm->base();
+                l.kv = l.kv_vm->base();
                 l.pooled = (float*) l.pooled_vm->base();
             } else {
-                l.kv = dalloc<__half>((size_t) l.kv_cells * hy4k::kKvRow);
+                l.kv = dalloc<uint8_t>(kb);
                 if (l.has_idx) l.pooled = dalloc<float>((size_t) (ctx / g.idx_pool) * idd);
             }
             kv_bytes += kb + (l.has_idx ? pb : 0);
@@ -1015,6 +1018,7 @@ struct Engine {
             for (size_t i = 0; i < nl; ++i) {   // the K/V of its trunk layer; its cells from the block's pass
                 Layer& d = m->dfly.layers[i];
                 d.kv = m->layers[(size_t) m->dfly.target[i]].kv;
+                d.kv_q8 = m->layers[(size_t) m->dfly.target[i]].kv_q8;
                 d.ext_cells = dfly_cells + i * W * (size_t) dfly_ld;
                 d.ext_n = dfly_n + i * W;
                 d.ext_ld = dfly_ld;
@@ -1036,8 +1040,8 @@ struct Engine {
             m->mtp.use.assign((size_t) g.n_expert, 0.f);
             m->mtp.total.assign((size_t) g.n_expert, 0.f);
         }
-        std::fprintf(stderr, "lamina: %lld cells of context: K/V and pooled keys %.2f GiB%s\n", (long long) ctx,
-                     (double) kv_bytes / (double) (1ull << 30),
+        std::fprintf(stderr, "lamina: %lld cells of context: K/V (%s) and pooled keys %.2f GiB%s\n", (long long) ctx,
+                     kv_q8 ? "q8_0" : "fp16", (double) kv_bytes / (double) (1ull << 30),
                      elastic ? ", mapped as the context grows (the main GPU's expert slots give way)" : "");
         pool = std::make_unique<C::ExpertPool>(threads);
         std::string err;
@@ -1054,6 +1058,7 @@ struct Engine {
     // ---- the K/V grown with the context: the sparse layers' cells mapped up to kv_mapped (a multiple of kKvStep), the
     // physical chunks taken from the free VRAM above kReserve, else from the main GPU's slots (shrink_main)
     bool elastic = true;
+    bool kv_q8 = false;   // --kv q8_0: the sparse layers' cells in q8_0 rows (Layer::kv_q8)
     static constexpr int64_t kKvStep = 16384;
     static constexpr size_t kReserve = (size_t) 1536 << 20;
     int64_t kv_mapped = 0;
@@ -1093,7 +1098,7 @@ struct Engine {
         int64_t n = 0;
         for (const Layer& l : cl) {
             if (!l.kv_vm) continue;
-            const int64_t kc = (int64_t) (((uint64_t) cells * hy4k::kKvRow * 2 + G - 1) / G);
+            const int64_t kc = (int64_t) (((uint64_t) cells * l.kv_row() + G - 1) / G);
             const int64_t pc = (int64_t) (((uint64_t) (cells / m->g.idx_pool) * (uint64_t) m->g.idx_dim * 4 + G - 1) / G);
             for (int64_t c = 0; c < std::min(kc, l.kv_vm->chunks()); ++c) n += l.kv_vm->mapped(c) ? 0 : 1;
             for (int64_t c = 0; c < std::min(pc, l.pooled_vm->chunks()); ++c) n += l.pooled_vm->mapped(c) ? 0 : 1;
@@ -1120,7 +1125,7 @@ struct Engine {
         };
         for (Layer& l : cl) {
             if (!l.kv_vm) continue;
-            const int64_t kc = (int64_t) (((uint64_t) target * hy4k::kKvRow * 2 + G - 1) / G);
+            const int64_t kc = (int64_t) (((uint64_t) target * l.kv_row() + G - 1) / G);
             const int64_t pc = (int64_t) (((uint64_t) (target / m->g.idx_pool) * (uint64_t) m->g.idx_dim * 4 + G - 1) / G);
             if (!l.kv_vm->map_range(0, kc, take) || !l.pooled_vm->map_range(0, pc, take)) {
                 std::fprintf(stderr, "lamina: no VRAM for %lld cells of context\n", (long long) target);
@@ -1211,7 +1216,7 @@ struct Engine {
         CK(cudaDeviceSynchronize());
         for (Layer& l : cl) {
             if (!l.kv_vm) continue;
-            const int64_t kc = (int64_t) (((uint64_t) target * hy4k::kKvRow * 2 + G - 1) / G);
+            const int64_t kc = (int64_t) (((uint64_t) target * l.kv_row() + G - 1) / G);
             const int64_t pc = (int64_t) (((uint64_t) (target / m->g.idx_pool) * (uint64_t) m->g.idx_dim * 4 + G - 1) / G);
             for (int64_t c = kc; c < l.kv_vm->chunks(); ++c)
                 if (l.kv_vm->mapped(c)) spare.push_back(l.kv_vm->unmap(c));
@@ -1308,7 +1313,7 @@ struct Engine {
     size_t snap_bytes() const {
         size_t n = 0;
         for (const Layer& l : cl) {
-            if (l.swa) n += (size_t) l.kv_cells * hy4k::kKvRow * 2;
+            if (l.swa) n += (size_t) l.kv_cells * l.kv_row();
             if (l.has_idx) n += (size_t) kTail * 2 * (size_t) m->g.idx_dim * 4;
         }
         if (hring) n += (size_t) kHRing * (size_t) m->g.n_embd * 4;   // the MTP block's states
@@ -1326,7 +1331,7 @@ struct Engine {
         size_t at = 0;
         for (const Layer& l : cl) {
             if (l.swa) {
-                const size_t n = (size_t) l.kv_cells * hy4k::kKvRow * 2;
+                const size_t n = (size_t) l.kv_cells * l.kv_row();
                 CK(cudaMemcpyAsync(s.bytes.data() + at, l.kv, n, cudaMemcpyDeviceToHost, st));
                 at += n;
             }
@@ -1362,7 +1367,7 @@ struct Engine {
                 size_t at = 0;
                 for (const Layer& l : cl) {
                     if (l.swa) {
-                        const size_t n = (size_t) l.kv_cells * hy4k::kKvRow * 2;
+                        const size_t n = (size_t) l.kv_cells * l.kv_row();
                         CK(cudaMemcpyAsync(l.kv, best->bytes.data() + at, n, cudaMemcpyHostToDevice, st));
                         at += n;
                     }
@@ -1417,7 +1422,7 @@ struct Engine {
         Parked c;
         size_t n = 0;
         for (const Layer& l : cl)
-            if (!l.swa) n += (size_t) p * hy4k::kKvRow * 2 + (size_t) groups * (size_t) g.idx_dim * 4;
+            if (!l.swa) n += (size_t) p * l.kv_row() + (size_t) groups * (size_t) g.idx_dim * 4;
         const size_t need = n + [&] { size_t k = 0; for (const Snap& x : snaps) k += x.bytes.size() + x.logits.size() * 4; return k; }();
         // the budget counts the snapshots too; the RAM, the cells alone (the snapshots are in RAM already)
         uint64_t avail = 0;
@@ -1438,7 +1443,7 @@ struct Engine {
         size_t at = 0;
         for (const Layer& l : cl) {
             if (l.swa) continue;
-            const size_t kb = (size_t) p * hy4k::kKvRow * 2, pb = (size_t) groups * (size_t) g.idx_dim * 4;
+            const size_t kb = (size_t) p * l.kv_row(), pb = (size_t) groups * (size_t) g.idx_dim * 4;
             CK(cudaMemcpyAsync(c.cells.data() + at, l.kv, kb, cudaMemcpyDeviceToHost, st));
             at += kb;
             if (pb) CK(cudaMemcpyAsync(c.cells.data() + at, l.pooled, pb, cudaMemcpyDeviceToHost, st));
@@ -1465,7 +1470,7 @@ struct Engine {
         size_t at = 0;
         for (const Layer& l : cl) {
             if (l.swa) continue;
-            const size_t kb = (size_t) p * hy4k::kKvRow * 2, pb = (size_t) groups * (size_t) g.idx_dim * 4;
+            const size_t kb = (size_t) p * l.kv_row(), pb = (size_t) groups * (size_t) g.idx_dim * 4;
             CK(cudaMemcpyAsync(l.kv, c.cells.data() + at, kb, cudaMemcpyHostToDevice, st));
             at += kb;
             if (pb) CK(cudaMemcpyAsync(l.pooled, c.cells.data() + at, pb, cudaMemcpyHostToDevice, st));
@@ -1666,8 +1671,8 @@ struct Engine {
         quant(qnope, (int64_t) T * H, g.nope(), qnq);
         hy4k::k_head_q8_0<<<dim3((unsigned) ((H * hy4k::kLatent + 127) / 128), T), 128, 0, st>>>(
             l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow);
-        hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta,
-                                                       g.eps);
+        (l.kv_q8 ? hy4k::k_kv_store<true> : hy4k::k_kv_store<false>)<<<T, hy4k::kThreads, 0, st>>>(
+            kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta, g.eps);
         ph(4);
         const int32_t* cells = cells_swa;
         const int32_t* counts = n_swa;
@@ -1690,8 +1695,8 @@ struct Engine {
         }
         const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
         const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
-        hy4k::k_mla_chunk<<<dim3(n_chunks, T), 256, smem, st>>>(qabs, l.kv, cells, counts, ld, H,
-                                                                1.0f / sqrtf((float) g.k_head), part, n_chunks);
+        (l.kv_q8 ? hy4k::k_mla_chunk<true> : hy4k::k_mla_chunk<false>)<<<dim3(n_chunks, T), 256, smem, st>>>(
+            qabs, l.kv, cells, counts, ld, H, 1.0f / sqrtf((float) g.k_head), part, n_chunks);
         hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_chunks);
         ph(6);
         quant(att, (int64_t) T * H, hy4k::kLatent, attq);
@@ -2043,8 +2048,21 @@ struct Engine {
             std::vector<int32_t> picks((size_t) n);
             CK(cudaMemcpy(picks.data(), snap_cells + (i * kMaxT + (size_t) src) * g.idx_top_k, (size_t) n * 4,
                           cudaMemcpyDeviceToHost));
-            std::vector<__half> kv((size_t) (anchor + W) * hy4k::kKvRow);
-            CK(cudaMemcpy(kv.data(), d.layers[i].kv, kv.size() * 2, cudaMemcpyDeviceToHost));
+            const Layer& dl = d.layers[i];
+            const size_t cells = (size_t) (anchor + W);
+            std::vector<uint8_t> raw(cells * dl.kv_row());
+            CK(cudaMemcpy(raw.data(), dl.kv, raw.size(), cudaMemcpyDeviceToHost));
+            std::vector<__half> kv(cells * hy4k::kKvRow);   // the rows as halves (q8_0 ones widened as the attention does)
+            if (!dl.kv_q8) std::memcpy(kv.data(), raw.data(), raw.size());
+            else
+                for (size_t c = 0; c < cells; ++c) {
+                    const uint8_t* r = raw.data() + c * hy4k::kKvQ8Row;
+                    for (int j = 0; j < hy4k::kKvRow; ++j) {
+                        __half dh;
+                        std::memcpy(&dh, r + hy4k::kKvRow + 2 * (j / 32), 2);
+                        kv[c * hy4k::kKvRow + (size_t) j] = __float2half((float) (int8_t) r[j] * __half2float(dh));
+                    }
+                }
             const int32_t t = d.target[i];
             std::fwrite(&t, 4, 1, f);
             std::fwrite(&n, 4, 1, f);
@@ -2725,7 +2743,9 @@ struct Prompt {
             lamina::core::DeviceScope ds(d.dev, main_dev, d.gi > 0);
             CK(cudaDeviceSynchronize());
         }
-        CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) sizeof(hy4p::AttnSmem)));
+        CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int) sizeof(hy4p::AttnSmem)));
         CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int) sizeof(hy4p::AttnSmem)));
@@ -2890,12 +2910,14 @@ struct Prompt {
         if (l.swa) {
             // the window's cells in position order: the ring's before the chunk, then the chunk's; the ring keeps the last
             lin0 = (int) std::max<int64_t>(0, p0 - n_swa + 1);
-            if (p0 > lin0) hy4p::k_copy_cells<<<(unsigned) (p0 - lin0), 64, 0, st>>>(l.kv, ring, lin, 0, lin0, lin0);
-            hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, lin, pos_d, 0, lin0, l.theta, g.eps);
+            __half* rh = reinterpret_cast<__half*>(l.kv);   // a ring's rows are halves
+            if (p0 > lin0) hy4p::k_copy_cells<<<(unsigned) (p0 - lin0), 64, 0, st>>>(rh, ring, lin, 0, lin0, lin0);
+            hy4k::k_kv_store<false><<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, lin, pos_d, 0, lin0, l.theta, g.eps);
             const int64_t pa = std::max<int64_t>(p0, p_end - ring);
-            hy4p::k_copy_cells<<<(unsigned) (p_end - pa), 64, 0, st>>>(lin, 0, l.kv, ring, (int) pa, lin0);
+            hy4p::k_copy_cells<<<(unsigned) (p_end - pa), 64, 0, st>>>(lin, 0, rh, ring, (int) pa, lin0);
         } else {
-            hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, 0, 0, l.theta, g.eps);
+            (l.kv_q8 ? hy4k::k_kv_store<true> : hy4k::k_kv_store<false>)<<<T, hy4k::kThreads, 0, st>>>(
+                kva, l.kv_a_norm, l.kv, pos_d, 0, 0, l.theta, g.eps);
             indexer(l, T, p0);
             if (const int sl = m->dfly.on ? E.dfly_slot(l.il) : -1; sl >= 0) {   // DFly reads it: the last row's picks
                 CK(cudaMemcpyAsync(E.snap_cells + (size_t) sl * kMaxT * g.idx_top_k,
@@ -2932,9 +2954,9 @@ struct Prompt {
                 hy4p::k_attn_prompt<false><<<T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, lin, nullptr, nullptr, 0, pos_d,
                                                                                   n_swa, lin0, l.sinks + h0, scale);
             else
-                hy4p::k_attn_prompt<true><<<T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, l.kv, cells, ncells,
-                                                                                 (int) g.idx_top_k, pos_d, 0, 0,
-                                                                                 l.sinks + h0, scale);
+                (l.kv_q8 ? hy4p::k_attn_prompt<true, true> : hy4p::k_attn_prompt<true, false>)<<<
+                    T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, l.kv, cells, ncells, (int) g.idx_top_k, pos_d, 0, 0,
+                                                          l.sinks + h0, scale);
             q8(ql, (int64_t) kG * T, hy4k::kLatent, hdq, 8, hids);
             MMQ::Product vb = kb;
             vb.w = l.v_b.d + (size_t) h0 * vb_bytes;
@@ -3546,6 +3568,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     double arena_pin = 72;
     double park_mib = 16384, reserve_mib = 6144;
     bool kv_grow = true;
+    std::string kv = "fp16";
     bool use_mtp = true;
     std::string dfly_path;
     int drafts = 0;
@@ -3587,6 +3610,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--park-mib" || a == "--conversation-cache-mib") park_mib = std::atof(next());
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
         else if (a == "--no-kv-grow") kv_grow = false;
+        else if (a == "--kv") kv = next();   // the sparse layers' K / V: fp16 or q8_0
         else if (a == "--no-mtp") use_mtp = false;   // the MTP block not loaded (no drafts)
         else if (a == "--dfly") dfly_path = next();   // DFly2's drafts (the checkpoint's last shard); no MTP block
         else if (a == "--drafts-per-step") drafts = std::max(0, std::min(kMaxT - 1, std::atoi(next())));
@@ -3603,6 +3627,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         }
     }
     if (model.empty()) { std::fprintf(stderr, "lamina: --native MODEL is required\n"); return 2; }
+    if (kv != "fp16" && kv != "q8_0") { std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n"); return 2; }
     std::string err;
     if (!dfly_path.empty()) {   // DFly's file read now: its config and the shard's header
         lamina::hy4::DFlyConfig c;
@@ -3626,6 +3651,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.save_every_min = save_every;
     E.use_graphs = graphs && E.trace < 3;
     E.elastic = kv_grow;
+    E.kv_q8 = kv == "q8_0";
     E.drafts_on = (m.has_mtp || m.dfly.on) && drafts > 0;
     E.spec_min_p = spec_min_p;
     E.vision = vision || !emb_file.empty();

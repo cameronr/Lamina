@@ -47,19 +47,23 @@ struct __align__(16) AttnSmem {
 
 /// A chunk's latent attention: block t takes row t's head group of kQRows heads - its absorbed queries qa [T][kQRows]
 /// [512] and its roped q_pe at qg [T][kQRows][256] + 192 - over its cells in tiles of 32, GATHER: cells[t][0 .. n[t])
-/// of the cache (rows of 576 halves); else the window, positions max(0, p - n_swa + 1) .. p (p = pos[t]) at kv +
-/// (position - lin0) rows.  Scores times `scale`, an online softmax that starts from the head's sink (m = sink, l = 1),
-/// the values the cells' first 512; the output, divided by l, replaces the row's queries in qa.  Warps: scores m-tile
-/// w & 1 x cells (w >> 1) * 8 .. +8; values m-tile w & 1 x dims (w >> 1) * 128 .. +128.  The next tile waits in
-/// registers through the current one's products.  Block 256, shared sizeof(AttnSmem).
-template <bool GATHER>
+/// of the cache (rows of 576 halves, or with Q8 q8_0 rows widened into halves as they are stashed); else the window,
+/// positions max(0, p - n_swa + 1) .. p (p = pos[t]) at kv + (position - lin0) rows of halves.  Scores times `scale`,
+/// an online softmax that starts from the head's sink (m = sink, l = 1), the values the cells' first 512; the output,
+/// divided by l, replaces the row's queries in qa.  Warps: scores m-tile w & 1 x cells (w >> 1) * 8 .. +8; values
+/// m-tile w & 1 x dims (w >> 1) * 128 .. +128.  The next tile waits in registers through the current one's products.
+/// Block 256, shared sizeof(AttnSmem).
+template <bool GATHER, bool Q8 = false>
 __global__ void __launch_bounds__(256, 1) k_attn_prompt(float* qa, const float* __restrict__ qg,
-                                                         const __half* __restrict__ kv, const int32_t* __restrict__ cells,
+                                                         const void* __restrict__ kv_, const int32_t* __restrict__ cells,
                                                          const int32_t* __restrict__ n, int ld_cells,
                                                          const int32_t* __restrict__ pos, int n_swa, int lin0,
                                                          const float* __restrict__ sinks, float scale) {
+    static_assert(GATHER || !Q8, "the window's linear buffer is halves");
     extern __shared__ __align__(16) unsigned char attn_raw[];
     AttnSmem& sm = *reinterpret_cast<AttnSmem*>(attn_raw);
+    const __half* kv = reinterpret_cast<const __half*>(kv_);
+    const uint8_t* kq = reinterpret_cast<const uint8_t*>(kv_);
     const int t = blockIdx.x, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
     const int li = lane >> 3, lr = lane & 7, tig = lane & 3;
     int cnt = 0, first = 0;
@@ -85,25 +89,61 @@ __global__ void __launch_bounds__(256, 1) k_attn_prompt(float* qa, const float* 
         const float4 v = *reinterpret_cast<const float4*>(qp + (size_t) r * 256 + 4 * c4);
         *reinterpret_cast<uint2*>(sm.q + r * kPad + kLatent + 4 * c4) = make_uint2(h2(v.x, v.y), h2(v.z, v.w));
     }
-    // a tile: 32 cells of 72 16-byte chunks, 9 a thread
-    uint4 nx[9];
+    // a tile: 32 cells of 72 16-byte chunks, 9 a thread; Q8: 32 cells of 36 16-value pieces (half a block each, with
+    // its block's scale), 5 a thread, each widened into two chunks of halves
+    constexpr int kQ8Pieces = kKvRow / 16, kQ8PerThread = (kTileCells * kQ8Pieces + 255) / 256;
+    uint4 nx[Q8 ? kQ8PerThread : 9];
+    [[maybe_unused]] __half2 nd[Q8 ? kQ8PerThread : 1];
     auto fetch = [&](int base) {
+        if constexpr (Q8) {
 #pragma unroll
-        for (int j = 0; j < 9; ++j) {
-            const int i = tid + 256 * j, c = i / 72, ch = i % 72;
-            if (base + c < cnt) {
-                const __half* row = GATHER ? kv + (size_t) cl[base + c] * kKvRow : kv + (size_t) (first + base + c) * kKvRow;
-                nx[j] = *reinterpret_cast<const uint4*>(row + ch * 8);
-            } else {
-                nx[j] = make_uint4(0, 0, 0, 0);
+            for (int j = 0; j < kQ8PerThread; ++j) {
+                const int i = tid + 256 * j, c = i / kQ8Pieces, pc = i % kQ8Pieces;
+                if (i < kTileCells * kQ8Pieces && base + c < cnt) {
+                    const uint8_t* row = kq + (size_t) cl[base + c] * hy4k::kKvQ8Row;
+                    nx[j] = *reinterpret_cast<const uint4*>(row + pc * 16);
+                    nd[j] = __half2half2(reinterpret_cast<const __half*>(row + kKvRow)[pc >> 1]);
+                } else {
+                    nx[j] = make_uint4(0, 0, 0, 0);
+                    nd[j] = __float2half2_rn(0.f);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 9; ++j) {
+                const int i = tid + 256 * j, c = i / 72, ch = i % 72;
+                if (base + c < cnt) {
+                    const __half* row = GATHER ? kv + (size_t) cl[base + c] * kKvRow : kv + (size_t) (first + base + c) * kKvRow;
+                    nx[j] = *reinterpret_cast<const uint4*>(row + ch * 8);
+                } else {
+                    nx[j] = make_uint4(0, 0, 0, 0);
+                }
             }
         }
     };
     auto stash = [&] {
+        if constexpr (Q8) {
 #pragma unroll
-        for (int j = 0; j < 9; ++j) {
-            const int i = tid + 256 * j, c = i / 72, ch = i % 72;
-            *reinterpret_cast<uint4*>(sm.k + c * kPad + ch * 8) = nx[j];
+            for (int j = 0; j < kQ8PerThread; ++j) {
+                const int i = tid + 256 * j, c = i / kQ8Pieces, pc = i % kQ8Pieces;
+                if (i >= kTileCells * kQ8Pieces) continue;
+                const uint32_t qw[4] = {nx[j].x, nx[j].y, nx[j].z, nx[j].w};
+                __half2 hv[8];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) hy4k::q8_widen4(qw[k], nd[j], hv[2 * k], hv[2 * k + 1]);
+                unsigned hw[8];
+#pragma unroll
+                for (int k = 0; k < 8; ++k) hw[k] = *reinterpret_cast<const unsigned*>(&hv[k]);
+                uint4* dst = reinterpret_cast<uint4*>(sm.k + c * kPad + pc * 16);
+                dst[0] = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+                dst[1] = make_uint4(hw[4], hw[5], hw[6], hw[7]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 9; ++j) {
+                const int i = tid + 256 * j, c = i / 72, ch = i % 72;
+                *reinterpret_cast<uint4*>(sm.k + c * kPad + ch * 8) = nx[j];
+            }
         }
     };
     fetch(0);

@@ -3,9 +3,10 @@
 // attention with sinks, the indexer, Engram's block and the sigmoid router.  Included by hy4_engine.cu alone.
 //
 // Layouts (T rows, one a token): the streams X [T][hc][N]; a row's MLA query [H][576] (512 absorbed + 64 roped); a
-// cached cell one latent row of 576 halves ([RMSNorm(latent) 512 | roped k_pe 64]); q8_1 blocks are llama.cpp's (half2
-// d / sum, 32 int8).  Arithmetic follows llama.cpp's PR #32517 graph (src/models/hy-v4-flash.cpp): f32 activations,
-// q8_1-quantized inputs to the Q8_0 matrices, the rope of rope.cu's rope_norm.
+// cached cell one latent row of 576 halves ([RMSNorm(latent) 512 | roped k_pe 64]), or with --kv q8_0 (the sparse
+// layers' cells) the same 576 values in q8_0 (kKvQ8Row); q8_1 blocks are llama.cpp's (half2 d / sum, 32 int8).
+// Arithmetic follows llama.cpp's PR #32517 graph (src/models/hy-v4-flash.cpp): f32 activations, q8_1-quantized inputs
+// to the Q8_0 matrices, the rope of rope.cu's rope_norm.
 #pragma once
 
 #include "lamina/kernels/warp.cuh"
@@ -25,6 +26,22 @@ constexpr int kAttnChunk = 32;   // cells a block of the latent attention takes 
 constexpr int kKvRow = 576;      // halves of a cached latent row (kv_lora 512 + n_rot 64): the kernels' fixed width
 constexpr int kKvRowPad = 578;   // the row in shared memory: 289 words, so lane c's word d / 2 is bank-conflict free
 constexpr int kLatent = 512;
+/// A cached latent row in q8_0 (--kv q8_0): its 576 values in int8, then its eighteen 32-value blocks' scales in FP16
+/// (llama.cpp's q8_0 rounding: d = amax / 127, q = round(x / d)), padded to whole 16-byte pieces: 624 bytes against
+/// FP16's 1,152.  The attention widens a row into the halves it reads (d * q rounded to FP16).
+constexpr int kKvQ8Row = 624;
+static_assert(kKvRow + kKvRow / 32 * 2 <= kKvQ8Row && kKvQ8Row % 16 == 0, "the q8_0 row's bytes");
+
+/// Four int8 values of a q8_0 row (a word) times their block's scale d2 (its FP16 scale twice), as two half2: each q
+/// made a half exactly (the byte with its sign bit flipped permuted under 0x64, 1024 + q + 128, less 1152), then one
+/// rounding of d * q to FP16, as a float product rounded to FP16 would give.
+__device__ __forceinline__ void q8_widen4(uint32_t u, __half2 d2, __half2& lo, __half2& hi) {
+    const uint32_t x = u ^ 0x80808080u;
+    const uint32_t a = __byte_perm(x, 0x64646464u, 0x4140), b = __byte_perm(x, 0x64646464u, 0x4342);
+    const __half2 bias = __float2half2_rn(1152.f);
+    lo = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&a), bias), d2);
+    hi = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&b), bias), d2);
+}
 
 __device__ __forceinline__ float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
 __device__ __forceinline__ float silu(float v) { return v / (1.0f + expf(-v)); }
@@ -194,28 +211,52 @@ __global__ void k_head_q8_0(const uint8_t* w, const uint8_t* xq, float* y, int H
     y[(size_t) t * ldy + (size_t) h * ld_head_y + j] = acc;
 }
 
-/// The cached latent row of token t: [rms(kva[0:512]) * norm | roped kva[512:576]] as halves into the cache's row for
-/// position pos[t]: pos % ring in a ring, else pos - base (a buffer whose row 0 is position `base`).  Rope as
-/// k_rope_norm (one head of n_rot at 512).
-__global__ void k_kv_store(const float* kva, const float* norm, __half* cache, const int32_t* pos, int ring, int base,
+/// The cached latent row of token t: [rms(kva[0:512]) * norm | roped kva[512:576]] into the cache's row for position
+/// pos[t]: pos % ring in a ring, else pos - base (a buffer whose row 0 is position `base`); halves, or with Q8 a q8_0
+/// row (kKvQ8Row).  Rope as k_rope_norm (one head of n_rot at 512).  A block of kThreads a row.
+template <bool Q8>
+__global__ void k_kv_store(const float* kva, const float* norm, void* cache, const int32_t* pos, int ring, int base,
                            float theta_scale, float eps) {
     __shared__ float sh[32];
+    __shared__ float vals[Q8 ? kKvRow : 1];   // Q8: the row's values before they are quantized
     const int t = blockIdx.x;
     const float* r = kva + (size_t) t * kKvRow;
     float s = 0.f;
     for (int i = threadIdx.x; i < kLatent; i += blockDim.x) s += r[i] * r[i];
     s = block_sum(s, sh);
     const float inv = rsqrtf(s / (float) kLatent + eps);
-    __half* dst = cache + (size_t) (ring ? pos[t] % ring : pos[t] - base) * kKvRow;
-    for (int i = threadIdx.x; i < kLatent; i += blockDim.x) dst[i] = __float2half(r[i] * inv * norm[i]);
+    const size_t cell = (size_t) (ring ? pos[t] % ring : pos[t] - base);
+    __half* dst = reinterpret_cast<__half*>(cache) + cell * kKvRow;
+    for (int i = threadIdx.x; i < kLatent; i += blockDim.x) {
+        const float v = r[i] * inv * norm[i];
+        if constexpr (Q8) vals[i] = v;
+        else dst[i] = __float2half(v);
+    }
     const int i = threadIdx.x;
     if (i < (kKvRow - kLatent) / 2) {
         const float p = (float) pos[t];
         const float theta = p * powf(theta_scale, (float) i);
         const float c = cosf(theta), sn = sinf(theta);
         const float x0 = r[kLatent + 2 * i], x1 = r[kLatent + 2 * i + 1];
-        dst[kLatent + 2 * i] = __float2half(x0 * c - x1 * sn);
-        dst[kLatent + 2 * i + 1] = __float2half(x0 * sn + x1 * c);
+        const float a = x0 * c - x1 * sn, b = x0 * sn + x1 * c;
+        if constexpr (Q8) {
+            vals[kLatent + 2 * i] = a;
+            vals[kLatent + 2 * i + 1] = b;
+        } else {
+            dst[kLatent + 2 * i] = __float2half(a);
+            dst[kLatent + 2 * i + 1] = __float2half(b);
+        }
+    }
+    if constexpr (Q8) {   // a warp a 32-value block (llama.cpp's quantize_f32_q8_0_block)
+        __syncthreads();
+        uint8_t* q = reinterpret_cast<uint8_t*>(cache) + cell * kKvQ8Row;
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        for (int b = warp; b < kKvRow / 32; b += blockDim.x >> 5) {
+            const float v = vals[32 * b + lane];
+            const float d = warp_max(fabsf(v)) / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+            q[32 * b + lane] = (uint8_t) (int8_t) roundf(v * id);
+            if (lane == 0) reinterpret_cast<__half*>(q + kKvRow)[b] = __float2half(d);
+        }
     }
 }
 
@@ -227,11 +268,13 @@ __global__ void k_swa_cells(const int32_t* pos, int n_swa, int ring, int32_t* ce
     if (threadIdx.x == 0) n[t] = p - a + 1;
 }
 
-/// The latent attention of T rows over their cell lists (cells[t][0 .. n[t]) of the cache), split in chunks of
-/// kAttnChunk cells: block (chunk, t) scores its cells for every head (s = q_h . K_c * scale), and writes per head the
-/// chunk's max m, sum l of exp(s - m) and acc[512] = sum exp(s - m) V_c (V the latent, a row's first 512) to part[t]
-/// [chunk][h] (514 floats).  A warp per head in turn, lane = cell.
-__global__ void __launch_bounds__(256) k_mla_chunk(const float* q, const __half* cache, const int32_t* cells,
+/// The latent attention of T rows over their cell lists (cells[t][0 .. n[t]) of the cache: halves, or with Q8 q8_0 rows
+/// widened into halves as they are read), split in chunks of kAttnChunk cells: block (chunk, t) scores its cells for
+/// every head (s = q_h . K_c * scale), and writes per head the chunk's max m, sum l of exp(s - m) and acc[512] = sum
+/// exp(s - m) V_c (V the latent, a row's first 512) to part[t][chunk][h] (514 floats).  A warp per head in turn, lane =
+/// cell.
+template <bool Q8>
+__global__ void __launch_bounds__(256) k_mla_chunk(const float* q, const void* cache, const int32_t* cells,
                                                     const int32_t* n, int ld_cells, int H, float scale, float* part,
                                                     int n_chunks) {
     extern __shared__ __half kt[];   // [kAttnChunk][kKvRowPad]
@@ -246,12 +289,29 @@ __global__ void __launch_bounds__(256) k_mla_chunk(const float* q, const __half*
         return;
     }
     const int nc = min(kAttnChunk, cnt - c0);
-    // the chunk's rows into shared memory, 4 bytes at a time
-    for (int i = threadIdx.x; i < kAttnChunk * (kKvRow / 2); i += blockDim.x) {
-        const int c = i / (kKvRow / 2), d2 = i % (kKvRow / 2);
-        __half2 v = __float2half2_rn(0.f);
-        if (c < nc) v = reinterpret_cast<const __half2*>(cache + (size_t) cells[(size_t) t * ld_cells + c0 + c] * kKvRow)[d2];
-        reinterpret_cast<__half2*>(kt + (size_t) c * kKvRowPad)[d2] = v;
+    // the chunk's rows into shared memory, 4 bytes at a time (Q8: 4 values, times their block's scale)
+    if constexpr (Q8) {
+        const uint8_t* cb = reinterpret_cast<const uint8_t*>(cache);
+        for (int i = threadIdx.x; i < kAttnChunk * (kKvRow / 4); i += blockDim.x) {
+            const int c = i / (kKvRow / 4), w = i % (kKvRow / 4);
+            __half2 lo = __float2half2_rn(0.f), hi = lo;
+            if (c < nc) {
+                const uint8_t* r = cb + (size_t) cells[(size_t) t * ld_cells + c0 + c] * kKvQ8Row;
+                q8_widen4(*reinterpret_cast<const uint32_t*>(r + 4 * w),
+                          __half2half2(reinterpret_cast<const __half*>(r + kKvRow)[w >> 3]), lo, hi);
+            }
+            __half2* dst = reinterpret_cast<__half2*>(kt + (size_t) c * kKvRowPad + 4 * w);
+            dst[0] = lo;
+            dst[1] = hi;
+        }
+    } else {
+        const __half* hc = reinterpret_cast<const __half*>(cache);
+        for (int i = threadIdx.x; i < kAttnChunk * (kKvRow / 2); i += blockDim.x) {
+            const int c = i / (kKvRow / 2), d2 = i % (kKvRow / 2);
+            __half2 v = __float2half2_rn(0.f);
+            if (c < nc) v = reinterpret_cast<const __half2*>(hc + (size_t) cells[(size_t) t * ld_cells + c0 + c] * kKvRow)[d2];
+            reinterpret_cast<__half2*>(kt + (size_t) c * kKvRowPad)[d2] = v;
+        }
     }
     __syncthreads();
     for (int h = warp; h < H; h += nw) {
