@@ -46,15 +46,22 @@ std::vector<int> gpu_list(const json& cfg);
 /// settings ({"id": "GPU-f26e9ba6", "clocks": "1395-2100/9751"}).  nullopt for none, or numbers alone (gpu_list).
 /// ConfigError for a card the engine would refuse.
 std::optional<std::vector<std::string>> gpu_cards(const json& cfg);
+/// gpu_cards' cards as objects: "id" and each setting by its key in lower case, all text
+std::optional<std::vector<json>> card_objects(const json& cfg);
+/// card objects as "gpu" is written: a card with its "id" alone as that id, else its object; every card an object
+/// when each would be a number alone (numbers alone are gpu_list's, the cards the engine sees)
+json cards_json(const std::vector<json>& cards);
 /// a "gpu" value as one list: its numbers ("0,2" as 0 and 2) or its cards, each an item
 json gpu_canonical(const json& gpu);
 /// the cards the engine works on, as --gpu takes them: "gpu"'s, else the args' --gpu, else their --main-gpu and
 /// --second-gpu (names alone); empty when none names one
 std::vector<std::string> engine_cards(const json& cfg);
-/// a config in the form --write-config writes: the older GPU flags (--main-gpu, --second-gpu and the per-tier lists) as
-/// the cards of "gpu", their other older names renamed (--clocks-hold, --tier-min ...), with `flash` (a
-/// Qwen3.8-Flash-Next config) the options at the engine's default left out, --native as "model", --vision as its
-/// section, and "args" as an object (an empty one too: a config without "args" is the preset's)
+/// a config in the form --write-config writes: the older GPU flags as cards of "gpu" (--main-gpu and --second-gpu as
+/// their names, the main GPU's flags and the per-tier lists as their settings, a card's own setting winning), but
+/// beside a "gpu" of numbers or replicas and where a setting would go to an auto card; the other older names renamed
+/// (--clocks-hold, --tier-min ...), in the replicas' own args too; with `flash` (a Qwen3.8-Flash-Next config) the
+/// options at the engine's default left out; --native as "model", --vision as its section, and "args" as an object (an
+/// empty one too: a config without "args" is the preset's)
 json modern_config(json cfg, bool flash);
 struct GpuInfo {
     int index;

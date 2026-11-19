@@ -5,6 +5,7 @@
 #include "runconfig.hpp"
 
 #include "config.hpp"
+#include "lamina/program/gpu_cards.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -51,7 +52,7 @@ const std::vector<Editable> kEditable = {
     {"api_monitor", "bool", "", {}, "Keep the last 100 requests' prompts and answers in memory for /api-monitor"},
     {"open_browser", "bool", "", {}, "Open the chat page in the browser when the model is ready", false},
     {"vram_reserve_mib", "arg", "--vram-reserve-mib", {},
-     "VRAM in MiB the engine leaves free for other programs (engine default 700)", false},
+     "VRAM in MiB the engine leaves free for other programs (engine default 700)", false, "reserve"},
 };
 
 namespace {
@@ -360,6 +361,33 @@ json arg_value(const json& cfg, std::string_view flag) {
     return digits ? digits_value(v) : json(v);
 }
 
+/// "gpu"'s cards when the first, the main GPU's, takes `e.card` (auto as the first takes no settings); none for an
+/// "arg" without a card setting, for "gpu" as numbers and for cards the engine would refuse (the flag stays theirs)
+std::optional<std::vector<json>> main_cards(const json& cfg, const Editable& e) {
+    if (e.card.empty()) return std::nullopt;
+    std::optional<std::vector<json>> cards;
+    try {
+        cards = card_objects(cfg);
+    } catch (const ConfigError&) {
+        return std::nullopt;
+    }
+    if (!cards || cards->empty() || lower((*cards)[0]["id"].get<std::string>()) == "auto") return std::nullopt;
+    return cards;
+}
+
+/// an "arg"'s value: the main GPU card's setting in MiB when it gives one (the engine takes it over the flag), else
+/// the flag's
+json arg_or_card(const json& cfg, const Editable& e) {
+    if (const auto cards = main_cards(cfg, e)) {
+        const json& v = jget((*cards)[0], std::string(e.card));
+        uint64_t bytes = 0;
+        std::string err;
+        if (v.is_string() && program::parse_size(v.get_ref<const std::string&>(), bytes, err))
+            return json((int64_t) (bytes >> 20));
+    }
+    return arg_value(cfg, e.rule);
+}
+
 /// list(x or []): a list as it is, a string's characters, an object's keys; anything else reads as an empty list
 /// (a number or a bool that is not 0: Python's TypeError)
 json list_of(const json& x) {
@@ -425,10 +453,17 @@ const json* entry(const json& cfg, const Editable& e) {
 bool put(json& cfg, const Editable& e, const json& v, bool keep_null) {
     const std::string key(e.key);
     if (e.kind == "arg") {
-        if (py_eq(arg_value(cfg, e.rule), v)) return false;
+        if (py_eq(arg_or_card(cfg, e), v)) return false;
         json a = list_of(jget(cfg, "args"));
         const size_t i = flag_at(a, e.rule);
-        if (i != npos) {
+        if (std::optional<std::vector<json>> cards = main_cards(cfg, e)) {   // the card's setting, the flag out
+            json& m = cards->front();
+            if (v.is_null()) m.erase(std::string(e.card));
+            else m[std::string(e.card)] = py_str(v) + "M";
+            cfg["gpu"] = cards_json(*cards);
+            if (i == npos) return true;
+            a.erase(a.begin() + (std::ptrdiff_t) i, a.begin() + (std::ptrdiff_t) i + 2);
+        } else if (i != npos) {
             if (v.is_null()) a.erase(a.begin() + (std::ptrdiff_t) i, a.begin() + (std::ptrdiff_t) i + 2);
             else a[i + 1] = py_str(v);
         } else if (!v.is_null()) {
@@ -467,7 +502,7 @@ json value_of(const json& cfg, std::string_view key) {
         const json& s = jget(cfg, "sampling");
         return s.is_object() ? jget(s, key.substr(key.find('.') + 1)) : json(nullptr);
     }
-    if (e->kind == "arg") return arg_value(cfg, e->rule);
+    if (e->kind == "arg") return arg_or_card(cfg, *e);
     return jget(cfg, key);
 }
 

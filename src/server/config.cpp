@@ -350,6 +350,34 @@ std::optional<std::vector<std::string>> gpu_cards(const json& cfg) {
     return out;
 }
 
+std::optional<std::vector<json>> card_objects(const json& cfg) {
+    const std::optional<std::vector<std::string>> texts = gpu_cards(cfg);
+    if (!texts) return std::nullopt;
+    std::vector<json> out;
+    for (const std::string& t : *texts) {   // "id,key=value,..." as parse_gpu_card took it
+        const std::vector<std::string> items = split(t, ",");
+        json c = {{"id", std::string(strip(items[0]))}};
+        for (size_t i = 1; i < items.size(); ++i) {
+            const std::string item(strip(items[i]));
+            const size_t eq = item.find('=');
+            if (eq != std::string::npos) c[lower(std::string(strip(item.substr(0, eq))))] = std::string(strip(item.substr(eq + 1)));
+        }
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+json cards_json(const std::vector<json>& cards) {
+    auto number = [](const json& c) {
+        const std::string id = card_value(c["id"]);
+        return c.size() == 1 && !id.empty() && std::all_of(id.begin(), id.end(), ::isdigit);
+    };
+    const bool objects = std::all_of(cards.begin(), cards.end(), number);
+    json out = json::array();
+    for (const json& c : cards) out.push_back(c.size() == 1 && !objects ? c["id"] : c);
+    return out;
+}
+
 json gpu_canonical(const json& g) {
     const std::vector<json> items = gpu_items(g);
     if (items.empty()) return g;
@@ -752,9 +780,40 @@ std::vector<std::string> offline_blockers(const json& cfg) {
     return needs;
 }
 
+namespace {
+
+bool is_flag(const std::string& s) { return s.size() > 2 && starts_with(s, "--"); }
+
+/// an older flag's number with its unit
+std::string with_unit(const std::string& number, const char* u) {
+    char b[48];
+    std::snprintf(b, sizeof b, "%g%s", std::atof(number.c_str()), u);
+    return b;
+}
+
+/// the tiers' options under their older names in `a` renamed, a value given its unit
+void rename_older(std::vector<std::string>& a) {
+    struct Rename {
+        const char *from, *to, *unit;
+    };
+    static const Rename kRenames[] = {{"--second-gpu-clocks-hold", "--clocks-hold", "s"},
+                                      {"--second-gpu-clocks-lead", "--clocks-lead", "s"},
+                                      {"--second-gpu-min-mb", "--tier-min", "M"},
+                                      {"--second-gpu-adapt", "--tier-adapt", nullptr},
+                                      {"--no-second-gpu-adapt", "--no-tier-adapt", nullptr}};
+    for (size_t i = 0; i < a.size(); ++i)
+        for (const Rename& r : kRenames) {
+            if (a[i] != r.from) continue;
+            a[i] = r.to;
+            if (r.unit != nullptr && i + 1 < a.size() && !is_flag(a[i + 1]))
+                a[i + 1] = std::string(r.unit) == "s" && std::atof(a[i + 1].c_str()) < 0 ? "off" : with_unit(a[i + 1], r.unit);
+        }
+}
+
+}  // namespace
+
 json modern_config(json cfg, bool flash) {
     std::vector<std::string> a = args_of(cfg);
-    auto flag = [](const std::string& s) { return s.size() > 2 && starts_with(s, "--"); };
     auto at = [&](const std::string& f) -> std::optional<size_t> {
         for (size_t i = 0; i < a.size(); ++i)
             if (a[i] == f) return i;
@@ -762,30 +821,22 @@ json modern_config(json cfg, bool flash) {
     };
     auto value = [&](const std::string& f) -> std::optional<std::string> {   // the word after the flag
         const auto i = at(f);
-        if (!i || *i + 1 >= a.size() || flag(a[*i + 1])) return std::nullopt;
+        if (!i || *i + 1 >= a.size() || is_flag(a[*i + 1])) return std::nullopt;
         return a[*i + 1];
     };
     auto erase = [&](const std::string& f) {   // the flag and its values
         if (const auto i = at(f)) {
             size_t j = *i + 1;
-            while (j < a.size() && !flag(a[j])) ++j;
+            while (j < a.size() && !is_flag(a[j])) ++j;
             a.erase(a.begin() + (std::ptrdiff_t) *i, a.begin() + (std::ptrdiff_t) j);
         }
     };
-    auto unit = [](const std::string& number, const char* u) {   // an older flag's number with its unit
-        char b[48];
-        std::snprintf(b, sizeof b, "%g%s", std::atof(number.c_str()), u);
-        return std::string(b);
-    };
-    // the GPUs: --main-gpu, --second-gpu and the per-tier lists as the cards of "gpu", unless "gpu" names them
-    if (!gpu_cards(cfg) && gpu_list(cfg).empty() && (value("--main-gpu") || value("--second-gpu") || value("--tier-gpus"))) {
-        const std::string main = value("--main-gpu").value_or("0");
-        std::vector<std::string> tiers;
-        if (const auto t = value("--second-gpu") ? value("--second-gpu") : value("--tier-gpus"))
-            for (const std::string& x : split(*t, ",")) {
-                const std::string s(strip(x));
-                if (!s.empty() && s[0] != '-') tiers.push_back(s);
-            }
+    // the GPUs as cards: "gpu"'s, else --main-gpu's and --second-gpu's (--tier-gpus') names, the main GPU the
+    // engine's "0" when none names it; the older per-card flags their settings where a card has none of its own (its
+    // own wins, as in the engine).  Beside a "gpu" of numbers or replicas (the cards the engine sees, a replica's "gpu"
+    // its group's numbers) the flags stay, and where a setting would go to an auto card (it takes none as the first, an
+    // auto tier's stay the per-tier lists').
+    if (gpu_list(cfg).empty() && !truthy(jget(cfg, "replicas"))) {
         auto list = [&](const char* f) {
             std::vector<std::string> v;
             if (const auto s = value(f))
@@ -799,30 +850,52 @@ json modern_config(json cfg, bool flash) {
                    prefetch = list("--second-gpu-prefetch-mb"), clocks = list("--second-gpu-clocks"),
                    sleep = list("--second-gpu-sleep-us");
         const auto pin = value("--second-gpu-pin-gib");
-        const bool auto_tiers = tiers.size() == 1 && tiers[0] == "auto";
+        const auto cache = value("--expert-cache"), keep = value("--vram-reserve-mib"), only = value("--vram-pin-gib");
         const bool per_tier = !gib.empty() || !reserve.empty() || !prefetch.empty() || !clocks.empty() ||
                               !sleep.empty() || pin;
-        if (!(auto_tiers && per_tier)) {   // an auto tier's settings stay the per-tier lists'
-            json cards = json::array();
-            json m = json::object();
-            m["id"] = main;
-            if (const auto v = value("--expert-cache"); v && *v != program::option_default("--expert-cache")) m["cache"] = *v;
-            if (const auto v = value("--vram-reserve-mib"); v && *v != program::option_default("--vram-reserve-mib"))
-                m["reserve"] = unit(*v, "M");
-            if (const auto v = value("--vram-pin-gib"); v && std::atof(v->c_str()) > 0) m["vram-only"] = unit(*v, "G");
-            cards.push_back(m.size() == 1 ? json(main) : m);
-            for (size_t t = 0; t < tiers.size(); ++t) {
-                json c = json::object();
-                c["id"] = tiers[t];
-                if (std::atof(pick(gib, t).c_str()) > 0) c["cache"] = unit(pick(gib, t), "G");
-                if (!reserve.empty()) c["reserve"] = unit(pick(reserve, t), "M");
-                if (!prefetch.empty()) c["prefetch"] = unit(pick(prefetch, t), "M");
-                if (const std::string k = pick(clocks, t); !k.empty() && k != "0") c["clocks"] = k;
-                if (std::atof(pick(sleep, t).c_str()) > 0) c["sleep"] = unit(pick(sleep, t), "us");
-                if (t == 0 && pin && std::atof(pin->c_str()) > 0) c["vram-only"] = unit(*pin, "G");
-                cards.push_back(c.size() == 1 ? json(tiers[t]) : c);
+        std::optional<std::vector<json>> cards = card_objects(cfg);
+        const bool given = cards.has_value();
+        bool named = given;   // a card named: "gpu"'s, --main-gpu's or a tier
+        if (!given) {
+            cards.emplace();
+            const auto main = value("--main-gpu");
+            named = main.has_value();
+            cards->push_back(json{{"id", main.value_or("0")}});
+            if (const auto t = value("--second-gpu") ? value("--second-gpu") : value("--tier-gpus"))
+                for (const std::string& x : split(*t, ",")) {
+                    const std::string s(strip(x));
+                    if (s.empty() || s[0] == '-') continue;
+                    cards->push_back(json{{"id", s}});
+                    named = true;
+                }
+        }
+        auto is_auto = [](const json& c) { return lower(card_value(c["id"])) == "auto"; };
+        const bool auto_main = is_auto(cards->front());
+        const bool auto_tier = auto_main || std::any_of(cards->begin() + 1, cards->end(), is_auto);
+        if (!((cache || keep || only) && auto_main) && !(per_tier && auto_tier)) {
+            bool changed = false;
+            auto set = [&](json& c, const char* k, const std::string& v) {
+                if (c.contains(k)) return;
+                c[k] = v;
+                changed = true;
+            };
+            json& m = cards->front();
+            if (cache && *cache != program::option_default("--expert-cache")) set(m, "cache", *cache);
+            if (keep && *keep != program::option_default("--vram-reserve-mib")) set(m, "reserve", with_unit(*keep, "M"));
+            if (only && std::atof(only->c_str()) > 0) set(m, "vram-only", with_unit(*only, "G"));
+            for (size_t t = 0; t + 1 < cards->size(); ++t) {
+                json& c = (*cards)[t + 1];
+                if (std::atof(pick(gib, t).c_str()) > 0) set(c, "cache", with_unit(pick(gib, t), "G"));
+                if (!reserve.empty()) set(c, "reserve", with_unit(pick(reserve, t), "M"));
+                if (!prefetch.empty()) set(c, "prefetch", with_unit(pick(prefetch, t), "M"));
+                if (const std::string k = pick(clocks, t); !k.empty() && k != "0") set(c, "clocks", k);
+                if (std::atof(pick(sleep, t).c_str()) > 0) set(c, "sleep", with_unit(pick(sleep, t), "us"));
+                if (t == 0 && pin && std::atof(pin->c_str()) > 0) set(c, "vram-only", with_unit(*pin, "G"));
             }
-            cfg["gpu"] = std::move(cards);
+            // "gpu" as it was unless a card took a setting; from the flags, unless they leave the engine's default
+            if (changed || (!given && named)) cfg["gpu"] = cards_json(*cards);
+            // the rest: at their default, a card's own in their place, per-tier lists without a tier, or (beside
+            // "gpu"'s cards) the names, which the engine reads no more
             for (const char* f : {"--main-gpu", "--second-gpu", "--tier-gpus", "--expert-cache", "--vram-reserve-mib",
                                   "--vram-pin-gib", "--second-gpu-gib", "--second-gpu-reserve-mib",
                                   "--second-gpu-prefetch-mb", "--second-gpu-clocks", "--second-gpu-sleep-us",
@@ -830,23 +903,12 @@ json modern_config(json cfg, bool flash) {
                 erase(f);
         }
     }
-    // the older names of the tiers' other options
-    auto rename = [&](const char* from, const char* to, const char* u) {
-        const auto i = at(from);
-        if (!i) return;
-        a[*i] = to;
-        if (u != nullptr && *i + 1 < a.size() && !flag(a[*i + 1]))
-            a[*i + 1] = std::string(u) == "s" && std::atof(a[*i + 1].c_str()) < 0 ? "off" : unit(a[*i + 1], u);
-    };
-    rename("--second-gpu-clocks-hold", "--clocks-hold", "s");
-    rename("--second-gpu-clocks-lead", "--clocks-lead", "s");
-    rename("--second-gpu-min-mb", "--tier-min", "M");
-    rename("--no-second-gpu-adapt", "--no-tier-adapt", nullptr);
+    rename_older(a);
     // Qwen3.8-Flash-Next's options at the engine's default (the qwen35 path's defaults are its own)
     for (size_t i = 0; flash && i < a.size();) {
         size_t j = i + 1;
-        while (j < a.size() && !flag(a[j])) ++j;
-        const std::string def = flag(a[i]) ? program::option_default(a[i].c_str()) : "";
+        while (j < a.size() && !is_flag(a[j])) ++j;
+        const std::string def = is_flag(a[i]) ? program::option_default(a[i].c_str()) : "";
         bool same = false;
         if (!def.empty() && j == i + 1) {
             same = def == "on";   // a switch the engine has on anyway
@@ -873,6 +935,17 @@ json modern_config(json cfg, bool flash) {
     json list = json::array();
     for (const std::string& w : a) list.push_back(w);
     cfg["args"] = args_as_object(list).value_or(list);   // an empty one stays: a config without "args" is a preset's
+    // a replica's own args, the older names renamed (its GPUs are numbers: their flags stay)
+    if (cfg.contains("replicas") && cfg["replicas"].is_array())
+        for (json& entry : cfg["replicas"]) {
+            if (!entry.is_object() || !truthy(jget(entry, "args"))) continue;
+            std::vector<std::string> own;
+            for (const json& w : args_as_list(entry["args"])) own.push_back(arg_str(w));
+            rename_older(own);
+            json words = json::array();
+            for (const std::string& w : own) words.push_back(w);
+            entry["args"] = args_as_object(words).value_or(words);
+        }
     // the model, its cards and its options first
     json out = json::object();
     for (const char* k : {"model", "gpu", "args"})

@@ -1936,6 +1936,7 @@ const char* lamina::program::option_default(const char* flag) {
             {"--arena-place", on(o.arena_place)},
             {"--no-file-cache", on(o.no_file_cache)},
             {"--deterministic-adapt", on(o.deterministic_adapt)},
+            {"--tier-adapt", on(!o.no_second_gpu_adapt)},
         };
     }();
     for (const auto& [f, v] : table)

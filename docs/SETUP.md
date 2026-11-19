@@ -153,7 +153,11 @@ the place of the preset's or the config's: `lamina-server -m MODEL.gguf --max-co
 parser reads those options first, for the model's family, and the server stops on one it does not take ("unknown
 argument: ...", a value out of range); `--native`, `--serve` and `--vision` are the server's to set (the model is
 `"model"`, the pictures the `vision` section). `lamina-server --config OLD.json --write-config NEW.json` writes an
-earlier config in this form: its GPUs as cards, its options at the engine's default left out, `"args"` an object.
+earlier config in this form: its GPUs as cards (the main GPU's and the per-tier flags as their settings, into `"gpu"`'s
+own cards too), the other deprecated options renamed (a replica's own `args` too), its options at the engine's default
+left out, `"args"` an object. Three keep their GPU flags, as the engine still reads them: a `"gpu"` of numbers (the
+cards the engine sees), replicas (each one's `"gpu"` its group's numbers) and an `auto` card a flag would give a
+setting.
 
 `--write-config FILE` writes the config the command line runs to FILE (the preset's, the config file's and the command
 line's settings in one) and stops; `lamina-server --config FILE` then runs it, and the web app's Model settings card

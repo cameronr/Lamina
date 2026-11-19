@@ -42,6 +42,8 @@ struct Editable {
     std::string_view help;
     /// a change applies at once (Service::apply_setting); false: a start-up setting, read when lamina-server starts
     bool live = true;
+    /// "arg": the main GPU card's setting in the flag's place when "gpu" names the cards (a size, its value in MiB)
+    std::string_view card = {};
 };
 /// the keys of the "sampling" block, the top-level keys, and an engine option kept in "args"
 extern const std::vector<Editable> kEditable;

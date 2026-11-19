@@ -1,11 +1,12 @@
 // lamina-server -m's config pieces that need no model and no GPU (src/server/model_config.hpp): the preset by the
 // header's architecture and quantizer, the main GPU and the image encoder's, a GPU's name in a config, the cards a
 // config's --main-gpu and --second-gpu name (none for a --main-gpu the engine would not find), the command
-// line's engine options in place of the config's, image projectors told apart by their width, and a config written
-// over an earlier one.  The projectors are small GGUF headers written here.  (CPU only.)
+// line's engine options in place of the config's, image projectors told apart by their width, a config written
+// over an earlier one, an earlier config's GPU flags as cards, and the Settings view's reserve on the main card.  The projectors are small GGUF headers written here.  (CPU only.)
 #include "config.hpp"
 #include "model_config.hpp"
 #include "process.hpp"
+#include "runconfig.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -309,6 +310,71 @@ int main() {
         CHECK((lamina::deprecated_options(r, lamina::engine_args(r)) ==
                std::vector<std::string>{"--no-second-gpu-adapt: --no-tier-adapt",
                                         "--vram-reserve-mib 800: the main GPU's reserve= in MiB"}));
+        // its form written: the older names renamed in the replicas' own args too, their GPU flags kept ("gpu" numbers)
+        const json rw = lamina::modern_config(
+            {{"gpu", {0, 1, 2, 3}},
+             {"args", {"--native", "m.gguf", "--vram-reserve-mib", "800", "--second-gpu-adapt"}},
+             {"replicas", json::array({json{{"gpus", {0, 1}}, {"args", {"--second-gpu-clocks-hold", "2",
+                                                                         "--vram-reserve-mib", "900"}}},
+                                       json{{"gpus", {2, 3}}}})}},
+            false);
+        CHECK((rw["args"] == json{{"vram-reserve-mib", 800}, {"tier-adapt", true}}) && rw["gpu"] == json({0, 1, 2, 3}));
+        CHECK((rw["replicas"][0]["args"] == json{{"clocks-hold", "2s"}, {"vram-reserve-mib", 900}}));
+        // replicas named by their groups alone: the same (each replica's "gpu" its group's numbers)
+        const json groups = lamina::modern_config(
+            {{"args", {"--native", "m.gguf", "--vram-reserve-mib", "800"}},
+             {"replicas", json::array({json{{"gpus", {0}}}, json{{"gpus", {2}}}})}}, true);
+        CHECK(!groups.contains("gpu") && (groups["args"] == json{{"vram-reserve-mib", 800}}));
+        // the engine's default switch left out, as the options at their default
+        CHECK(lamina::modern_config({{"args", {"--native", "m.gguf", "--second-gpu-adapt"}}}, true)["args"].empty());
+    }
+    // the GPU flags as cards in each config's form: numbers (the cards the engine sees otherwise) as objects, the main
+    // GPU's flags without a GPU named on the engine's "0", into "gpu"'s own cards (a card's own setting wins), kept for
+    // an auto card
+    {
+        const json n = lamina::modern_config({{"args", {"--native", "m.gguf", "--main-gpu", "1", "--second-gpu", "0,2"}}}, true);
+        CHECK((n["gpu"] == json{{{"id", "1"}}, {{"id", "0"}}, {{"id", "2"}}}) && n["args"].empty());
+        CHECK((lamina::engine_cards(n) == std::vector<std::string>{"1", "0", "2"}) && lamina::gpu_list(n).empty());
+        const json mixed = lamina::modern_config({{"args", {"--native", "m.gguf", "--main-gpu", "1", "--second-gpu",
+                                                            "RTX 5070 Ti"}}}, true);
+        CHECK((mixed["gpu"] == json{"1", "RTX 5070 Ti"}));
+        const json flags = lamina::modern_config({{"args", {"--native", "m.gguf", "--vram-reserve-mib", "800",
+                                                            "--expert-cache", "512", "--vram-pin-gib", "4"}}}, true);
+        CHECK((flags["gpu"] == json{{{"id", "0"}, {"cache", "512"}, {"reserve", "800M"}, {"vram-only", "4G"}}}));
+        CHECK(flags["args"].empty() && lamina::deprecated_options(flags, lamina::engine_args(flags)).empty());
+        // nothing named, nothing set: the engine's defaults, no "gpu"
+        const json none = lamina::modern_config({{"args", {"--native", "m.gguf", "--second-gpu", "-1",
+                                                           "--vram-reserve-mib", "700", "--second-gpu-gib", "12"}}}, true);
+        CHECK(!none.contains("gpu") && none["args"].empty());
+        const json carded = lamina::modern_config(
+            {{"gpu", {"GPU-75af3083", "RTX 5070 Ti,clocks=0", {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"}}}},
+             {"args", {"--native", "m.gguf", "--main-gpu", "GPU-x", "--vram-reserve-mib", "800", "--second-gpu-clocks",
+                       "1-2/3", "--second-gpu-sleep-us", "0,55"}}},
+            true);
+        CHECK((carded["gpu"] == json{{{"id", "GPU-75af3083"}, {"reserve", "800M"}}, {{"id", "RTX 5070 Ti"}, {"clocks", "0"}},
+                                     {{"id", "GPU-f26e9ba6"}, {"clocks", "1395-2100/9751"}, {"sleep", "55us"}}}));
+        CHECK(carded["args"].empty());
+        // "gpu"'s cards as written when they take nothing; the names beside them (which the engine skips) out
+        const json as_is = lamina::modern_config({{"gpu", "GPU-75af3083"}, {"args", {"--native", "m.gguf", "--second-gpu",
+                                                                                     "auto"}}}, true);
+        CHECK(as_is["gpu"] == "GPU-75af3083" && as_is["args"].empty());
+        const json first_auto = lamina::modern_config({{"gpu", {"auto"}}, {"args", {"--native", "m.gguf",
+                                                                                    "--vram-reserve-mib", "800"}}}, true);
+        CHECK((first_auto["gpu"] == json{"auto"}) && (first_auto["args"] == json{{"vram-reserve-mib", 800}}));
+    }
+    // the Settings view's reserve: the main card's when "gpu" names cards (it wins over the flag), the flag beside
+    // numbers; a change goes to the card and takes the flag out
+    {
+        namespace rc = lamina::runconfig;
+        const json c = {{"gpu", {"GPU-75af3083", "RTX 5070 Ti"}}, {"args", {"--native", "m.gguf", "--vram-reserve-mib", "800"}}};
+        CHECK(rc::value_of(c, "vram_reserve_mib") == 800);
+        const json set = rc::apply(c, {{"vram_reserve_mib", 900}}).first;
+        CHECK((set["gpu"] == json{{{"id", "GPU-75af3083"}, {"reserve", "900M"}}, "RTX 5070 Ti"}));
+        CHECK((set["args"] == json{"--native", "m.gguf"}) && rc::value_of(set, "vram_reserve_mib") == 900);
+        const json cleared = rc::apply(set, {{"vram_reserve_mib", nullptr}}).first;
+        CHECK((cleared["gpu"] == json{"GPU-75af3083", "RTX 5070 Ti"}) && rc::value_of(cleared, "vram_reserve_mib").is_null());
+        const json listed = rc::apply({{"gpu", {0, 2}}, {"args", {"--native", "m.gguf"}}}, {{"vram_reserve_mib", 900}}).first;
+        CHECK((listed["gpu"] == json{0, 2}) && (listed["args"] == json{"--native", "m.gguf", "--vram-reserve-mib", "900"}));
     }
 
     fs::remove_all(dir, ec);

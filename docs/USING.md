@@ -370,8 +370,9 @@ alone: `--config`, `--write-config`, `--check`, `--help` and `--version` (`-v`).
 The web app's Model settings card shows the values the server runs with (the command line's over the config file's
 over the preset's, each set on the command line marked so) of `sampling` (`temperature`, `top_p`, `top_k`, `min_p`),
 `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
-`lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and the engine's `--vram-reserve-mib` (the main
-GPU's reserve; a card's own `reserve` in `"gpu"` wins over it).
+`lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and `vram_reserve_mib`, the main GPU's reserve: the
+first card's `reserve` in `"gpu"` (a change goes there and takes an earlier `--vram-reserve-mib` out of `"args"`), in
+a config whose `"gpu"` is numbers the engine's `--vram-reserve-mib`.
 
 - **Apply** changes them for the running server, at once. `effort_position`, `lazy_load`, `open_browser` and
   `--vram-reserve-mib` are read when the server starts (marked *at start-up*): a change to them waits for the next
