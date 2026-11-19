@@ -760,6 +760,111 @@ struct Engine {
     // counters
     double cpu_ms = 0, table_ms = 0;
     int64_t forwards = 0;
+    // LAMINA_HY4_TRACE=1: the host's time of the decode's forwards by part, printed by trace_print (2: the main GPU is
+    // also waited for after each MoE layer's host part, which tells its own experts' tail from the next segment's work;
+    // 3: no graphs, the main GPU waited for after each phase of a layer: its time by phase, the wall times no longer
+    // the engine's)
+    const int trace = [] {
+        const char* v = std::getenv("LAMINA_HY4_TRACE");
+        return v ? std::atoi(v) : 0;
+    }();
+    static constexpr int kPhases = 14;
+    struct Trace {   // sums by a forward's rows
+        struct Part {
+            double ms = 0, table = 0, route = 0, scan = 0, tier_launch = 0, pool = 0, tier_wait = 0, main_tail = 0,
+                   launch = 0;
+            int64_t n = 0, layers = 0, pool_layers = 0, tier_layers = 0, cpu_experts = 0, cpu_entries = 0;
+        } by[kMaxT + 1];
+        double draft = 0, logits = 0;
+        double phase[kMaxT + 1][kPhases] = {};
+        int64_t l_ent[64] = {}, l_cpu[64] = {};   // by layer: the decode's routed entries, the CPU's of them
+    } tr;
+    // LAMINA_HY4_ROUTE_DUMP=FILE: the routing as int32 records (a placement policy replayed over a session's): kind,
+    // layer, rows, then rows * top_k expert ids.  Kinds: 0 a decode forward's MoE layer, 1 a prompt chunk's, 2 a
+    // request's start, 3 its generation's start, 4 a rebalance (its copy budget in place of the layer); 2-4 have no ids
+    std::FILE* route_dump = [] {
+        const char* v = std::getenv("LAMINA_HY4_ROUTE_DUMP");
+        return v ? std::fopen(v, "wb") : nullptr;
+    }();
+    void dump_route(int32_t kind, int32_t layer, int32_t rows, const int32_t* ids_) {
+        if (!route_dump) return;
+        const int32_t hdr[3] = {kind, layer, rows};
+        std::fwrite(hdr, 4, 3, route_dump);
+        if (rows > 0) std::fwrite(ids_, 4, (size_t) rows * (size_t) m->g.top_k, route_dump);
+        if (kind >= 2) std::fflush(route_dump);
+    }
+    static constexpr const char* kPhaseNames[kPhases] = {
+        "the embedding", "Engram", "the streams' mixes and the FFN input", "q_a, q_b, kv_a and the gate",
+        "k_b and the cell", "the indexer", "the attention", "v_b, the gate and the output", "the router, routed_down "
+        "and the copies", "its routed experts", "the shared expert", "the MoE's end", "layer 0's FFN", "the head"};
+    Clock::time_point ph_t;
+    int ph_rows = 0;      // the forward's rows (0: not a trunk forward, nothing is marked)
+    /// trace level 3: the stream waited for, the time since the last mark added to phase k of this forward's rows
+    void ph(int k) {
+        if (trace < 3 || ph_rows == 0) return;
+        CK(cudaStreamSynchronize(st));
+        tr.phase[ph_rows][k] += ms_since(ph_t);
+        ph_t = Clock::now();
+    }
+    static double ms_between(Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    }
+    /// The trace since the last print: a line for each row count's forwards (ms a forward by part) and one for all,
+    /// then zeroed
+    void trace_print(const char* what) {
+        if (!trace) return;
+        Trace::Part all;
+        auto line = [&](const char* rows, const Trace::Part& x) {
+            const double f = 1.0 / (double) x.n, L = x.layers ? 1.0 / (double) x.layers : 0.0;
+            std::fprintf(stderr, "lamina: trace (%s): %s: %lld forwards, %.2f ms each: the table %.2f, the waits for a "
+                         "layer's routing %.2f, the holders %.2f, the tiers' launches %.2f, the pool %.2f (in %.0f%% of "
+                         "the layers, %.1f experts, %.1f entries), the tiers' rows after it %.2f (a tier in %.0f%%), the "
+                         "main GPU after them %.2f, the segments' launches %.2f\n", what, rows, (long long) x.n,
+                         x.ms * f, x.table * f, x.route * f, x.scan * f, x.tier_launch * f, x.pool * f,
+                         100.0 * (double) x.pool_layers * L, (double) x.cpu_experts * f, (double) x.cpu_entries * f,
+                         x.tier_wait * f, 100.0 * (double) x.tier_layers * L, x.main_tail * f, x.launch * f);
+        };
+        for (int t = 1; t <= kMaxT; ++t) {
+            const Trace::Part& x = tr.by[t];
+            if (x.n == 0) continue;
+            line((std::to_string(t) + (t == 1 ? " row" : " rows")).c_str(), x);
+            all.ms += x.ms, all.table += x.table, all.route += x.route, all.scan += x.scan;
+            all.tier_launch += x.tier_launch, all.pool += x.pool, all.tier_wait += x.tier_wait;
+            all.main_tail += x.main_tail, all.launch += x.launch;
+            all.n += x.n, all.layers += x.layers, all.pool_layers += x.pool_layers, all.tier_layers += x.tier_layers;
+            all.cpu_experts += x.cpu_experts, all.cpu_entries += x.cpu_entries;
+        }
+        if (all.n > 0) {
+            line("all", all);
+            if (trace >= 3)
+                for (int t = 1; t <= kMaxT; ++t) {
+                    if (tr.by[t].n == 0) continue;
+                    std::string txt;
+                    double sum = 0;
+                    for (int k = 0; k < kPhases; ++k) {
+                        char b[96];
+                        std::snprintf(b, sizeof b, "%s%s %.2f", k ? ", " : "", kPhaseNames[k],
+                                      tr.phase[t][k] / (double) tr.by[t].n);
+                        txt += b;
+                        sum += tr.phase[t][k];
+                    }
+                    std::fprintf(stderr, "lamina: trace (%s): the main GPU's ms a forward of %d row%s, %.2f: %s\n", what, t,
+                                 t == 1 ? "" : "s", sum / (double) tr.by[t].n, txt.c_str());
+                }
+            std::fprintf(stderr, "lamina: trace (%s): a forward's logits waited for %.2f ms, its drafts took %.2f\n", what,
+                         tr.logits / (double) all.n, tr.draft / (double) all.n);
+            std::string by_layer;
+            for (int i = 0; i < 64; ++i) {
+                if (tr.l_ent[i] == 0) continue;
+                char b[32];
+                std::snprintf(b, sizeof b, " %d:%.0f", i, 100.0 * (double) tr.l_cpu[i] / (double) tr.l_ent[i]);
+                by_layer += b;
+            }
+            std::fprintf(stderr, "lamina: trace (%s): the CPU's %% of the routed entries by layer:%s\n", what,
+                         by_layer.c_str());
+        }
+        tr = Trace{};
+    }
 
     int n_chunks_max() const {
         const auto chunks = [](int64_t cells) { return (int) ((cells + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk); };
@@ -978,6 +1083,7 @@ struct Engine {
     float spec_min_p = 0.f;   // a window's drafts while their joint probability under the drafter's head stays >= this
     cudaEvent_t ev_moe = nullptr, ev_mtp = nullptr;   // the MoE block's routing event: ev (the decode's), ev_mtp
     ~Engine() {   // (the ranges free their own chunks with the model)
+        if (route_dump) std::fclose(route_dump);
         for (const lamina::core::VmmChunk h : spare) lamina::core::vmm_chunk_free(h);
     }
     int s_max = 0;   // the main GPU's slots at the start
@@ -1436,14 +1542,31 @@ struct Engine {
             throw Fatal{1};
         }
         table_ms += ms_since(tt);
+        if (trace) tr.by[T].table += ms_since(tt);
         CK(cudaMemcpyAsync(eraw, h_raw, n_mod * (size_t) T * eh * ed, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(evalid, h_valid, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         const int n_seg = (int) moe_layers.size() + 1;
+        if (trace >= 3) {
+            CK(cudaStreamSynchronize(st));
+            ph_rows = T;
+            ph_t = Clock::now();
+        }
         for (int s = 0; s < n_seg; ++s) {
-            if (s > 0) cpu_part(m->layers[(size_t) moe_layers[(size_t) s - 1]], T);
+            if (s > 0) {
+                cpu_part(m->layers[(size_t) moe_layers[(size_t) s - 1]], T);
+                ph_t = Clock::now();   // the host's part is not the GPU's time
+            }
+            const auto tl = Clock::now();
             run_segment(s, T);
+            if (trace) tr.by[T].launch += ms_since(tl);
         }
         ++forwards;
+        ph(13);
+        ph_rows = 0;
+        if (trace) {
+            ++tr.by[T].n;
+            tr.by[T].ms += ms_since(tt);
+        }
     }
 
     void run_segment(int s, int T) {
@@ -1476,9 +1599,11 @@ struct Engine {
             if (vision) hy4k::k_image_rows<<<T, 256, 0, st>>>(emb, img_rows_d, img_slot_d, N);
             hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
             hy4k::k_swa_cells<<<T, 256, 0, st>>>(pos_d, (int) g.n_swa, (int) ring, cells_swa, n_swa);
+            ph(0);
         } else {
             const int lm = moe_layers[(size_t) s - 1];
             moe_end(m->layers[(size_t) lm], T);
+            ph(11);
             li = (size_t) lm + 1;
         }
         for (; li < m->layers.size(); ++li) {
@@ -1489,6 +1614,7 @@ struct Engine {
                 return;
             }
             dense_ffn(l, T);
+            ph(12);
         }
         // the head: the streams reduced, output_norm, the BF16 head
         hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, m->ohc_fn, m->ohc_scale, m->ohc_base, hc, N, hc, g.eps, g.hc_eps, 0.f,
@@ -1509,14 +1635,17 @@ struct Engine {
             mmvq(l.e_kv, erq, ekv, T);
             hy4k::k_engram_mix<<<T, 256, 0, st>>>(X, ekv, l.e_kv_b, l.e_gate, l.e_gamma, l.e_hcs, evalid, hc, N,
                                                   kEngramEps);
+            ph(1);
         }
         hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hca_fn, l.hca_scale, l.hca_base, hc, N, 2 * hc, g.eps, g.hc_eps,
                                           g.hc_mag, post, xh, l.attn_norm, xn, g.eps);
+        ph(2);
         attend(l, T);
         hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
         hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hcf_fn, l.hcf_scale, l.hcf_base, hc, N, 2 * hc, g.eps, g.hc_eps,
                                           g.hc_mag, post, xh, l.ffn_norm, xn, g.eps);
         quant(xn, T, N, xq);
+        ph(2);
     }
 
     /// A layer's attention over T rows: its input normed in xn, its output (wo, the post-attention norm) in y
@@ -1530,6 +1659,7 @@ struct Engine {
         mmvq(l.q_b, qrq, q, T);
         mmvq(l.kv_a, xq, kva, T);
         mmvq(l.gate, xq, gt, T);
+        ph(3);
         hy4k::k_q_split<<<dim3(H, T), 256, 0, st>>>(q, qnope, qabs, H, (int) g.k_head, (int) g.nope());
         hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
                                                      l.theta);
@@ -1538,6 +1668,7 @@ struct Engine {
             l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow);
         hy4k::k_kv_store<<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta,
                                                        g.eps);
+        ph(4);
         const int32_t* cells = cells_swa;
         const int32_t* counts = n_swa;
         int ld = (int) g.n_swa;
@@ -1555,12 +1686,14 @@ struct Engine {
                                    (size_t) T * g.idx_top_k * 4, cudaMemcpyDeviceToDevice, st));
                 CK(cudaMemcpyAsync(snap_n + (size_t) sl * kMaxT, n_sel, (size_t) T * 4, cudaMemcpyDeviceToDevice, st));
             }
+            ph(5);
         }
         const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
         const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
         hy4k::k_mla_chunk<<<dim3(n_chunks, T), 256, smem, st>>>(qabs, l.kv, cells, counts, ld, H,
                                                                 1.0f / sqrtf((float) g.k_head), part, n_chunks);
         hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_chunks);
+        ph(6);
         quant(att, (int64_t) T * H, hy4k::kLatent, attq);
         hy4k::k_head_q8_0<<<dim3((unsigned) ((H * g.v_head + 127) / 128), T), 128, 0, st>>>(
             l.v_b.d, attq, o, H, hy4k::kLatent, (int) g.v_head, H * (int) g.v_head, (int) g.v_head);
@@ -1568,6 +1701,7 @@ struct Engine {
         quant(o, T, (int64_t) H * g.v_head, oq);
         mmvq(l.wo, oq, y, T);
         hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_attn, N, g.eps);
+        ph(7);
     }
 
     /// The sparse layer's indexer: the rows' index keys into the tail, the groups they complete pooled, and each row's
@@ -1619,8 +1753,10 @@ struct Engine {
         mmvq(l.r_down, xq, rin, T);
         CK(cudaMemcpyAsync(h_rin, rin, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * Kk * 4, cudaMemcpyDeviceToHost, st));
-        if (ev_moe == ev) CK(cudaEventRecordWithFlags(ev, st, cudaEventRecordExternal));   // a graph's node: the host waits on it
+        // a graph's node the host waits on; launched (no graphs, the MTP block's event) a plain record
+        if (ev_moe == ev && use_graphs) CK(cudaEventRecordWithFlags(ev, st, cudaEventRecordExternal));
         else CK(cudaEventRecord(ev_moe, st));
+        ph(8);
         if (!l.held.empty() && l.held[0].n > 0) {
             quant(rin, T, Ld, rinq);
             hy4k::k_group_slots<<<1, 512, 0, st>>>(ids, T * Kk, Kk, E, l.held[0].slot_of_d, l.held[0].slots, l.stride,
@@ -1628,12 +1764,14 @@ struct Engine {
             K::native_expert_grouped(l.gl, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                      std::min<int64_t>((int64_t) T * Kk, E), (int64_t) T * Kk, rinq,
                                      (int64_t) (Ld / 32) * 36, escr, parts, st);
+            ph(9);
         }
         mmvq(l.s_gate, xq, sg, T);
         mmvq(l.s_up, xq, su, T);
         hy4k::k_swiglu<<<blocks((int64_t) T * F), hy4k::kThreads, 0, st>>>(sg, su, sh, (int64_t) T * F);
         quant(sh, T, F, hq);
         mmvq(l.s_down, hq, sy, T);
+        ph(10);
     }
 
     /// The host's part of an MoE layer, between two segments: each entry to its holder (the main GPU's slots, which the
@@ -1642,8 +1780,10 @@ struct Engine {
     void cpu_part(Layer& l, int T) {
         const auto& g = m->g;
         const int Kk = (int) g.top_k, Ld = (int) g.n_latent;
+        const auto tw = Clock::now();
         CK(cudaEventSynchronize(ev_moe));
         const auto t0 = Clock::now();
+        if (!l.mtp) dump_route(0, l.il, T, h_ids);
         std::fill(tier_used.begin(), tier_used.end(), (char) 0);
         int n_miss = 0;
         for (int e = 0; e < T * Kk; ++e) {
@@ -1658,8 +1798,10 @@ struct Engine {
             if (holder > 0) tier_used[(size_t) holder] = 1;
             if (holder < 0) ++n_miss;
         }
+        const auto t1 = Clock::now();
         for (size_t gi = 1; gi < tier_used.size(); ++gi)
             if (tier_used[gi]) tier_launch((int) gi, l, T);
+        const auto t2 = Clock::now();
         jobs.clear();
         std::map<int, size_t> open;
         std::vector<char> quantized((size_t) T, 0);
@@ -1687,12 +1829,37 @@ struct Engine {
         lookups += T * Kk;
         hits += T * Kk - n_miss;
         if (n_miss > 0) pool->run_split_multi_native(l.fmt, jobs.data(), (int) jobs.size());
+        const auto t3 = Clock::now();
+        bool tiers = false;
         for (size_t gi = 1; gi < tier_used.size(); ++gi)
             if (tier_used[gi]) {
                 lamina::core::DeviceScope ds(gpus[gi].dev, main_dev);
                 CK(cudaEventSynchronize(gpus[gi].ev));
+                tiers = true;
             }
         cpu_ms += ms_since(t0);
+        if (trace) {
+            const auto t4 = Clock::now();
+            Trace::Part& x = tr.by[T];
+            x.route += ms_between(tw, t0);
+            x.scan += ms_between(t0, t1);
+            x.tier_launch += ms_between(t1, t2);
+            x.pool += ms_between(t2, t3);
+            x.tier_wait += ms_between(t3, t4);
+            ++x.layers;
+            x.pool_layers += n_miss > 0;
+            x.tier_layers += tiers;
+            x.cpu_experts += (int64_t) jobs.size();
+            x.cpu_entries += n_miss;
+            if (l.il < 64) {
+                tr.l_ent[l.il] += T * Kk;
+                tr.l_cpu[l.il] += n_miss;
+            }
+            if (trace > 1) {
+                CK(cudaStreamSynchronize(st));
+                x.main_tail += ms_since(t4);
+            }
+        }
     }
 
     /// The MoE layer's end: the CPU's rows merged (read through the mapping), the weighted sum, routed_up, the shared
@@ -1921,7 +2088,9 @@ struct Engine {
     Window drafted(std::vector<int32_t>& rows, int n, std::vector<float>& lg, Pick pick, Keep keep) {
         Window w;
         const int64_t P = pos();
+        const auto td = Clock::now();
         w.drafts = m->dfly.on ? dfly_draft(rows.back(), P, n) : draft(rows, P - (int64_t) rows.size() + 1, n);
+        if (trace) tr.draft += ms_since(td);
         std::vector<int32_t> win{rows.back()};
         win.insert(win.end(), w.drafts.begin(), w.drafts.end());
         forward(win.data(), (int) win.size());
@@ -2140,6 +2309,7 @@ struct Engine {
     /// used first) while they are used less (by 1.25x); at most `max_swaps` copies in all; then the counts are halved.
     /// `waiting` (if set) is asked before each copy: true ends the copies there (the counts are halved all the same).
     int rebalance(int max_swaps, const std::function<bool()>& waiting = nullptr) {
+        dump_route(4, max_swaps, 0, nullptr);
         int swaps = 0;
         for (Layer& l : m->layers) {
             if (l.dense || l.held.empty()) continue;
@@ -2204,7 +2374,8 @@ struct Engine {
                                  (int64_t) (Ld / 32) * 36, gp.escr, gp.rows_d, gp.st);
         K::native_expert_rows_out(gp.rows_d, gp.n_groups, gp.grp_start, gp.ent_dst, Ld, (int64_t) T * Kk, gp.out_d,
                                   gp.flag_d, nullptr, gp.counter_d, gp.st);
-        CK(cudaEventRecordWithFlags(gp.ev, gp.st, cudaEventRecordExternal));
+        if (use_graphs) CK(cudaEventRecordWithFlags(gp.ev, gp.st, cudaEventRecordExternal));
+        else CK(cudaEventRecord(gp.ev, gp.st));
     }
     void tier_launch(int gi, Layer& l, int T) {
         Gpu& gp = gpus[(size_t) gi];
@@ -2299,9 +2470,11 @@ struct Engine {
     /// row r's logits on the host
     void host_logits(int r, std::vector<float>& out) {
         const auto& g = m->g;
+        const auto t0 = Clock::now();
         out.resize((size_t) g.n_vocab);
         CK(cudaMemcpyAsync(out.data(), logits + (size_t) r * g.n_vocab, (size_t) g.n_vocab * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (trace) tr.logits += ms_since(t0);
     }
 };
 
@@ -2943,6 +3116,7 @@ struct Prompt {
         }
         free_ents.resize((size_t) nE);
         for (auto& v : free_ents) v.clear();
+        E.dump_route(1, l.il, T, h_ids);
         int64_t on_gpus = 0;
         for (int e = 0; e < T * K; ++e) {
             const int x = h_ids[e];
@@ -3217,6 +3391,7 @@ struct Serve {
         int64_t done = 0;
         auto last_pp = Clock::now();
         E.img = geni ? &ir : nullptr;
+        E.dump_route(2, 0, 0, nullptr);
         const int last = E.feed(ids.data() + reuse, fresh, [&](int64_t d) {
             done = d;
             if (done == fresh || ms_since(last_pp) > 250) {
@@ -3227,6 +3402,7 @@ struct Serve {
             return !stop.load();
         });
         E.img = nullptr;
+        E.trace_print("the prompt");
         const bool cancelled = last < 0;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
@@ -3243,6 +3419,7 @@ struct Serve {
         for (const int32_t t : ids)
             if (t >= 0) hist.push_back(t);
         const long long hits0 = E.hits, lookups0 = E.lookups;
+        E.dump_route(3, 0, 0, nullptr);
         const auto d0 = Clock::now();
         long long produced = 0;
         const char* finish = "length";
@@ -3286,6 +3463,7 @@ struct Serve {
         if (E.drafts_on && E.m->has_mtp && !rows.empty() && E.pos() >= (int64_t) rows.size())   // the block caught up
             E.mtp_catch_up(rows.data(), (int64_t) rows.size(), E.pos() - (int64_t) rows.size());
         const double decode_ms = ms_since(d0);
+        E.trace_print("generation");
         const long long hits = E.hits - hits0, lookups = E.lookups - lookups0;
         serve_print("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld 0 0 0.0 %lld 0\n", produced, ids.size(),
                     prompt_ms, decode_ms, finish, kept, offered, reuse, hits, lookups, (long long) fresh);
@@ -3446,7 +3624,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.profile_path = profile;
     E.save_path = profile_save;
     E.save_every_min = save_every;
-    E.use_graphs = graphs;
+    E.use_graphs = graphs && E.trace < 3;
     E.elastic = kv_grow;
     E.drafts_on = (m.has_mtp || m.dfly.on) && drafts > 0;
     E.spec_min_p = spec_min_p;
@@ -3496,12 +3674,15 @@ int run_engine(int argc, char** argv, bool check_only) {
     }
     FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");
     const auto t0 = Clock::now();
+    E.dump_route(2, 0, 0, nullptr);
     const int last = E.feed(prompt.data(), (int64_t) prompt.size(), nullptr);
     E.img = nullptr;
     std::vector<float> lg;
     E.host_logits(last, lg);
     const double pp_ms = ms_since(t0);
+    E.trace_print("the prompt");
     const double cpu0 = E.cpu_ms, tab0 = E.table_ms;
+    E.dump_route(3, 0, 0, nullptr);
     const auto t1 = Clock::now();
     std::vector<int32_t> gen;
     int64_t offered = 0, kept = 0, windows = 0;
@@ -3541,6 +3722,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         }
     }
     const double tg_ms = ms_since(t1);
+    E.trace_print("generation");
     if (ff) std::fclose(ff);
     serve_print("gen:");
     for (int t : gen) serve_print(" %d", t);
