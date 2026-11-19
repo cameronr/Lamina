@@ -18,6 +18,11 @@
     "top_k": 64
   },
   "log": "./lamina-hy4-flash-q4_k_m.log",
+  "vision": {
+    "mmproj": "../Lamina-data/models/hy4-flash-Q4_K_M/mmproj-Hy4-flash-bf16.gguf",
+    "gpu": false,
+    "threads": 16
+  },
   "lib_dirs": [],
   "expert_profile_save": "./hy4-flash-q4_k_m-learned.bin",
   "expert_profile_save_every": 1
