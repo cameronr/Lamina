@@ -16,3 +16,4 @@ configs/
 *.png
 .claude/
 __pycache__/
+Dockerfile
