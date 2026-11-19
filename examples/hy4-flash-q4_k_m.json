@@ -5,7 +5,9 @@
     "auto"
   ],
   "args": {
-    "max-context": 524288
+    "max-context": 524288,
+    "drafts-per-step": 4,
+    "spec-min-p": 0.3
   },
   "cwd": ".",
   "model_name": "hy4-flash-q4_k_m",

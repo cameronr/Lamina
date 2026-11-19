@@ -791,4 +791,20 @@ __global__ void __launch_bounds__(256) k_index_scores(const float* q, const floa
     if (lane == 0) scores[(size_t) t * ld_scores + gidx] = sc;
 }
 
+// ------------------------------------------------------------------------------------------------ the MTP block
+/// Rows of n into a ring by position: ring[pos[t] % n_ring] = x[t] (the trunk's normed final hidden of the last positions)
+__global__ void k_ring_store(const float* x, float* ring, const int32_t* pos, int n_ring, int n) {
+    const int t = blockIdx.x;
+    float* dst = ring + (size_t) (pos[t] % n_ring) * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = x[(size_t) t * n + i];
+}
+/// The MTP block's input states: row t from src[t] (>= 0: the ring's slot; < 0 and above kNoState: row -1 - src of
+/// `own`; kNoState: zeros, the first position's)
+constexpr int kNoState = -1000000;
+__global__ void k_gather_states(const float* ring, const float* own, const int32_t* src, float* hs, int n) {
+    const int t = blockIdx.x, sr = src[t];
+    const float* from = sr >= 0 ? ring + (size_t) sr * n : sr == kNoState ? nullptr : own + (size_t) (-1 - sr) * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) hs[(size_t) t * n + i] = from ? from[i] : 0.f;
+}
+
 }  // namespace hy4k

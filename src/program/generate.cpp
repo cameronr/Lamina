@@ -548,7 +548,7 @@ void usage(bool all = false) {
                  "  --spec-split         a window's tokens in two groups, the GPU's work on one beside the CPU's on\n"
                  "                       the other (exact, ~7%% slower: a measurement arm)\n"
                  "  --mtp-window N       the draft layer attends to the last N cells (default 32768; 0 = every cell)\n"
-                 "  --drafts-per-step N  Qwen3.6-35B-A3B and Qwen3.8-27B: at most N drafts (0..7) of the file's own\n"
+                 "  --drafts-per-step N  Qwen3.6, Qwen3.8-27B and Hy4-flash: at most N drafts (0..7) of the file's own\n"
                  "                       MTP block a step (default 0: none; --spec-min-p as above), --draft-vocab N\n"
                  "                       its head over the first N ids\n"
                  "  --clocks-hold TIME   --serve: the tiers' clock locks stay this long after a request (default 5s)\n"
