@@ -162,7 +162,8 @@ The API reports how many prompt tokens were reused (`cached_tokens`, `cache_read
 
 The image encoder, `lamina-vision`, is llama.cpp's multimodal library with the model's projector, run on the CPU in a
 process of its own: the GPUs keep their VRAM for experts. The server sends it each picture and passes the embeddings
-it returns to the engine, which places them in the prompt with their positions in the picture's grid.
+it returns to the engine, which places them in the prompt with their positions in the picture's grid (Hy4-flash's file:
+at consecutive positions, as text, which is how llama.cpp's support for it reads them).
 
 ## The server
 

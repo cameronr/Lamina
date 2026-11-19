@@ -233,6 +233,7 @@ struct Model {
     double arena_gib = 0;
     size_t pinned = 0;   // the arena's bytes in pinned memory
     int32_t eos = -1;   // tokenizer.ggml.eos_token_id: the end of an answer
+    int32_t image_pad = -1;   // <｜hy_image▁pad｜>: a picture's cells in a prompt (the template writes one, the server n)
 };
 
 /// Rows of floats as a Q8_0 matrix on the device (ggml's quantizer; kWeightPad zero bytes after it)
@@ -344,6 +345,7 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     if (std::string e = lamina::hy4::check_layout(gm, m.g); !e.empty()) { err = e; return false; }
     if (const lamina::MetaValue* v = gm.meta().get("tokenizer.ggml.eos_token_id"); v && v->is_num())
         m.eos = (int32_t) v->u;
+    m.image_pad = (int32_t) gm.meta().find_string("tokenizer.ggml.tokens", "<\xEF\xBD\x9Chy_image\xE2\x96\x81pad");
     const auto& g = m.g;
     Loader L{gm, {}};
     {
@@ -671,6 +673,47 @@ void engram_ids(const lamina::hy4::Geometry& g, const std::vector<int32_t>& seq,
     }
 }
 
+// ------------------------------------------------------------------------------------------------ pictures
+/// A request's pictures (--vision): lamina-vision's rows in prompt order and each prompt cell's row (-1: text)
+struct ImgReq {
+    std::vector<float> rows;
+    std::vector<int32_t> cell_row;
+    int32_t row(int64_t p) const { return p < (int64_t) cell_row.size() ? cell_row[(size_t) p] : -1; }
+};
+
+/// Reads a lamina-vision file (records 'SVE1': n, nx, ny, n_embd, then n x n_embd floats, a picture each in prompt
+/// order) and lays the pictures over the prompt's runs of `pad`, a row a cell; each such cell's id becomes negative, from
+/// the picture's key (the server's, img_keys=, else the rows' hash) and its row.  "" or the error.
+std::string build_images(const std::string& path, std::vector<int32_t>& ids, int32_t pad, int64_t n_embd,
+                         const std::vector<uint64_t>& keys, ImgReq& r) {
+    std::vector<lamina::program::VisionImage> imgs;
+    if (std::string ve = lamina::program::read_vision_records(path, n_embd, r.rows, imgs); !ve.empty()) return ve;
+    const int64_t n = (int64_t) ids.size();
+    r.cell_row.assign((size_t) n, -1);
+    size_t k = 0;
+    for (int64_t i = 0; i < n;) {
+        if (ids[(size_t) i] != pad) { ++i; continue; }
+        if (k >= imgs.size()) return "the prompt has more images than the embeddings file";
+        const lamina::program::VisionImage& im = imgs[k++];
+        const uint64_t key = lamina::program::vision_image_key(im, keys.size() == imgs.size() ? &keys[k - 1] : nullptr,
+                                                               r.rows.data(), n_embd);
+        for (int64_t j = 0; j < im.n; ++j) {
+            if (i + j >= n || ids[(size_t) (i + j)] != pad)
+                return "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                       " rows but fewer image tokens";
+            uint64_t h = key + (uint64_t) j * 0x9E3779B97F4A7C15ull;   // splitmix64 of the key and the row
+            h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+            h = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+            ids[(size_t) (i + j)] = -1 - (int32_t) ((h ^ (h >> 31)) & 0x3fffffff);
+            r.cell_row[(size_t) (i + j)] = (int32_t) (im.off / (size_t) n_embd + (size_t) j);
+        }
+        i += im.n;
+    }
+    if (k != imgs.size()) return "the embeddings file has more images than the prompt";
+    if (n > 0 && r.cell_row.back() >= 0) return "the prompt cannot end in an image";
+    return "";
+}
+
 // ------------------------------------------------------------------------------------------------ the engine
 struct Engine {
     Model* m = nullptr;
@@ -805,6 +848,12 @@ struct Engine {
         h_ids = halloc<int32_t>(T * (size_t) g.top_k);
         h_tok = halloc<int32_t>(T);
         h_pos = halloc<int32_t>(T);
+        if (vision) {
+            img_rows_d = dalloc<float>(T * N);
+            img_slot_d = dalloc<int32_t>(T);
+            h_img = halloc<float>(T * N);
+            h_slot = halloc<int32_t>(T);
+        }
         for (size_t li = 0; li < m->layers.size(); ++li)
             if (!m->layers[li].dense) moe_layers.push_back((int) li);
         h_raw = halloc<uint8_t>(n_mod * T * eh * ed);
@@ -1339,6 +1388,11 @@ struct Engine {
     std::vector<int> moe_layers;
     std::map<int, cudaGraphExec_t> graphs;
     bool use_graphs = true;
+    // pictures (--vision): the request's (feed's) rows; a forward's image cells staged for its first segment
+    bool vision = false;
+    const ImgReq* img = nullptr;
+    float *img_rows_d = nullptr, *h_img = nullptr;
+    int32_t *img_slot_d = nullptr, *h_slot = nullptr;
 
     /// T rows (tokens toks, at positions pos() ..) through the model; logits of every row into `logits`.
     void forward(const int32_t* toks, int T) {
@@ -1362,6 +1416,20 @@ struct Engine {
         const lamina::ngram::PleReader::Ticket ticket = reader.issue(h_rows, n_mod * (size_t) T * eh, h_raw);
         CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        if (vision) {   // the forward's image cells: their rows staged, the others' slots -1
+            const int N = (int) g.n_embd;
+            int any = 0;
+            for (int t = 0; t < T; ++t) {
+                const int32_t r = img ? img->row(p0 + t) : -1;
+                h_slot[t] = r >= 0 ? t : -1;
+                if (r >= 0) {
+                    std::memcpy(h_img + (size_t) t * N, img->rows.data() + (size_t) r * N, (size_t) N * 4);
+                    any = t + 1;
+                }
+            }
+            CK(cudaMemcpyAsync(img_slot_d, h_slot, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+            if (any) CK(cudaMemcpyAsync(img_rows_d, h_img, (size_t) any * N * 4, cudaMemcpyHostToDevice, st));
+        }
         std::string err;
         if (!reader.collect(ticket, err)) {
             std::fprintf(stderr, "lamina: the Engram table: %s\n", err.c_str());
@@ -1405,6 +1473,7 @@ struct Engine {
         size_t li = 0;
         if (s == 0) {
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, T, N, emb, st);
+            if (vision) hy4k::k_image_rows<<<T, 256, 0, st>>>(emb, img_rows_d, img_slot_d, N);
             hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
             hy4k::k_swa_cells<<<T, 256, 0, st>>>(pos_d, (int) g.n_swa, (int) ring, cells_swa, n_swa);
         } else {
@@ -2529,6 +2598,16 @@ struct Prompt {
         hy4p::k_head_ids<<<(unsigned) ((kG * T + 255) / 256), 256, 0, st>>>(hids, kG, T);
         hy4p::k_head_bounds<<<1, 64, 0, st>>>(hb, kG, T);
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, T, N, emb, st);
+        if (E.img)   // a picture's cells: its rows, a copy a run
+            for (int t = 0; t < T;) {
+                const int32_t row = E.img->row(p0 + t);
+                if (row < 0) { ++t; continue; }
+                int len = 1;
+                while (t + len < T && E.img->row(p0 + t + len) == row + len) ++len;
+                CK(cudaMemcpyAsync(emb + (size_t) t * N, E.img->rows.data() + (size_t) row * N, (size_t) len * N * 4,
+                                   cudaMemcpyHostToDevice, st));
+                t += len;
+            }
         hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
         std::string err;
         if (!E.reader.collect(ticket, err)) {
@@ -3028,9 +3107,10 @@ struct Prompt {
 };
 
 // ------------------------------------------------------------------------------------------------ serve
-/// lamina-server's engine protocol, one request at a time: GEN <max_new> [key=value ...] <ids> -> RESUME (the tokens
-/// the state already held), PP lines while the prompt is read, a T line a token, DONE; STOP ends a request at its next
-/// step, QUIT the loop.
+/// lamina-server's engine protocol, one request at a time: GEN <max_new> [key=value ...] <ids>, or with --vision GENI
+/// <max_new> [keys] <file> <ids> (the file lamina-vision's rows of the prompt's pictures) -> RESUME (the tokens the state
+/// already held), PP lines while the prompt is read, a T line a token, DONE; STOP ends a request at its next step, QUIT
+/// the loop.
 struct Serve {
     Engine& E;
     int32_t eos = -1;
@@ -3045,11 +3125,13 @@ struct Serve {
 
     void request(const std::string& line) {
         const auto& g = E.m->g;
-        const char* p = line.c_str() + 4;
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        const char* p = line.c_str() + (geni ? 5 : 4);
         char* e = nullptr;
         const long long max_new = std::strtoll(p, &e, 10);
         p = e;
         lamina::program::Sampling smp;
+        std::vector<uint64_t> img_keys;   // img_keys=<hex>,..: each picture's key from the server, in prompt order
         for (;;) {
             while (*p == ' ') ++p;
             const char* st0 = p;
@@ -3057,12 +3139,40 @@ struct Serve {
             const std::string tk(st0, (size_t) (p - st0));
             const size_t eq = tk.find('=');
             if (tk.empty() || eq == std::string::npos) { p = const_cast<char*>(st0); break; }
-            smp.set(tk.substr(0, eq), tk.c_str() + eq + 1);   // keys of other paths (img_keys, score) are left
+            if (tk.compare(0, eq, "img_keys") == 0) {
+                for (const char* q = tk.c_str() + eq + 1; *q;) {
+                    char* qe = nullptr;
+                    const unsigned long long x = std::strtoull(q, &qe, 16);
+                    if (qe == q || (*qe != ',' && *qe != '\0')) { img_keys.clear(); break; }
+                    img_keys.push_back((uint64_t) x);
+                    q = *qe == ',' ? qe + 1 : qe;
+                }
+            } else {
+                smp.set(tk.substr(0, eq), tk.c_str() + eq + 1);   // keys of other paths (score) are left
+            }
         }
-        const std::vector<int32_t> ids = lamina::program::parse_ids(p);
-        if (max_new < 1 || ids.empty()) { serve_print("ERR bad request: max_new or the ids\n"); return; }
+        std::string emb;   // GENI: the request's lamina-vision file before the ids
+        if (geni) {
+            while (*p == ' ') ++p;
+            const char* e0 = p;
+            while (*p && *p != ' ') ++p;
+            emb.assign(e0, (size_t) (p - e0));
+        }
+        std::vector<int32_t> ids = lamina::program::parse_ids(p);
+        if (max_new < 1 || ids.empty() || (geni && emb.empty())) {
+            serve_print("ERR bad request: max_new or the ids\n");
+            return;
+        }
         for (const int32_t t : ids)
             if (t < 0 || t >= g.n_vocab) { serve_print("ERR a token id is outside the vocabulary\n"); return; }
+        ImgReq ir;
+        if (geni) {
+            if (!E.vision) { serve_print("ERR this engine was started without --vision\n"); return; }
+            if (const std::string ve = build_images(emb, ids, E.m->image_pad, g.n_embd, img_keys, ir); !ve.empty()) {
+                serve_print("ERR %s\n", ve.c_str());
+                return;
+            }
+        }
         if ((int64_t) ids.size() + max_new > E.ctx - kMaxT) {
             serve_print("ERR prompt (%zu tokens) + max_new (%lld) exceeds the context (%lld)\n", ids.size(), max_new,
                         (long long) (E.ctx - kMaxT));
@@ -3106,6 +3216,7 @@ struct Serve {
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         int64_t done = 0;
         auto last_pp = Clock::now();
+        E.img = geni ? &ir : nullptr;
         const int last = E.feed(ids.data() + reuse, fresh, [&](int64_t d) {
             done = d;
             if (done == fresh || ms_since(last_pp) > 250) {
@@ -3115,6 +3226,7 @@ struct Serve {
             }
             return !stop.load();
         });
+        E.img = nullptr;
         const bool cancelled = last < 0;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
@@ -3127,7 +3239,9 @@ struct Serve {
             E.snapshot(lg);
         }
         std::mt19937_64 rng(smp.seed);
-        std::vector<int32_t> hist = ids;
+        std::vector<int32_t> hist;   // the penalties' history: the prompt's text (as llama.cpp's sampler, no picture)
+        for (const int32_t t : ids)
+            if (t >= 0) hist.push_back(t);
         const long long hits0 = E.hits, lookups0 = E.lookups;
         const auto d0 = Clock::now();
         long long produced = 0;
@@ -3226,21 +3340,23 @@ struct Serve {
                 lines.pop_front();
             }
             if (line.empty()) continue;
-            if (line.rfind("GEN ", 0) == 0) {
+            if (line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0) {
                 request(line);
             } else if (line == "QUIT") {
                 std::lock_guard<std::mutex> lk(mu);
                 eof = true;
                 lines.clear();
             } else {
-                serve_print("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+                serve_print("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [keys] <file> "
+                            "<id,id,...>\n");
             }
         }
     }
 };
 
 int run_engine(int argc, char** argv, bool check_only) {
-    std::string model, tokens, force, dump_full;
+    std::string model, tokens, force, dump_full, emb_file;
+    bool vision = false;
     int64_t max_ctx = 8192;
     int n_gen = 64, threads = 0;
     bool serve = false;
@@ -3298,6 +3414,8 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--drafts-per-step") drafts = std::max(0, std::min(kMaxT - 1, std::atoi(next())));
         else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next());
         else if (a == "--kv-grow") kv_grow = true;
+        else if (a == "--vision") vision = true;    // pictures: GENI requests, --emb (the rows lamina-vision's)
+        else if (a == "--emb") emb_file = next();   // generate mode: --tokens' pictures, a lamina-vision file
         else if (a == "--tier-gpus") {   // the expert tiers' GPUs (CUDA ordinals, the family switch's)
             for (const int32_t d : lamina::program::parse_ids(next())) tier_devs.push_back((int) d);
         }
@@ -3332,6 +3450,11 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.elastic = kv_grow;
     E.drafts_on = (m.has_mtp || m.dfly.on) && drafts > 0;
     E.spec_min_p = spec_min_p;
+    E.vision = vision || !emb_file.empty();
+    if (E.vision && m.image_pad < 0) {
+        std::fprintf(stderr, "lamina: the model's vocabulary has no image pad token, so --vision has no cells to fill\n");
+        return 2;
+    }
     E.init(m, max_ctx, threads);
     E.park_budget = (size_t) (std::max(0.0, park_mib) * (double) (1 << 20));
     E.ram_reserve = (size_t) (std::max(0.0, reserve_mib) * (double) (1 << 20));
@@ -3348,11 +3471,11 @@ int run_engine(int argc, char** argv, bool check_only) {
         E.save_profile(true);
         return rc;
     }
-    const std::vector<int32_t> prompt = lamina::program::parse_ids(tokens.c_str()),
-                               forced = lamina::program::parse_ids(force.c_str());
+    std::vector<int32_t> prompt = lamina::program::parse_ids(tokens.c_str());
+    const std::vector<int32_t> forced = lamina::program::parse_ids(force.c_str());
     if (prompt.empty()) { std::fprintf(stderr, "lamina: --tokens is required\n"); return 2; }
     if (!forced.empty()) n_gen = (int) forced.size() + 1;
-    for (const std::vector<int32_t>* v : {&prompt, &forced})
+    for (const std::vector<int32_t>* v : {(const std::vector<int32_t>*) &prompt, &forced})
         for (const int32_t t : *v)
             if (t < 0 || t >= m.g.n_vocab) {
                 std::fprintf(stderr, "lamina: the token %d is outside the vocabulary (%lld)\n", (int) t, (long long) m.g.n_vocab);
@@ -3363,9 +3486,18 @@ int run_engine(int argc, char** argv, bool check_only) {
                      n_gen, (long long) E.ctx);
         return 2;
     }
+    ImgReq ir;
+    if (!emb_file.empty()) {
+        if (const std::string ve = build_images(emb_file, prompt, m.image_pad, m.g.n_embd, {}, ir); !ve.empty()) {
+            std::fprintf(stderr, "lamina: --emb: %s\n", ve.c_str());
+            return 2;
+        }
+        E.img = &ir;
+    }
     FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");
     const auto t0 = Clock::now();
     const int last = E.feed(prompt.data(), (int64_t) prompt.size(), nullptr);
+    E.img = nullptr;
     std::vector<float> lg;
     E.host_logits(last, lg);
     const double pp_ms = ms_since(t0);

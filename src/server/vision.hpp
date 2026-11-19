@@ -70,11 +70,15 @@ private:
     std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> cache_;   ///< key -> (file, tokens), oldest first
 };
 
-/// where the image encoder belongs: lamina-vision in this program's folder, where a release and every build put it (no
-/// config names another)
-std::string vision_exe_path();
+/// where the image encoder of the projector `mmproj` belongs: lamina-vision in this program's folder, where a release and
+/// every build put it (no config names another), or for Hy4-flash's projector (hy4_projector) lamina-vision-hy4 there
+std::string vision_exe_path(const std::string& mmproj = "");
 /// that encoder; std::runtime_error when it is not there
-std::string vision_exe();
+std::string vision_exe(const std::string& mmproj = "");
+/// a projector of Hy4-flash's (clip.projector_type hy_v4_flash or hy_v4_vl): its mtmd and its text model's vocabulary
+/// are llama.cpp's PR #32517's, which the vendored llama.cpp has not taken, so lamina-vision built from that tree reads
+/// it (its mtmd encodes the other models' pictures differently from the vendored one's)
+bool hy4_projector(const std::string& mmproj);
 /// the encoder's command line from the config's vision section: it runs in its own directory, so the section's paths
 /// are made absolute
 std::vector<std::string> vision_reader_args(const json& cfg);

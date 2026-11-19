@@ -493,6 +493,23 @@ public:
         }
         return true;
     }
+    /// The index of a string array's first element that starts with `prefix`, read from the mapping (MetaValue keeps
+    /// the first kMetaArrayKept), or -1
+    int64_t find_string(const std::string& key, const std::string& prefix) const {
+        const MetaValue* v = get(key);
+        if (v == nullptr || v->type != MetaType::ARRAY || v->elem != MetaType::STRING) return -1;
+        uint64_t at = v->data;
+        for (uint64_t i = 0; i < v->count; ++i) {
+            uint64_t n = 0;
+            if (at + 8 > size_) return -1;
+            std::memcpy(&n, base_ + at, 8);
+            at += 8;
+            if (n > size_ - at) return -1;
+            if (n >= prefix.size() && std::memcmp(base_ + at, prefix.data(), prefix.size()) == 0) return (int64_t) i;
+            at += n;
+        }
+        return -1;
+    }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
 private:

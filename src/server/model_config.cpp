@@ -212,21 +212,21 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
 
     // pictures: the projector (named, else the one beside the model) and lamina-vision beside the server
     std::string mmproj, why_not;
-    const bool encoder = fs::is_regular_file(u8_path(vision_exe_path()));
+    const auto encoder = [](const std::string& proj) { return fs::is_regular_file(u8_path(vision_exe_path(proj))); };
     if (o.no_mmproj) {
         why_not = "--no-mmproj";
     } else if (!o.mmproj.empty()) {
         mmproj = absolute_path(o.mmproj);
         if (const std::string why = projector_problem(mmproj, m); !why.empty())
             throw ConfigError("--mmproj " + o.mmproj + ": " + why);
-        if (!encoder)
-            throw ConfigError("--mmproj " + o.mmproj + ": the image encoder is not there: " + vision_exe_path() +
+        if (!encoder(mmproj))
+            throw ConfigError("--mmproj " + o.mmproj + ": the image encoder is not there: " + vision_exe_path(mmproj) +
                               " (lamina-vision belongs in lamina-server's folder)");
     } else if (const std::vector<std::string> found = projectors_beside(m); found.empty()) {
         why_not = "no image projector made for it (mmproj*.gguf) beside the model; --mmproj names one";
-    } else if (!encoder) {
-        why_not = "the image encoder is not there: " + vision_exe_path() + " (lamina-vision belongs in lamina-server's "
-                  "folder)";
+    } else if (!encoder(found.front())) {
+        why_not = "the image encoder is not there: " + vision_exe_path(found.front()) + " (lamina-vision belongs in "
+                  "lamina-server's folder)";
     } else {
         mmproj = found.front();
     }
@@ -462,9 +462,9 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
                 const std::string mmproj = jstr(v, "mmproj");
                 const std::string why = projector_problem(mmproj, m);
                 if (!why.empty()) stops.push_back("the vision section's projector " + mmproj + ": " + why);
-                if (!fs::is_regular_file(u8_path(vision_exe_path())))
+                if (!fs::is_regular_file(u8_path(vision_exe_path(mmproj))))
                     stops.push_back("the config has a \"vision\" section, and the image encoder is not there: " +
-                                    vision_exe_path());
+                                    vision_exe_path(mmproj));
                 say("  pictures: " + mmproj + ", encoded " +
                     (truthy(jget(v, "gpu")) ? "on " + (jget(v, "cuda_device").is_null() ? std::string("a GPU")
                                                                                          : str_of(v["cuda_device"]))

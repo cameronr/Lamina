@@ -2,7 +2,8 @@
 //
 // Turns an image into the embeddings the text model reads in place of its <|image_pad|> tokens, with llama.cpp's
 // mtmd library and the model's mmproj file (vision encoder + projector).  The engine does the rest: it places the
-// rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
+// rows at the image's pad tokens and gives them their positions, 2-D M-RoPE ones (see --serve GENI in generate.cpp)
+// or, for a model that reads a picture at text positions (Hy4-flash's file: a grid of one row), consecutive ones.
 //
 //   lamina-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
 //                 [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]
@@ -240,9 +241,11 @@ int main(int argc, char** argv) {
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
             const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
+            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token; a model that
+            // reads the picture at text positions (t = the row: Hy4-flash's file) has none, a row of n
             const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
+            const bool seq = n > 1 && last.t == (uint32_t) (n - 1);
+            const int nx = seq ? n : (int) last.x + 1, ny = seq ? 1 : (int) last.y + 1;
             if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
             const float* embd = mtmd_get_output_embd(ctx);
             FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;

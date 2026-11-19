@@ -147,7 +147,10 @@ Prepared Service::prepare(json& messages, const json& tools, const json& kwargs,
         if (vision == nullptr)
             throw RequestError("this server was started without the vision encoder (an image projector beside the model, or the "
                                "config's vision section), so it cannot read images");
-        const int32_t pad = tok.encode("<|image_pad|>", true)[0], start = tok.encode("<|vision_start|>", true)[0];
+        // a picture's tags: Qwen's, or Hy4's (its template writes the same three)
+        const std::string pad_tag = tok.hy4 ? tok.hy4->image_pad : "<|image_pad|>",
+                          start_tag = tok.hy4 ? tok.hy4->image_start : "<|vision_start|>";
+        const int32_t pad = tok.encode(pad_tag, true)[0], start = tok.encode(start_tag, true)[0];
         // an image URL is downloaded first, outside the turn: under it, a slow server held every other request
         std::vector<std::pair<std::string, bool>> sources;
         for (const auto& src : pics) {
@@ -163,7 +166,7 @@ Prepared Service::prepare(json& messages, const json& tools, const json& kwargs,
         }
         // one <|image_pad|> per image -> one per image token; only the markers the template writes for an image (right
         // after <|vision_start|>) are images, the same text inside a message stays text
-        const std::vector<int32_t> literal = tok.encode("<|image_pad|>", false);
+        const std::vector<int32_t> literal = tok.encode(pad_tag, false);
         std::vector<int32_t> out;
         size_t k = 0;
         for (size_t j = 0; j < ids.size(); ++j) {

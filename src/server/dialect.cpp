@@ -23,6 +23,8 @@ std::optional<Hy4Tags> Hy4Tags::from_template(std::string_view src) {
     t.key_close = "</arg_key" + k + ">";
     t.val_open = "<arg_value" + k + ">";
     t.val_close = "</arg_value" + k + ">";
+    t.image_start = "<｜hy_image▁start" + k + "｜>";
+    t.image_pad = "<｜hy_image▁pad" + k + "｜>";
     return t;
 }
 

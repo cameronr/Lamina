@@ -79,6 +79,11 @@ Copy `build-vision/bin/lamina-vision` (`.exe`) beside `lamina-server`, over the 
 the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. The engine's
 build with `-DLAMINA_BUILD_VISION=OFF` leaves it there; a build with the encoder writes its CUDA one over it.
 
+Hy4-flash's projector (`mmproj-Hy4-flash-bf16.gguf`) is read by llama.cpp's pull request #32517 alone, which the
+pinned llama.cpp has not taken: the server starts `lamina-vision-hy4` for it, the same tool built against a checkout
+of that pull request (`-DLLAMA_DIR=<the checkout>`, its own build folder) and copied beside `lamina-server` under that
+name. Its mtmd encodes the other models' pictures differently from the pinned one's, so `lamina-vision` stays.
+
 ## A model file
 
 `lamina-server -m MODEL.gguf` runs a model file as it lies, a split one by any of its shards:

@@ -807,6 +807,13 @@ __global__ void k_gather_states(const float* ring, const float* own, const int32
     for (int i = threadIdx.x; i < n; i += blockDim.x) hs[(size_t) t * n + i] = from ? from[i] : 0.f;
 }
 
+/// A picture's rows into the embeddings: row t from rows[slot[t]] where slot[t] >= 0 (a forward's image cells)
+__global__ void k_image_rows(float* emb, const float* rows, const int32_t* slot, int n) {
+    const int t = blockIdx.x, s = slot[t];
+    if (s < 0) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) emb[(size_t) t * n + i] = rows[(size_t) s * n + i];
+}
+
 // ------------------------------------------------------------------------------------------------ DFly2
 /// A DFly layer's cells for block row r (blockIdx.x): the trunk layer's n picks of the row before the block (every one
 /// before it), then the block's positions anchor .. anchor + r
