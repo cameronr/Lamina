@@ -641,6 +641,7 @@ Process::Process(SpawnOptions o) : impl_(std::make_unique<Impl>()) {
     const pid_t parent = ::getpid();
     const bool group = o.contain || o.own_group;
     const pid_t pid = anchor().call([&]() -> pid_t {
+        // fork() copies at once each page cudaHostRegister pinned, unless platform::keep_from_children kept it out
         const pid_t c = ::fork();
         if (c != 0) return c;
         // the child
