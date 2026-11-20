@@ -35,6 +35,7 @@
 #include "lamina/program/serve_io.hpp"
 #include "q36_attn.cuh"
 #include "q36_kernels.cuh"
+#include "q36_lora.cuh"
 #if defined(LAMINA_Q36_CPU_POOL)
 #include "lamina/kernels/cpu/native_expert.hpp"
 #include "lamina/kernels/cpu/pool.hpp"
@@ -258,8 +259,9 @@ __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, con
 }
 /// GDN alpha and beta for T <= 8 rows in one launch, their epilogues applied: rows [0, HV) of the output are
 /// softplus(alpha . x + dt) * ssm_a, rows [HV, 2 HV) sigmoid(beta . x).  Warp per row (grid (ceil(2 HV / 8), T)).
+/// `dab` [T][2 HV]: the adapters' deltas of the products, added before the epilogues (null: none).
 __global__ void k_gdn_ab(const float* Wa, const float* Wb, const float* x, const float* dt, const float* ssm_a,
-                         float* alpha, float* beta, int n_in, int HV) {
+                         float* alpha, float* beta, int n_in, int HV, const float* dab) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int o = blockIdx.x * 8 + warp;
     if (o >= 2 * HV) return;
@@ -274,6 +276,7 @@ __global__ void k_gdn_ab(const float* Wa, const float* Wb, const float* x, const
     }
     for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
     if (lane != 0) return;
+    if (dab != nullptr) acc += dab[(size_t) blockIdx.y * 2 * HV + o];
     if (isb) beta[(size_t) blockIdx.y * HV + r] = sigm(acc);
     else alpha[(size_t) blockIdx.y * HV + r] = softplus(acc + dt[r]) * ssm_a[r];
 }
@@ -1006,10 +1009,34 @@ __global__ void __launch_bounds__(128) k_gdn_norm(const float* o_raw, const floa
 }
 
 // ------------------------------------------------------------------------------------------------ the model
+/// LoRA adapters (--lora, --lora-scaled: llama.cpp's GGUF adapters; q36_lora.cuh's kernels).  One adapter's pair at one
+/// product: A [rank][n_in] and B [n_out][rank] on the product's GPU, the rank padded to a multiple of q36lora::kGroup
+/// with zeros; F16 (the file's F16 and Q8_0 pairs) or F32 (its F32 and BF16 ones).
+struct LoraSeg {
+    int adapter = 0;
+    int rank = 0;
+    float rank_true = 0.f;
+    bool f32 = false;
+    void* a = nullptr;
+    void* b = nullptr;
+};
+/// the adapters' pairs at one product
+struct LoraMat {
+    std::vector<LoraSeg> segs;
+};
+/// a loaded adapter
+struct LoraAdapter {
+    std::string path, task_name, prompt_prefix;
+    float alpha = 0.f;     // adapter.lora.alpha (0: none, a pair's scale is the adapter's as given)
+    int pairs = 0, rank_min = 0, rank_max = 0;
+    uint64_t bytes = 0;    // on the GPUs
+};
+
 struct Mat {
     const uint8_t* d = nullptr;   // device, GGUF blocks
     int type = -1;
     int n_in = 0, n_out = 0;
+    const LoraMat* lora = nullptr;   // the adapters' pairs for this product (null: none)
 };
 
 struct Layer {
@@ -1018,6 +1045,7 @@ struct Layer {
     // GDN
     Mat qkv, zg, ssm_out;
     const float *alpha = nullptr, *beta = nullptr, *dt = nullptr, *ssm_a = nullptr, *conv = nullptr, *ssm_norm = nullptr;
+    const LoraMat *lora_alpha = nullptr, *lora_beta = nullptr;   // the adapters' pairs for the F32 alpha / beta products
     // attention
     Mat wq, wk, wv, wo;
     const float *q_norm = nullptr, *k_norm = nullptr;
@@ -1058,6 +1086,8 @@ struct Model {
     std::vector<Layer> layers;
     const float* out_norm = nullptr;
     Mat head;
+    std::vector<LoraAdapter> loras;     // --lora's files, in their order (a request's scales are in it too)
+    std::deque<LoraMat> lora_mats;      // the products' pairs (Mat::lora points here)
     const uint8_t* embd = nullptr;
     const uint8_t* embd_mtp = nullptr;   // the MTP block's: embd, or its copy on the last stage's GPU
     int embd_type = -1;
@@ -1124,9 +1154,9 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
-/// A tensor as f32 on the device (F32 as it is, BF16 / F16 widened).
-float* upload_f32(const lamina::TensorInfo& t, const uint8_t* src) {
-    std::vector<float> h((size_t) t.elements());
+/// A tensor's values as f32 on the host (F32 as it is, BF16 / F16 widened, Q8_0 scaled); false for another type.
+bool tensor_floats(const lamina::TensorInfo& t, const uint8_t* src, std::vector<float>& h) {
+    h.resize((size_t) t.elements());
     if (t.type == 0) std::memcpy(h.data(), src, h.size() * 4);
     else if (t.type == 30)
         for (size_t i = 0; i < h.size(); ++i) h[i] = bf16_to_f32((uint16_t) (src[2 * i] | (src[2 * i + 1] << 8)));
@@ -1141,6 +1171,15 @@ float* upload_f32(const lamina::TensorInfo& t, const uint8_t* src) {
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
     } else {
+        return false;
+    }
+    return true;
+}
+
+/// A tensor as f32 on the device (F32 as it is, BF16 / F16 widened).
+float* upload_f32(const lamina::TensorInfo& t, const uint8_t* src) {
+    std::vector<float> h;
+    if (!tensor_floats(t, src, h)) {
         std::fprintf(stderr, "lamina: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
         throw Fatal{1};
     }
@@ -1168,8 +1207,9 @@ uint64_t buffer_bytes_per_row(const Model& m) {
 /// less the engine's buffers at a `chunk`-token prompt chunk and 1.5 GiB: a layer's tensors, the attention layers'
 /// K / V at `ctx` cells; the first stage's the embedding, the last's the head and the MTP block) but a layer for each
 /// later stage, and the last the rest. A model with experts that no split holds runs on the first GPU alone (hybrid).
+/// `lora`: the adapters' bytes per block (the MTP block at n_layers), the head's at n_layers + 1.
 bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& devs, const std::vector<int>& split,
-                 int ctx, int chunk, std::string& err) {
+                 int ctx, int chunk, const std::vector<uint64_t>& lora, std::string& err) {
     const auto& g = m.g;
     const size_t nl = (size_t) g.n_layers;
     m.stage_dev = devs;
@@ -1215,6 +1255,7 @@ bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& 
     const uint64_t kv = (uint64_t) g.n_head_kv * m.kv_row() * 2 * (uint64_t) ctx;
     for (size_t l = 0; l <= nl; ++l)
         if (l == nl ? g.n_mtp_layers > 0 : lamina::core::is_qsa_layer(g, (int64_t) l)) cost[l] += kv;
+    for (size_t l = 0; l < lora.size() && l <= nl + 1; ++l) (l <= nl ? cost[l] : tail) += lora[l];
     tail += cost[nl];
     const uint64_t overhead = ((uint64_t) 3 << 29) + (uint64_t) chunk * buffer_bytes_per_row(m);
     std::vector<uint64_t> room(devs.size());
@@ -1277,8 +1318,273 @@ bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& 
     return false;
 }
 
+// ------------------------------------------------------------------------------------------------ LoRA adapters
+/// --lora / --lora-scaled: a file and its scale at the start
+struct LoraSpec {
+    std::string path;
+    float scale = 1.f;
+};
+
+/// An adapter's pair: its product's tensor name, its lora_a [n_in, rank] and lora_b [rank, n_out]
+struct LoraPair {
+    std::string name;
+    const lamina::TensorInfo* a = nullptr;
+    const lamina::TensorInfo* b = nullptr;
+};
+
+/// An adapter file read as llama.cpp reads one: general.type "adapter", adapter.type "lora" (an activated LoRA, with
+/// invocation tokens, refused), the architecture `arch` (empty: not checked); its alpha, task name and prompt prefix,
+/// and its pairs (each .lora_a with its .lora_b; the norms' vectors left out, as llama.cpp leaves them).
+bool lora_read(const lamina::GgufFile& f, const std::string& arch, LoraAdapter& ad, std::vector<LoraPair>& pairs,
+               std::string& err) {
+    auto str = [&](const char* k) -> std::string {
+        const lamina::MetaValue* v = f.get(k);
+        return v != nullptr && v->type == lamina::MetaType::STRING ? v->s : "";
+    };
+    const std::string at = f.path() + ": ";
+    if (str("general.type") != "adapter") {
+        err = at + "general.type is '" + str("general.type") + "', not 'adapter' (a LoRA adapter's GGUF)";
+        return false;
+    }
+    if (str("adapter.type") != "lora") {
+        err = at + "adapter.type is '" + str("adapter.type") + "', not 'lora'";
+        return false;
+    }
+    if (!arch.empty() && str("general.architecture") != arch) {
+        err = at + "an adapter of " + str("general.architecture") + ", the model is " + arch;
+        return false;
+    }
+    if (f.get("adapter.alora.invocation_tokens") != nullptr) {
+        err = at + "an activated LoRA (aLoRA), which this path does not run";
+        return false;
+    }
+    if (const lamina::MetaValue* v = f.get("adapter.lora.alpha"); v != nullptr && v->is_num()) ad.alpha = (float) v->num();
+    ad.task_name = str("adapter.lora.task_name");
+    ad.prompt_prefix = str("adapter.lora.prompt_prefix");
+    std::map<std::string, LoraPair> by;
+    for (const lamina::TensorInfo& t : f.tensors()) {
+        const std::string& n = t.name;
+        auto ends = [&](const char* s) {
+            const size_t k = std::strlen(s);
+            return n.size() > k && n.compare(n.size() - k, k, s) == 0;
+        };
+        if (ends(".lora_a") || ends(".lora_b")) {
+            LoraPair& p = by[n.substr(0, n.size() - 7)];
+            p.name = n.substr(0, n.size() - 7);
+            (ends(".lora_a") ? p.a : p.b) = &t;
+        } else if (!ends("_norm.weight")) {   // (norms' vectors: left out)
+            err = at + "the tensor " + n + " has an unexpected suffix";
+            return false;
+        }
+    }
+    pairs.clear();
+    for (auto& [name, p] : by) {
+        if (p.a == nullptr || p.b == nullptr) {
+            err = at + "the pair of " + name + " lacks its " + (p.a ? "lora_b" : "lora_a");
+            return false;
+        }
+        if (p.a->shape.size() != 2 || p.b->shape.size() != 2 || p.a->shape[1] != p.b->shape[0] || p.a->shape[1] == 0) {
+            err = at + name + ": lora_a and lora_b do not pair (an adapter of llama.cpp's old finetune example?)";
+            return false;
+        }
+        for (const lamina::TensorInfo* t : {p.a, p.b})
+            if (t->type != 0 && t->type != 1 && t->type != 8 && t->type != 30) {
+                err = at + t->name + " is " + t->type_name() + ": F32, F16, BF16 or Q8_0 pairs only";
+                return false;
+            }
+        pairs.push_back(p);
+    }
+    if (pairs.empty()) {
+        err = at + "no LoRA pairs";
+        return false;
+    }
+    return true;
+}
+
+int lora_rank_pad(int r) { return (r + q36lora::kGroup - 1) / q36lora::kGroup * q36lora::kGroup; }
+/// a pair kept in F32 (a part in F32 or BF16) or F16 (both in F16 or Q8_0)
+bool lora_f32(const LoraPair& p) { return p.a->type == 0 || p.a->type == 30 || p.b->type == 0 || p.b->type == 30; }
+uint64_t lora_pair_bytes(const LoraPair& p) {
+    return (p.a->shape[0] + p.b->shape[1]) * (uint64_t) lora_rank_pad((int) p.a->shape[1]) * (lora_f32(p) ? 4 : 2);
+}
+/// blk.N's N (the MTP block's too), else -1
+int64_t lora_block(const std::string& name) {
+    return name.rfind("blk.", 0) == 0 ? std::strtoll(name.c_str() + 4, nullptr, 10) : -1;
+}
+
+/// The adapters' bytes on the GPUs per block (the MTP block at n_layers), the head's at n_layers + 1: the split's plan.
+bool lora_scan(const std::vector<LoraSpec>& specs, int64_t n_layers, std::vector<uint64_t>& cost, std::string& err) {
+    cost.assign((size_t) n_layers + 2, 0);
+    for (const LoraSpec& sp : specs) {
+        try {
+            const lamina::GgufFile f(sp.path);
+            LoraAdapter ad;
+            std::vector<LoraPair> pairs;
+            if (!lora_read(f, "", ad, pairs, err)) return false;
+            for (const LoraPair& p : pairs) {
+                const int64_t l = p.name == "output.weight" ? n_layers + 1 : lora_block(p.name);
+                if (l >= 0 && l <= n_layers + 1) cost[(size_t) l] += lora_pair_bytes(p);
+            }
+        } catch (const std::exception& e) {
+            err = sp.path + ": " + e.what();
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The product a pair adds to, by its tensor's name: the Mat's pairs slot (or the F32 alpha / beta product's), its GPU
+/// and widths; false with the reason for a name this path has no product for (llama.cpp's "does not exist in base
+/// model") or does not take an adapter's pair at (the embedding, the router, the routed experts).
+bool lora_target(Model& m, const std::string& name, const LoraMat**& slot, int& dev, int& n_in, int& n_out,
+                 std::string& why) {
+    const auto& g = m.g;
+    auto take = [&](Mat& w, int d) {
+        if (w.d == nullptr) {
+            why = "the model has no such tensor";
+            return false;
+        }
+        slot = &w.lora;
+        dev = d;
+        n_in = w.n_in;
+        n_out = w.n_out;
+        return true;
+    };
+    if (name == "output.weight") return take(m.head, m.stage_dev.back());
+    if (name == "token_embd.weight") {
+        why = "this path takes no pair for the embedding";
+        return false;
+    }
+    const int64_t l = lora_block(name);
+    const size_t dot = name.find('.', 4);
+    if (l < 0 || l > g.n_layers || (l == g.n_layers && !m.has_mtp) || dot == std::string::npos) {
+        why = "the model has no such tensor";
+        return false;
+    }
+    Layer& L = l == g.n_layers ? m.mtp : m.layers[(size_t) l];
+    const int d = m.dev_of(l);
+    const std::string s = name.substr(dot + 1);
+    if (s == "attn_qkv.weight") return take(L.qkv, d);
+    if (s == "attn_gate.weight") return take(L.zg, d);
+    if (s == "ssm_out.weight") return take(L.ssm_out, d);
+    if (s == "attn_q.weight") return take(L.wq, d);
+    if (s == "attn_k.weight") return take(L.wk, d);
+    if (s == "attn_v.weight") return take(L.wv, d);
+    if (s == "attn_output.weight") return take(L.wo, d);
+    if (s == "ffn_gate.weight") return take(L.ffn_gate, d);
+    if (s == "ffn_up.weight") return take(L.ffn_up, d);
+    if (s == "ffn_down.weight") return take(L.ffn_down, d);
+    if (s == "ffn_gate_shexp.weight") return take(L.sh_gate, d);
+    if (s == "ffn_up_shexp.weight") return take(L.sh_up, d);
+    if (s == "ffn_down_shexp.weight") return take(L.sh_down, d);
+    if (s == "nextn.eh_proj.weight" && l == g.n_layers) return take(m.eh_proj, d);
+    if ((s == "ssm_alpha.weight" || s == "ssm_beta.weight") && L.alpha != nullptr) {
+        slot = s == "ssm_alpha.weight" ? &L.lora_alpha : &L.lora_beta;
+        dev = d;
+        n_in = (int) g.n_embd;
+        n_out = (int) g.ssm_v_heads;
+        return true;
+    }
+    if (s.find("_exps.") != std::string::npos) why = "this path takes no pair for the routed experts";
+    else if (s.rfind("ffn_gate_inp", 0) == 0) why = "this path takes no pair for the router or the shared expert's gate";
+    else why = "the model has no such tensor";
+    return false;
+}
+
+/// floats to the current GPU: in F32, or rounded to F16
+void* lora_upload(const std::vector<float>& v, bool f32) {
+    void* d = nullptr;
+    if (f32) {
+        CK(dmalloc(&d, v.size() * 4));
+        CK(cudaMemcpy(d, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+        return d;
+    }
+    std::vector<__half> h(v.size());
+    for (size_t i = 0; i < v.size(); ++i) h[i] = __float2half_rn(v[i]);
+    CK(dmalloc(&d, h.size() * 2));
+    CK(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+    return d;
+}
+
+/// --lora's files onto the loaded model: each pair checked against its product (llama.cpp's checks) and placed on the
+/// product's GPU, its rank padded to whole groups.
+bool load_loras(Model& m, const std::vector<LoraSpec>& specs, std::string& err) {
+    const std::string arch = lamina::model_family_arch(m.g.family);
+    std::map<const LoraMat**, LoraMat*> made;   // a product's pairs, the files adding to them in their order
+    std::vector<float> fa, fb;
+    for (size_t ai = 0; ai < specs.size(); ++ai) {
+        const auto t0 = Clock::now();
+        try {
+            const lamina::GgufFile f(specs[ai].path);
+            LoraAdapter ad;
+            ad.path = specs[ai].path;
+            std::vector<LoraPair> pairs;
+            if (!lora_read(f, arch, ad, pairs, err)) return false;
+            for (const LoraPair& p : pairs) {
+                const LoraMat** slot = nullptr;
+                int dev = 0, n_in = 0, n_out = 0;
+                std::string why;
+                if (!lora_target(m, p.name, slot, dev, n_in, n_out, why)) {
+                    err = ad.path + ": " + p.name + ": " + why;
+                    return false;
+                }
+                const int rank = (int) p.a->shape[1], rp = lora_rank_pad(rank);
+                if ((int64_t) p.a->shape[0] != n_in || (int64_t) p.b->shape[1] != n_out) {
+                    err = ad.path + ": " + p.name + " is " + std::to_string(n_in) + " x " + std::to_string(n_out) +
+                          " in the model, its pair " + std::to_string(p.a->shape[0]) + " x " +
+                          std::to_string(p.b->shape[1]) +
+                          " (an adapter of another model?)";
+                    return false;
+                }
+                if (n_in % 8 != 0 || rp > q36lora::kMaxR) {
+                    err = ad.path + ": " + p.name + ": rank " + std::to_string(rank) + " over " + std::to_string(n_in) +
+                          " inputs (ranks up to " + std::to_string(q36lora::kMaxR) + ", inputs a multiple of 8)";
+                    return false;
+                }
+                if (!tensor_floats(*p.a, f.tensor_data(*p.a), fa) || !tensor_floats(*p.b, f.tensor_data(*p.b), fb)) {
+                    err = ad.path + ": " + p.name + ": an unreadable pair";
+                    return false;
+                }
+                // A [rank][n_in] -> [rp][n_in] (zero rows); B [n_out][rank] -> [n_out][rp] (zero columns)
+                std::vector<float> pa((size_t) rp * n_in, 0.f), pb((size_t) n_out * rp, 0.f);
+                std::memcpy(pa.data(), fa.data(), (size_t) rank * n_in * 4);
+                for (int j = 0; j < n_out; ++j) std::memcpy(&pb[(size_t) j * rp], &fb[(size_t) j * rank], (size_t) rank * 4);
+                LoraSeg sg;
+                sg.adapter = (int) ai;
+                sg.rank = rp;
+                sg.rank_true = (float) rank;
+                sg.f32 = lora_f32(p);
+                CK(cudaSetDevice(dev));
+                sg.a = lora_upload(pa, sg.f32);
+                sg.b = lora_upload(pb, sg.f32);
+                ad.bytes += (pa.size() + pb.size()) * (sg.f32 ? 4 : 2);
+                LoraMat*& lm = made[slot];
+                if (lm == nullptr) {
+                    m.lora_mats.emplace_back();
+                    lm = &m.lora_mats.back();
+                    *slot = lm;
+                }
+                lm->segs.push_back(sg);
+                ad.rank_min = ad.pairs ? std::min(ad.rank_min, rank) : rank;
+                ad.rank_max = std::max(ad.rank_max, rank);
+                ++ad.pairs;
+            }
+            std::fprintf(stderr, "lamina: LoRA adapter %zu: %s: %d pairs, rank %d%s%s, alpha %g, %.1f MiB on the GPUs in "
+                         "%.1f s\n", ai, ad.path.c_str(), ad.pairs, ad.rank_min, ad.rank_max != ad.rank_min ? " to " : "",
+                         ad.rank_max != ad.rank_min ? std::to_string(ad.rank_max).c_str() : "", (double) ad.alpha,
+                         (double) ad.bytes / 1048576.0, ms_since(t0) / 1000.0);
+            m.loras.push_back(std::move(ad));
+        } catch (const std::exception& e) {
+            err = specs[ai].path + ": " + e.what();
+            return false;
+        }
+    }
+    CK(cudaSetDevice(m.stage_dev.front()));
+    return true;
+}
+
 bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, const std::vector<int>& devs,
-          const std::vector<int>& split, int ctx, int chunk) {
+          const std::vector<int>& split, int ctx, int chunk, const std::vector<LoraSpec>& lora_specs) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<lamina::GgufModel>(lamina::GgufModel::open(path));
     const lamina::GgufModel& gm = *m.file;
@@ -1301,7 +1607,9 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
     if (const lamina::MetaValue* v = gm.meta().get(p + "attention.layer_norm_rms_epsilon")) m.eps = (float) v->num();
     if (const lamina::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();
     if (const lamina::MetaValue* v = gm.meta().get(p + "rope.dimension_count")) m.n_rot = (int) v->u;
-    if (!plan_stages(m, gm, devs, split, ctx, chunk, err)) return false;
+    std::vector<uint64_t> lora_cost;
+    if (!lora_scan(lora_specs, m.g.n_layers, lora_cost, err)) return false;
+    if (!plan_stages(m, gm, devs, split, ctx, chunk, lora_cost, err)) return false;
     uint64_t bytes = 0;
     auto find = [&](const std::string& name, size_t& s) -> const lamina::TensorInfo* {
         const lamina::TensorInfo* t = gm.find(name, &s);
@@ -1446,7 +1754,7 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, co
     std::fprintf(stderr, "lamina: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
                  ms_since(t0) / 1000.0);
-    return true;
+    return load_loras(m, lora_specs, err);
 }
 
 /// Expert e of layer L as its native blob [gate | up | down] (L.L.bytes) at dst (host memory).
@@ -1511,12 +1819,20 @@ struct Engine {
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
     // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
-    // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
+    // (the graphs hold the current session's state pointers as kernel arguments: one set per session, and one more for
+    // the passes that apply an adapter, whose LoRA kernels read the rows' scales from the device)
     struct GSet {
         cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
     };
     std::vector<GSet> gsets;
-    GSet& gs() { return gsets[(size_t) cur]; }
+    GSet& gs() { return gsets[(size_t) cur * 2 + (lora_live ? 1 : 0)]; }
+    // ---- LoRA adapters (Model::loras): the pass's rows' scales on this stage's GPU, the A stage's partials and t
+    int n_ad = 0;
+    bool lora_live = false;               // a row of the pass uses an adapter (the LoRA graphs, lora_site runs)
+    float* d_lscale = nullptr;            // [kVerify][n_ad] each row's scale of each adapter
+    std::vector<float> h_lscale;          // what d_lscale holds
+    float *l_part = nullptr, *l_t = nullptr, *l_dab = nullptr;   // the A stage's partials, a prompt GEMM's t, the GDN deltas
+    std::vector<float> lora_default;      // stage 0: a request's scales when it names none (--lora's, --lora-scaled's)
     lamina::prefill::Gemm gemm;
     cublasHandle_t blas = nullptr;
     static constexpr int kSplitK = 16;
@@ -1586,6 +1902,7 @@ struct Engine {
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
         std::vector<int32_t> live;          // the tokens whose state it holds (cell i = live[i])
         std::vector<ImgKey> imgs;           // the pictures among them
+        std::vector<float> lora;            // the adapters' scales its state was read with (its request's; stage 0's)
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
     };
@@ -1866,7 +2183,16 @@ struct Engine {
             p_draft = dalloc(1);
         }
         sess.resize((size_t) n_sess);
-        gsets.resize((size_t) n_sess);
+        gsets.resize((size_t) n_sess * 2);
+        n_ad = (int) m->loras.size();
+        if (n_ad > 0) {
+            d_lscale = dalloc((size_t) kVerify * n_ad);
+            h_lscale.assign((size_t) kVerify * n_ad, 0.f);
+            const size_t ks_max = (size_t) (max_in + q36lora::kChunk - 1) / q36lora::kChunk;
+            l_part = dalloc(ks_max * kVerify * q36lora::kMaxR);
+            l_t = dalloc(T * q36lora::kMaxR);   // a prompt chunk's t (one pair a GEMM)
+            l_dab = dalloc((size_t) kVerify * 2 * g.ssm_v_heads);
+        }
         {   // the sessions' caches: said before they fail (a slot's K / V at the context, in the --kv format, for the
             // attention layers and the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
@@ -2365,6 +2691,147 @@ struct Engine {
         }
     }
 
+    // ---- LoRA adapters
+    /// The scales of the pass's rows on every stage: row r's are session rows[r]'s (its request's), every row's the current
+    /// session's when `rows` is null; lora_live when a row uses an adapter.  Before the pass (a table that changed is an
+    /// upload, not a graph's node).
+    void lora_rows(const int* rows, int T) {
+        if (n_ad == 0) return;
+        std::vector<float> tab((size_t) kVerify * n_ad, 0.f);
+        bool live = false;
+        for (int r = 0; r < kVerify; ++r) {
+            const int s_ = rows == nullptr ? cur : r < T ? rows[r] : -1;
+            if (s_ < 0) continue;
+            const std::vector<float>& sc = sess[(size_t) s_].lora;
+            for (int a = 0; a < n_ad && a < (int) sc.size(); ++a) {
+                tab[(size_t) r * n_ad + a] = sc[(size_t) a];
+                live = live || sc[(size_t) a] != 0.f;
+            }
+        }
+        for_each([&](Engine& e) {
+            e.lora_live = live;
+            if (tab == e.h_lscale) return;
+            e.h_lscale = tab;
+            CK(cudaMemcpyAsync(e.d_lscale, e.h_lscale.data(), tab.size() * 4, cudaMemcpyHostToDevice, e.st));
+        });
+    }
+    /// one product of a site: its pairs (null: none) and its output [T][ld] (its first n columns)
+    struct LoraOut {
+        const LoraMat* lm;
+        float* y;
+        int ld, n;
+    };
+    /// The adapters of a site - up to three products that read one input, x [T][ldx] of n_in (with u: SwiGLU(x, u), the
+    /// down product's decode input) - added into the products' outputs, after them: a decode batch's launch pairs (the A
+    /// stage, then the B stage), a prompt chunk's GEMMs.  `assign` (decode only): the outputs take the sum alone, zeros
+    /// where no pair is (the GDN alpha / beta deltas).  Nothing without an adapter in the pass.
+    void lora_site(const float* xin, const float* u, int ldx, int n_in, int T, std::initializer_list<LoraOut> outs,
+                   bool assign = false) {
+        if (!lora_live || T <= 0) return;
+        bool any = false;
+        for (const LoraOut& o : outs) any = any || o.lm != nullptr;
+        if (!any) return;
+        if (T > kGemmT) {
+            lora_gemms(xin, ldx, n_in, T, outs);
+            return;
+        }
+        static const int kslice = [] {   // a K split's elements (LAMINA_Q36_LORA_KSLICE: A/B, up to kSliceMax)
+            const char* v = std::getenv("LAMINA_Q36_LORA_KSLICE");
+            const int k = v ? std::atoi(v) : q36lora::kSliceMax;
+            return std::min(q36lora::kSliceMax, std::max(1, k / q36lora::kChunk) * q36lora::kChunk);
+        }();
+        q36lora::Site s;
+        s.x = xin;
+        s.u = u;
+        s.ldx = ldx;
+        s.n_in = n_in;
+        s.kslice = kslice;
+        s.ks = (n_in + kslice - 1) / kslice;
+        s.T = T;
+        s.n_ad = n_ad;
+        s.scale = d_lscale;
+        s.part = l_part;
+        auto launch = [&] {
+            for (int m_ = 0; m_ < s.n_mem; ++m_) s.ob[m_ + 1] = s.ob[m_] + (s.n_out[m_] + 255) / 256;
+            q36lora::k_lora_a<<<dim3((unsigned) s.n_groups, (unsigned) s.ks), 256, 0, st>>>(s);
+            q36lora::k_lora_b<<<(unsigned) s.ob[s.n_mem], 256, 0, st>>>(s);
+            s.n_seg = s.n_groups = s.R = s.n_mem = 0;
+        };
+        if (assign)   // the deltas alone: zeros, the pairs then added
+            for (const LoraOut& o : outs)
+                CK(cudaMemset2DAsync(o.y, (size_t) o.ld * 4, 0, (size_t) o.n * 4, (size_t) T, st));
+        // the members in order, a launch taking their pairs while kMaxSeg pairs, kMaxR ranks and 3 members hold them
+        for (const LoraOut& o : outs) {
+            if (o.lm == nullptr) continue;
+            const std::vector<LoraSeg>& segs = o.lm->segs;
+            for (size_t i = 0; i < segs.size();) {
+                if (s.n_mem == 3 || s.n_seg == q36lora::kMaxSeg || s.R + segs[i].rank > q36lora::kMaxR) launch();
+                const int mi = s.n_mem++;
+                s.out[mi] = o.y;
+                s.ld_out[mi] = o.ld;
+                s.n_out[mi] = o.n;
+                for (; i < segs.size() && s.n_seg < q36lora::kMaxSeg && s.R + segs[i].rank <= q36lora::kMaxR; ++i) {
+                    const LoraSeg& pr = segs[i];
+                    q36lora::Seg& d = s.seg[s.n_seg++];
+                    d.a = pr.a;
+                    d.b = pr.b;
+                    d.alpha = m->loras[(size_t) pr.adapter].alpha;
+                    d.rank_true = pr.rank_true;
+                    d.rank = pr.rank;
+                    d.r0 = s.R;
+                    d.adapter = pr.adapter;
+                    d.member = mi;
+                    d.f32 = pr.f32 ? 1 : 0;
+                    d.g0 = s.n_groups;
+                    s.R += pr.rank;
+                    s.n_groups += pr.rank / q36lora::kGroup;
+                }
+            }
+        }
+        if (s.n_mem > 0) launch();
+    }
+    /// A prompt chunk's pairs as GEMMs (cuBLAS, FP32 accumulation): t = A x per pair, then out += s B t; the scales of the
+    /// table's first row (a prompt is one request's: every row holds them).
+    void lora_gemms(const float* xin, int ldx, int n_in, int T, std::initializer_list<LoraOut> outs) {
+        const float* sc = h_lscale.data();
+        bool f16_ready = false;
+        auto ok = [](cublasStatus_t e) {
+            if (e != CUBLAS_STATUS_SUCCESS) {
+                std::fprintf(stderr, "lamina: a LoRA GEMM failed (cuBLAS status %d)\n", (int) e);
+                throw Fatal{1};
+            }
+        };
+        for (const LoraOut& o : outs) {
+            if (o.lm == nullptr) continue;
+            for (const LoraSeg& pr : o.lm->segs) {
+                const float us = sc[(size_t) pr.adapter];
+                if (us == 0.f) continue;
+                const float scale = q36lora::pair_scale(us, m->loras[(size_t) pr.adapter].alpha, pr.rank_true);
+                const float one = 1.f, zero = 0.f;
+                if (pr.f32) {
+                    ok(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, pr.rank, T, n_in, &one, (const float*) pr.a, n_in,
+                                   xin, ldx, &zero, l_t, pr.rank));
+                    ok(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, o.n, T, pr.rank, &scale, (const float*) pr.b,
+                                   pr.rank, l_t, pr.rank, &one, o.y, o.ld));
+                    continue;
+                }
+                if (!f16_ready) {   // the input in FP16 once for the site's F16 pairs (x16: the prompt GEMMs' buffer)
+                    if (!(xin == px && p16 && pn == n_in)) {
+                        const int64_t total = (int64_t) T * n_in;
+                        q36lora::k_lora_f16<<<(unsigned) ((total + 255) / 256), 256, 0, st>>>(xin, ldx, x16, n_in, total);
+                        p16 = xin == px && pn == n_in && ldx == n_in;   // x16 holds the projections' input again, or not
+                    }
+                    f16_ready = true;
+                }
+                __half* t16 = (__half*) l_t;
+                ok(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, pr.rank, T, n_in, &one, pr.a, CUDA_R_16F, n_in, x16,
+                                CUDA_R_16F, n_in, &zero, t16, CUDA_R_16F, pr.rank, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                ok(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, o.n, T, pr.rank, &scale, pr.b, CUDA_R_16F, pr.rank, t16,
+                                CUDA_R_16F, pr.rank, &one, o.y, CUDA_R_32F, o.ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            }
+        }
+    }
+
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
@@ -2383,12 +2850,21 @@ struct Engine {
             prep_in(T);
             apply(L.qkv, xq, qkv_b, T);
             apply(L.zg, xq, z, T);
+            lora_site(h, nullptr, N, N, T, {{L.qkv.lora, qkv_b, L.qkv.n_out, L.qkv.n_out},
+                                            {L.zg.lora, z, L.zg.n_out, L.zg.n_out}});
             if (T <= kGemmT) {
+                const float* dab = nullptr;   // the adapters' alpha / beta deltas, added before the epilogues
+                if (lora_live && (L.lora_alpha != nullptr || L.lora_beta != nullptr)) {
+                    lora_site(h, nullptr, N, N, T,
+                              {{L.lora_alpha, l_dab, 2 * HV, HV}, {L.lora_beta, l_dab + HV, 2 * HV, HV}}, true);
+                    dab = l_dab;
+                }
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
-                                                                      HV);
+                                                                      HV, dab);
             } else {
                 f32mm(L.alpha, h, al_b, N, HV, T);
                 f32mm(L.beta, h, be_b, N, HV, T);
+                lora_site(h, nullptr, N, N, T, {{L.lora_alpha, al_b, HV, HV}, {L.lora_beta, be_b, HV, HV}});
                 k_gdn_gb<<<grid1((int64_t) HV * T), kThreads, 0, st>>>(al_b, L.dt, L.ssm_a, be_b, HV, T);
             }
             if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
@@ -2416,11 +2892,14 @@ struct Engine {
                 }
             }
             mm(L.ssm_out, gdn_y, y, T);
+            lora_site(gdn_y, nullptr, L.ssm_out.n_in, L.ssm_out.n_in, T, {{L.ssm_out.lora, y, N, N}});
         } else {
             prep_in(T);
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
+            lora_site(h, nullptr, N, N, T, {{L.wq.lora, qg, L.wq.n_out, L.wq.n_out}, {L.wk.lora, kx, L.wk.n_out, L.wk.n_out},
+                                            {L.wv.lora, vx, L.wv.n_out, L.wv.n_out}});
             RowSel rs;
             if (rows_mode) {
                 rs.cell = d_rcell;
@@ -2453,6 +2932,7 @@ struct Engine {
                 }
             }
             mm(L.wo, att, y, T);
+            lora_site(att, nullptr, L.wo.n_in, L.wo.n_in, T, {{L.wo.lora, y, N, N}});
         }
         add_rms_post(L, T);
         if (!m->moe) {
@@ -2519,18 +2999,24 @@ struct Engine {
         // the shared expert, scaled by sigmoid(w . h)
         if (T > kGemmT) prep(h, N, T, xq);
         if (T <= kGemmT) {
-            if (!shared_gu(L, T)) {
+            // (an adapter's pairs need the gate and up products themselves: no fused gate + up + SwiGLU then)
+            const bool sh_lora = lora_live && (L.sh_gate.lora || L.sh_up.lora || L.sh_down.lora);
+            if (sh_lora || !shared_gu(L, T)) {
                 apply(L.sh_gate, xq, sg, T);
                 apply(L.sh_up, xq, su, T);
+                lora_site(h, nullptr, N, N, T, {{L.sh_gate.lora, sg, FS, FS}, {L.sh_up.lora, su, FS, FS}});
                 K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);   // SwiGLU and its q8_1 image in one launch
                 il_stale(q8);
             }
             mmq(L.sh_down, q8, sy, T);
+            lora_site(sg, su, FS, FS, T, {{L.sh_down.lora, sy, N, N}});
         } else {
             apply(L.sh_gate, xq, sg, T);
             apply(L.sh_up, xq, su, T);
+            lora_site(h, nullptr, N, N, T, {{L.sh_gate.lora, sg, FS, FS}, {L.sh_up.lora, su, FS, FS}});
             k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
             mm(L.sh_down, shh, sy, T);
+            lora_site(shh, nullptr, FS, FS, T, {{L.sh_down.lora, sy, N, N}});
         }
         if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
@@ -2546,15 +3032,19 @@ struct Engine {
             if (!xq_post) quant(h, N, T, xq);
             apply(L.ffn_gate, xq, sg, T);
             apply(L.ffn_up, xq, su, T);
+            lora_site(h, nullptr, N, N, T, {{L.ffn_gate.lora, sg, FF, FF}, {L.ffn_up.lora, su, FF, FF}});
             K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);   // SwiGLU and its q8_1 image in one launch
-            il_stale(q8);
+            il_stale(q8);   // SwiGLU(gate, up), as the product
             mmq(L.ffn_down, q8, sy, T);
+            lora_site(sg, su, FF, FF, T, {{L.ffn_down.lora, sy, N, N}});   // SwiGLU(gate, up), as the product
         } else {
             prep(h, N, T, xq);
             apply(L.ffn_gate, xq, sg, T);
             apply(L.ffn_up, xq, su, T);
+            lora_site(h, nullptr, N, N, T, {{L.ffn_gate.lora, sg, FF, FF}, {L.ffn_up.lora, su, FF, FF}});
             k_swiglu<<<grid1((int64_t) T * FF), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FF);
             mm(L.ffn_down, shh, sy, T);
+            lora_site(shh, nullptr, FF, FF, T, {{L.ffn_down.lora, sy, N, N}});
         }
         xq_ready = false;
         k_add_rms<<<T, kThreads, 0, st>>>(x, sy, wn, hout, N, m->eps);
@@ -2630,6 +3120,7 @@ struct Engine {
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
         const auto& g = m->g;
         mm(m->head, hn, lg, n);
+        lora_site(hn, nullptr, (int) g.n_embd, (int) g.n_embd, n, {{m->head.lora, lg, (int) g.n_vocab, (int) g.n_vocab}});
         k_argmax<<<dim3(kArgBlocks, n), kThreads, 0, st>>>(lg, (int) g.n_vocab, pk, amv, ami, false);
         k_argmax<<<dim3(1, n), kThreads, 0, st>>>(lg, kArgBlocks, pk, amv, ami, true);
     }
@@ -2650,7 +3141,7 @@ struct Engine {
             head_rows(hn, 1, logits_m, pick_m);
             if (draft_min_p > 0.f) k_pmax<<<1, 1024, 0, st>>>(logits_m, (int) g.n_vocab, p_draft);
             return;
-        }
+        }   // (B's first draft_n rows)
         quant(hn, N, 1, q8);
         if (fast_k && draft_n % 8 == 0 && hd.type == 8 && hd.n_in == N && N / 32 == 64) {
             q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, q8, logits_m, 64, draft_n, st);
@@ -2659,6 +3150,7 @@ struct Engine {
             sub.n_out = draft_n;
             mmq(sub, q8, logits_m, 1);
         }
+        lora_site(hn, nullptr, N, N, 1, {{hd.lora, logits_m, draft_n, draft_n}});   // (B's first draft_n rows)
         k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits_m, draft_n, pick_m, amv, ami, false);
         k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits_m, kArgBlocks, pick_m, amv, ami, true);
         if (draft_min_p > 0.f) k_pmax<<<1, 1024, 0, st>>>(logits_m, draft_n, p_draft);
@@ -2676,6 +3168,7 @@ struct Engine {
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
         k_rms_ld<<<T, kThreads, 0, st>>>(seeds, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);      // [... | h]
         mm(m->eh_proj, mtp_cat, x, T);
+        lora_site(mtp_cat, nullptr, 2 * N, 2 * N, T, {{m->eh_proj.lora, x, N, N}});
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
         layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
         if (draft) head_draft(hmtp + (size_t) (T - 1) * N);
@@ -2967,6 +3460,7 @@ struct Engine {
     /// after every chunk; false ends the read there (a cancelled request): the tokens processed are returned.
     template <class F> int64_t process(const int32_t* toks, int64_t n, F on_chunk_) {
         const int N = (int) m->g.n_embd;
+        lora_rows(nullptr, 0);   // the current session's adapters
         auto on_chunk = [&](int64_t done) -> bool {   // a callback returning void never cancels
             if constexpr (std::is_void_v<decltype(on_chunk_(done))>) {
                 on_chunk_(done);
@@ -3070,7 +3564,7 @@ struct Engine {
 
     void run_graph_key(int key, const std::function<void()>& body) {
         if (!use_graph) { body(); return; }
-        graph_run(row_graphs[key], body);
+        graph_run(row_graphs[key + (lora_live ? 100000 : 0)], body);   // (the LoRA kernels: graphs of their own)
     }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
@@ -3081,6 +3575,7 @@ struct Engine {
         CK(cudaStreamSynchronize(st));   // the pinned staging is free again
         int64_t pmax = 0;
         int T = 0;
+        int row_sess[kVerify];
         for (int g = 0; g < G; ++g) {
             const Sess& ss = sess[(size_t) gr[g].slot];
             hrow[40 + g] = gr[g].slot;
@@ -3091,10 +3586,12 @@ struct Engine {
                 hrow[8 + T] = (int32_t) (ss.pos + j);
                 hrow[16 + T] = gr[g].slot;
                 hrow[24 + T] = ss.rdelta;
+                row_sess[T] = gr[g].slot;
                 ++T;
             }
             pmax = std::max<int64_t>(pmax, ss.pos + gr[g].n - 1);
         }
+        lora_rows(row_sess, T);   // each row its own request's adapters
         CK(cudaMemcpyAsync(tok, hrow, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_rcell, hrow + 8, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_rslot, hrow + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
@@ -3172,6 +3669,9 @@ struct Engine {
         sess[(size_t) cur].pos = pos;
         CK(cudaStreamSynchronize(st));
         int64_t pmax = 0;
+        int row_sess[kVerify];
+        for (int r = 0; r < T; ++r) row_sess[r] = rows[r].slot;
+        lora_rows(row_sess, T);
         for (int r = 0; r < T; ++r) {
             hrow[r] = rows[r].tok;
             hrow[8 + r] = (int32_t) rows[r].cell;
@@ -3196,9 +3696,11 @@ struct Engine {
             k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);                 // [e | ...]
             k_rms_ld<<<T, kThreads, 0, st>>>(mtp_seed(), N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);   // [... | h]
             mm(m->eh_proj, mtp_cat, x, T);
+            lora_site(mtp_cat, nullptr, 2 * N, 2 * N, T, {{m->eh_proj.lora, x, N, N}});
             k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
             layer(m->mtp, m->layers.size(), T, pmax, pos0_m, graphed, false, m->mtp_shnorm, hmtp);
             mm(m->head, hmtp, logits_mr, T);
+            lora_site(hmtp, nullptr, N, N, T, {{m->head.lora, logits_mr, (int) g.n_vocab, (int) g.n_vocab}});
             k_argmax<<<dim3(kArgBlocks, T), kThreads, 0, st>>>(logits_mr, (int) g.n_vocab, pick_mr, amv, ami, false);
             k_argmax<<<dim3(1, T), kThreads, 0, st>>>(logits_mr, kArgBlocks, pick_mr, amv, ami, true);
         };
@@ -3247,6 +3749,7 @@ struct Engine {
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
+        b.lora = a.lora;
         if (dst == cur) load_cur();
     }
     int hybrid_swaps_after_prompt = 2048;
@@ -3264,6 +3767,7 @@ struct Engine {
                   const std::atomic<bool>* cancel = nullptr) {
         const int N = (int) m->g.n_embd;
         Engine& L = *lst;   // the MTP block, the picks and hlast are the last stage's
+        lora_rows(nullptr, 0);
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         sync_all();
@@ -3346,22 +3850,37 @@ struct Engine {
         warming = true;
         const int32_t filler = 198;   // a newline: any token works
         std::vector<int32_t> toks((size_t) tmax, filler);
-        process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
-        if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
-        process(&filler, 1, [](int64_t) {});
-        if (mtp_d > 0) {
-            std::vector<int32_t> fix, drafts;
-            int32_t picks[16];
-            spec_step(filler, fix, mtp_d, drafts, picks);
+        // with adapters, the steps twice: without them and with them (their graphs are others; the scales --lora gave,
+        // or 1 each where they start at 0)
+        const std::vector<float> keep = sess[(size_t) cur].lora;
+        for (int round = 0; round < (n_ad > 0 ? 2 : 1); ++round) {
+            if (n_ad > 0) {
+                std::vector<float> w((size_t) n_ad, 0.f);
+                if (round == 1)
+                    for (int a = 0; a < n_ad; ++a)
+                        w[(size_t) a] = lora_default[(size_t) a] != 0.f ? lora_default[(size_t) a] : 1.f;
+                sess[(size_t) cur].lora = w;
+                reset();
+            }
+            process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
+            if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
+            process(&filler, 1, [](int64_t) {});
+            if (mtp_d > 0) {
+                std::vector<int32_t> fix, drafts;
+                int32_t picks[16];
+                spec_step(filler, fix, mtp_d, drafts, picks);
+            }
         }
+        sess[(size_t) cur].lora = keep;
         sync_all();
         warming = false;
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         hy_cpu = hy_gpu = hy_swaps = 0;
         hy_cpu_ms = 0;
         reset();
-        std::fprintf(stderr, "lamina: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
-                     ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
+        std::fprintf(stderr, "lamina: warmed up in %.1f s (one prompt chunk, a decode step%s%s)\n",
+                     ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "",
+                     n_ad > 0 ? "; without the LoRA adapters and with them" : "");
     }
 
     int greedy() {
@@ -3657,6 +4176,24 @@ std::string build_images(const std::string& path, const std::vector<int32_t>& id
 
 // ------------------------------------------------------------------------------------------------ serve
 /// A batch slot: a session decoding (its next token is `x`, not yet in the state).
+/// s as the inside of a JSON string
+std::string json_escape(const std::string& s) {
+    std::string o;
+    for (const unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            o += '\\';
+            o += (char) c;
+        } else if (c < 0x20) {
+            char b[8];
+            std::snprintf(b, sizeof b, "\\u%04x", c);
+            o += b;
+        } else {
+            o += (char) c;
+        }
+    }
+    return o;
+}
+
 struct Slot {
     bool active = false, stop = false;
     int32_t x = 0;
@@ -3908,10 +4445,13 @@ struct Serve {
         }
     }
 
-    /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
-    size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+    /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, read with the
+    /// same adapters' scales (`lora`), else 0.
+    size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                     const std::vector<float>& lora) const {
         const size_t L = ss.live.size();
-        if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
+        if (L == 0 || L >= ids.size() || ss.lora != lora || !std::equal(ss.live.begin(), ss.live.end(), ids.begin()))
+            return 0;
         std::vector<ImgKey> in_live;
         for (const ImgKey& k : imgs) {
             if (k.cell + k.n <= (int64_t) L) in_live.push_back(k);
@@ -3922,13 +4462,14 @@ struct Serve {
 
     /// The session a request alone takes: the one holding the longest start of its prompt, else an empty one, else the
     /// least recently used (never a decoding slot).
-    int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+    int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                     const std::vector<float>& lora) const {
         int best = -1, free_empty = -1, lru = -1;
         size_t bl = 0;
         for (int i = 0; i < E.n_sess; ++i) {
             const Engine::Sess& ss = E.sess[(size_t) i];
             if (ss.active) continue;
-            const size_t l = match_len(ss, ids, imgs);
+            const size_t l = match_len(ss, ids, imgs, lora);
             if (l > bl) { bl = l; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
             if (lru < 0 || ss.used < E.sess[(size_t) lru].used) lru = i;
@@ -3958,6 +4499,8 @@ struct Serve {
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
         std::vector<uint64_t> img_keys;
+        std::vector<float> lsc = E.lora_default;   // the adapters' scales (lora=: the request's, in their order)
+        bool bad_lora = false;
         for (;;) {
             while (*p == ' ') ++p;
             const char* st0 = p;
@@ -3976,6 +4519,18 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "lora") {   // every adapter's scale, comma-separated in --lora's order (the ones left out: 0)
+                lsc.assign((size_t) E.n_ad, 0.f);
+                size_t k = 0;
+                for (const char* q = v; *q;) {
+                    char* qe = nullptr;
+                    const float s_ = std::strtof(q, &qe);
+                    if (qe == q || k >= lsc.size() || !std::isfinite(s_)) { bad_lora = true; break; }
+                    lsc[k++] = s_;
+                    q = *qe == ',' ? qe + 1 : qe;
+                    if (*qe != ',' && *qe != '\0') { bad_lora = true; break; }
+                }
+            }
             else if (key == "img_keys") {
                 const char* q = v;
                 img_keys.clear();
@@ -4013,6 +4568,10 @@ struct Serve {
         bool bad = false;
         for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) E.m->g.n_vocab;
         if (bad) { serve_print("ERR a token id is outside the vocabulary\n"); return; }
+        if (bad_lora) {
+            serve_print("ERR lora=: a scale for each of the %d LoRA adapters at most, comma-separated\n", E.n_ad);
+            return;
+        }
         ImgReq ir;
         if (geni) {
             const std::string ve = build_images(emb, ids, E.m->g.n_embd, img_keys, ir);
@@ -4020,19 +4579,19 @@ struct Serve {
         }
         stop.store(false);
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
-        const int s = adm ? slot : pick_session(ids, ir.imgs);
+        const int s = adm ? slot : pick_session(ids, ir.imgs, lsc);
         if (s < 0) {   // every session decodes in a slot: a request alone has none to run in
             serve_print("ERR every session is busy (batch slots decoding)\n");
             return;
         }
         Engine::Sess& ss = E.sess[(size_t) s];
-        size_t reuse = match_len(ss, ids, ir.imgs);
+        size_t reuse = match_len(ss, ids, ir.imgs, lsc);
         if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
             int src = -1;
             size_t best = reuse;
             for (int i = 0; i < E.n_sess; ++i) {
                 if (i == s || E.sess[(size_t) i].active) continue;
-                const size_t l = match_len(E.sess[(size_t) i], ids, ir.imgs);
+                const size_t l = match_len(E.sess[(size_t) i], ids, ir.imgs, lsc);
                 if (l > best) { best = l; src = i; }
             }
             if (src >= 0) {
@@ -4046,6 +4605,7 @@ struct Serve {
             ss.live.clear();
             ss.imgs.clear();
         }
+        ss.lora = lsc;   // the scales its state is read with from here (the same ones when it continues)
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
@@ -4195,6 +4755,13 @@ struct Serve {
 
     int run() {
         if (E.n_sess > 1) serve_print("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
+        for (size_t a = 0; a < E.m->loras.size(); ++a) {   // the adapters, for the server's /lora-adapters
+            const LoraAdapter& ad = E.m->loras[a];
+            serve_print("ADAPTER {\"id\":%zu,\"path\":\"%s\",\"scale\":%.9g,\"alpha\":%.9g,\"rank\":%d,\"pairs\":%d,"
+                        "\"task_name\":\"%s\",\"prompt_prefix\":\"%s\"}\n", a, json_escape(ad.path).c_str(),
+                        (double) E.lora_default[a], (double) ad.alpha, ad.rank_max, ad.pairs,
+                        json_escape(ad.task_name).c_str(), json_escape(ad.prompt_prefix).c_str());
+        }
         serve_print("READY %d stop\n", E.ctx);
         const lamina::program::ServeIo& io = lamina::program::serve_io();
         std::thread reader([&] {
@@ -4262,6 +4829,8 @@ static int run_engine(int argc, char** argv, bool check_only) {
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     float spec_min_p = 0.f;
     std::vector<int> stage_gpus, layer_split;   // the layer split: the GPUs (the first the main one) and their layer counts
+    std::vector<LoraSpec> lora_specs;           // --lora / --lora-scaled, in their order
+    bool lora_no_apply = false;                 // --lora-init-without-apply: every adapter at scale 0 to start
     auto int_list = [](const std::string& v) {
         std::vector<int> out;
         for (size_t i = 0; i < v.size();) {
@@ -4333,6 +4902,33 @@ static int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--stage-gpus") stage_gpus = int_list(next());     // CUDA ordinals: the family switch's --second-gpu
         else if (a == "--layer-split") layer_split = int_list(next());   // a layer count per GPU (default: fill the first)
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+        else if (a == "--lora" || a == "--lora-scaled") {
+            // llama.cpp's: --lora F[,F] at scale 1, --lora-scaled F:S[,F:S] (the scale after the last ':', so that a
+            // drive's colon stays the path's)
+            const std::string v = next();
+            for (size_t at = 0; at <= v.size();) {
+                const size_t comma = std::min(v.find(',', at), v.size());
+                const std::string item = v.substr(at, comma - at);
+                at = comma + 1;
+                if (item.empty()) continue;
+                LoraSpec sp;
+                sp.path = item;
+                if (a == "--lora-scaled") {
+                    const size_t c = item.rfind(':');
+                    char* e = nullptr;
+                    const float s_ = c == std::string::npos ? 0.f : std::strtof(item.c_str() + c + 1, &e);
+                    if (c == std::string::npos || c == 0 || e == item.c_str() + c + 1 || *e != '\0' || !std::isfinite(s_)) {
+                        std::fprintf(stderr, "lamina: --lora-scaled takes FNAME:SCALE[,FNAME:SCALE], not '%s'\n",
+                                     item.c_str());
+                        return 2;
+                    }
+                    sp.path = item.substr(0, c);
+                    sp.scale = s_;
+                }
+                lora_specs.push_back(sp);
+            }
+        }
+        else if (a == "--lora-init-without-apply") lora_no_apply = true;   // loaded at scale 0: a request names its own
         else if (a.rfind("--control-vector", 0) == 0 || a.rfind("--cvec-", 0) == 0) {   // not a skip: it steers
             std::fprintf(stderr, "lamina: %s: control vectors run on Qwen3.8-Flash-Next's engine only\n", a.c_str());
             return 2;
@@ -4359,6 +4955,21 @@ static int run_engine(int argc, char** argv, bool check_only) {
         std::fprintf(stderr, "lamina: --kv takes fp16 or q8_0 on this path\n");
         return 2;
     }
+    for (const LoraSpec& sp : lora_specs) {   // the adapters' headers now (no GPU yet): a wrong file fails a check too
+        std::string e;
+        try {
+            const lamina::GgufFile f(sp.path);
+            LoraAdapter ad;
+            std::vector<LoraPair> pairs;
+            if (!lora_read(f, "", ad, pairs, e)) {
+                std::fprintf(stderr, "lamina: --lora %s\n", e.c_str());
+                return 2;
+            }
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "lamina: --lora %s: %s\n", sp.path.c_str(), ex.what());
+            return 2;
+        }
+    }
     if (check_only) return 0;
 #if !defined(_WIN32)
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
@@ -4379,7 +4990,7 @@ static int run_engine(int argc, char** argv, bool check_only) {
     m.kv_q8 = kv == "q8_0";
     std::string err;
     try {
-        if (!load(model, m, err, mtp_d > 0, stage_gpus, layer_split, ctx, chunk > 0 ? chunk : 2048)) {
+        if (!load(model, m, err, mtp_d > 0, stage_gpus, layer_split, ctx, chunk > 0 ? chunk : 2048, lora_specs)) {
             std::fprintf(stderr, "lamina: %s\n", err.c_str());
             return 1;
         }
@@ -4469,6 +5080,10 @@ static int run_engine(int argc, char** argv, bool check_only) {
     for (Layer& L : m.layers) L.src_g = L.src_u = L.src_d = nullptr;
     m.file.reset();
     E.on();
+    // the adapters' scales a request that names none takes (every session starts with them)
+    E.lora_default.assign(lora_specs.size(), 0.f);
+    for (size_t a = 0; a < lora_specs.size(); ++a) E.lora_default[a] = lora_no_apply ? 0.f : lora_specs[a].scale;
+    for (Engine::Sess& ss : E.sess) ss.lora = E.lora_default;
     struct Report {
         Engine& E;
         ~Report() {

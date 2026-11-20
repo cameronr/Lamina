@@ -418,6 +418,8 @@ if(LAMINA_ENABLE_CUDA)
   lamina_kernel_test(qsa_select_parity src/kernels/qsa_select_parity.cu)
   # The MMVQ of 2..8 tokens from interleaved activations against native_mmvq: bitwise (synthetic matrices).
   lamina_kernel_test(mmvq_il_parity src/kernels/mmvq_il_parity.cu)
+  # The qwen35 path's LoRA kernels against FP64, a row alone bitwise its window's (synthetic sites).
+  lamina_kernel_test(lora_parity src/kernels/lora_parity.cu)
 
   # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
   # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)

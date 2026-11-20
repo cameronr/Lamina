@@ -551,6 +551,11 @@ void usage(bool all = false) {
                  "  --drafts-per-step N  Qwen3.6, Qwen3.8-27B and Hy4-flash: at most N drafts (0..7) of the file's own\n"
                  "                       MTP block a step (default 0: none; --spec-min-p as above), --draft-vocab N\n"
                  "                       its head over the first N ids\n"
+                 "  --lora F[,F]         Qwen3.6 and Qwen3.8-27B: LoRA adapters in llama.cpp's GGUF format, each at\n"
+                 "                       scale 1 (every product with a pair adds s B A x, s = scale * alpha / rank)\n"
+                 "  --lora-scaled F:S[,F:S]  the same at scale S\n"
+                 "  --lora-init-without-apply  the adapters loaded at scale 0: a request's \"lora\" (or the server's\n"
+                 "                       /lora-adapters) sets their scales\n"
                  "  --clocks-hold TIME   --serve: the tiers' clock locks stay this long after a request (default 5s)\n"
                  "  --clocks-lead TIME   --serve: they are asked for this long before a batched prompt part ends, by\n"
                  "                       its progress, instead of from its last chunk on (default off; a lock is at\n"
@@ -1637,6 +1642,11 @@ int parse_options(int argc, char** argv, Options& o, bool& help, bool usage_on_e
                 }
             }
             else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
+            else if (a == "--lora" || a == "--lora-scaled" || a == "--lora-init-without-apply") {
+                std::fprintf(stderr, "lamina: %s: LoRA adapters run on the engine path of Qwen3.6-35B-A3B and Qwen3.8-27B "
+                                     "only\n", a.c_str());
+                return 2;
+            }
             else {
                 // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
                 // tokens would look like a working run.
