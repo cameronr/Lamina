@@ -1554,6 +1554,15 @@ struct Engine {
         const int64_t short_by = n - (int64_t) spare.size() - free_chunks;
         if (short_by <= 0) return true;
         if (gpus.empty() || gpus[0].S <= 0) return false;
+        {   // the slots' chunks past their first quarter at most (a smaller card keeps some of its slots, or declines)
+            int64_t can = 0;
+            for (const Layer& l : m->layers)
+                if (l.slot_vm)
+                    for (int64_t c = (int64_t) (((uint64_t) (gpus[0].S / 4) * l.stride + G - 1) / G); c < l.slot_vm->chunks();
+                         ++c)
+                        can += l.slot_vm->mapped(c) ? 1 : 0;
+            if (short_by > can) return false;
+        }
         CK(cudaStreamSynchronize(st));
         settle(true);   // no copy in flight into a slot that moves or goes
         lent_from.assign(m->layers.size(), {});   // the residents, for queue_restore
@@ -3478,6 +3487,9 @@ struct MoeDev {
     int64_t ident_rows = 0;
     float* acc_h = nullptr;
     __half* acc16 = nullptr;   // a tier's sums as halves (Prompt::sum_f16)
+    // the second half's (Prompt::run's halves): its plan's host copy, its sums' end on a tier
+    int32_t* plan_h2 = nullptr;
+    cudaEvent_t done2 = nullptr;
     uint8_t* stage[2] = {};
 };
 
@@ -3518,7 +3530,7 @@ struct Prompt {
     int streamer = 0;         // the devs index that runs the experts no GPU holds
     cublasHandle_t blas = nullptr;
     cudaStream_t st = nullptr;
-    cudaEvent_t routed = nullptr;
+    cudaEvent_t routed = nullptr, routed2 = nullptr;   // a half's routing on the host (routed2: the second half's)
     // the main GPU's rows
     float *X = nullptr, *xh = nullptr, *xn = nullptr, *y = nullptr, *sy = nullptr, *emb = nullptr, *post = nullptr;
     uint8_t *xq = nullptr, *qrq = nullptr, *hdq = nullptr, *oq = nullptr, *ikq = nullptr, *subq = nullptr, *fhq = nullptr,
@@ -3530,6 +3542,8 @@ struct Prompt {
     // the tiers' sums cross the links as halves (LAMINA_HY4_SUM_F16=0: floats): half the bytes, an error well under
     // the q8_1 rounding of routed_up's input
     bool sum_f16 = true;
+    // a chunk of two sub-chunks or more in two halves overlapped (LAMINA_HY4_HALVES=0: its MoE in one piece)
+    bool halves_on = true;
     int32_t *ids = nullptr, *cells = nullptr, *ncells = nullptr, *hids = nullptr, *hb = nullptr, *tok_d = nullptr,
             *pos_d = nullptr;
     int64_t hids_rows = 0;
@@ -3537,7 +3551,7 @@ struct Prompt {
     // the host's (pinned)
     int32_t *h_ids = nullptr, *h_tok = nullptr, *h_pos = nullptr;
     float *h_wts = nullptr, *h_valid = nullptr;
-    uint8_t *tq_h = nullptr, *h_raw = nullptr;
+    uint8_t *tq_h = nullptr, *tq_h2 = nullptr, *h_raw = nullptr;   // tq_h2: the second half's tiers' input
     uint32_t* h_rows = nullptr;
     std::vector<MoeDev> devs;   // [0] the main GPU, then the tiers in Engine::gpus' order
     // the snapshots inside a chunk (Engine::chunk_snaps, one buffer each): their bytes on the main GPU as snapshot() lays
@@ -3570,6 +3584,7 @@ struct Prompt {
     bool init(int rows, const std::vector<int>& tier_devs, int pass_rows = 0) {
         const auto& g = m->g;
         if (const char* v = std::getenv("LAMINA_HY4_SUM_F16")) sum_f16 = std::atoi(v) != 0;
+        if (const char* v = std::getenv("LAMINA_HY4_HALVES")) halves_on = std::atoi(v) != 0;
         cap = std::max(kMaxT + 1, rows);
         pass = std::max(cap, pass_rows);
         std::vector<const Layer*> checked;
@@ -3603,8 +3618,10 @@ struct Prompt {
         }
         CK(cudaGetDevice(&main_dev));
         st = E.st;
-        CK(cudaEventCreateWithFlags(&routed, cudaEventDisableTiming));
-        own(&Owned::events, routed);
+        for (cudaEvent_t* e : {&routed, &routed2}) {
+            CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+            own(&Owned::events, *e);
+        }
         if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "lamina: cuBLAS did not start: prompts read %d rows a forward\n", kMaxT);
             return false;
@@ -3612,6 +3629,9 @@ struct Prompt {
         const size_t T = (size_t) cap, N = (size_t) g.n_embd, hc = (size_t) g.hc, Ld = (size_t) g.n_latent,
                      F = (size_t) g.n_ff_exp, Ex = (size_t) g.n_expert, K = (size_t) g.top_k;
         const size_t PR = (size_t) pass;   // a pass's rows: the streams' buffers and the MoE pass's
+        // a tier's rows at once: a half's (Prompt::run's halves, one after the other on its stream), else the pass's
+        const size_t TR = pass > cap && halves_on && !trace
+                              ? (size_t) (((pass + cap - 1) / cap + 1) / 2) * (size_t) cap : PR;
         size_t hmax = 0;
         for (const Layer& l : m->layers) hmax = std::max<size_t>(hmax, (size_t) l.H);
         X = dalloc<float>(T * hc * N);
@@ -3677,6 +3697,7 @@ struct Prompt {
         h_rows = halloc<uint32_t>(n_mod * PR * eh);
         h_raw = halloc<uint8_t>(n_mod * PR * eh * ed);
         tq_h = halloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
+        if (pass > cap) tq_h2 = halloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
         for (const Layer& l : m->layers) stage_bytes = std::max(stage_bytes, l.stride);
         {
             ring_off.assign((size_t) g.n_layers + 1, 0);
@@ -3721,27 +3742,28 @@ struct Prompt {
             }
             CK(cudaStreamCreateWithFlags(&d.cst, cudaStreamNonBlocking));
             own(&Owned::streams, d.cst);
-            for (cudaEvent_t* e : {&d.done, &d.copied[0], &d.copied[1], &d.used[0], &d.used[1]}) {
+            for (cudaEvent_t* e : {&d.done, &d.done2, &d.copied[0], &d.copied[1], &d.used[0], &d.used[1]}) {
                 CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
                 own(&Owned::events, *e);
             }
             CK(cudaEventRecord(d.used[0], d.st));
             CK(cudaEventRecord(d.used[1], d.st));
             d.mmq = std::make_unique<MMQ::Context>();
-            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) (i == 0 ? T : PR), (int64_t) Ld));
+            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) (i == 0 ? T : TR), (int64_t) Ld));
             d.eq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) Ld));
             d.gu = dalloc<float>((size_t) kEmax * 2 * F);
             d.h = dalloc<float>((size_t) kEmax * F);
             d.hq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) F));
             d.rows = dalloc<float>((size_t) kEmax * Ld);
-            d.acc = dalloc<float>((i == 0 ? T : PR) * Ld);
+            d.acc = dalloc<float>((i == 0 ? T : TR) * Ld);
             d.ident_rows = MMQ::ids_table_rows(kEmax);
             d.ident = dalloc<int32_t>((size_t) d.ident_rows);
             MMQ::iota(d.ident, d.ident_rows, d.st);
             d.plan = dalloc<int32_t>(plan_n);
             d.plan_h = halloc<int32_t>(plan_n);
+            if (pass > cap) d.plan_h2 = halloc<int32_t>(plan_n);
             if (i > 0) d.acc_h = halloc<float>(PR * Ld);
-            if (i > 0 && sum_f16) d.acc16 = dalloc<__half>(PR * Ld);
+            if (i > 0 && sum_f16) d.acc16 = dalloc<__half>(TR * Ld);
             devs.push_back(std::move(d));
         }
         // the experts no GPU holds go to the GPU whose link copies fastest (core::probe_gpus: the links woken first)
@@ -3985,18 +4007,60 @@ struct Prompt {
                 hids_T = ts;
             }
         };
-        for (Layer& l : m->layers) {
-            for (int r0 = 0; r0 < T; r0 += ssz) {   // the dense steps a sub-chunk at a time
-                const int ts = std::min(ssz, T - r0);
-                view(r0, ts);
-                front(l, ts, p0 + r0);
-                mark(0);
-                if (l.dense) dense_ffn(l, ts);
-                else moe_a(l, ts, r0, nsub > 1);
-                mark(l.dense ? 5 : 1);
+        if (halves_on && nsub >= 2 && devs.size() > 1 && !trace && tq_h2) {
+            // two halves of sub-chunks: one half's dense steps on the main GPU while the tiers run the other's experts
+            const int nh0 = (nsub + 1) / 2, T0 = std::min(T, nh0 * ssz);
+            const int hr0[2] = {0, T0}, hT[2] = {T0, T - T0};
+            auto dense_half = [&](Layer& l, int hf) {
+                for (int r0 = hr0[hf]; r0 < hr0[hf] + hT[hf]; r0 += ssz) {
+                    const int ts = std::min(ssz, hr0[hf] + hT[hf] - r0);
+                    view(r0, ts);
+                    front(l, ts, p0 + r0);
+                    if (l.dense) dense_ffn(l, ts);
+                    else moe_a(l, ts, r0, true);
+                }
+            };
+            Layer* pend[2] = {nullptr, nullptr};   // the layer whose experts a half has started
+            auto finish = [&](int hf) {
+                if (pend[hf]) finish_moe(*pend[hf], hT[hf], hr0[hf], hf);
+                pend[hf] = nullptr;
+            };
+            for (Layer& l : m->layers) {
+                if (l.dense) {
+                    finish(0);
+                    finish(1);
+                    dense_half(l, 0);
+                    dense_half(l, 1);
+                    continue;
+                }
+                finish(0);
+                dense_half(l, 0);
+                route_out(l, hT[0], hr0[0], 0);
+                finish(1);   // queued before the host waits on half 0's routing: the GPU runs it while the host plans
+                start_moe(l, hT[0], hr0[0], 0);
+                pend[0] = &l;
+                dense_half(l, 1);
+                route_out(l, hT[1], hr0[1], 1);
+                finish(0);
+                start_moe(l, hT[1], hr0[1], 1);
+                pend[1] = &l;
             }
-            if (!l.dense) moe_b(l, T, nsub > 1);
-            mark(5);
+            finish(0);
+            finish(1);
+        } else {
+            for (Layer& l : m->layers) {
+                for (int r0 = 0; r0 < T; r0 += ssz) {   // the dense steps a sub-chunk at a time
+                    const int ts = std::min(ssz, T - r0);
+                    view(r0, ts);
+                    front(l, ts, p0 + r0);
+                    mark(0);
+                    if (l.dense) dense_ffn(l, ts);
+                    else moe_a(l, ts, r0, nsub > 1);
+                    mark(l.dense ? 5 : 1);
+                }
+                if (!l.dense) moe_b(l, T, nsub > 1);
+                mark(5);
+            }
         }
         view(0, T);   // the whole chunk's views (the MTP block's catch-up: a chunk of one sub-chunk, its tables made)
         // the head over the last row; with the MTP block kept up, every row's normed final hidden (y) for its catch-up;
@@ -4262,13 +4326,16 @@ struct Prompt {
         std::vector<Batch> batches;
         int n_slot_groups = 0;
     };
-    std::vector<DevPlan> plans;
-    std::vector<std::vector<std::vector<int32_t>>> slot_ents;   // [dev][slot]: entries
-    std::vector<std::vector<int32_t>> free_ents;                // [expert]: entries no GPU holds
+    struct PlanSet {   // a half's plans: each GPU's groups, its entries by slot, the entries no GPU holds by expert
+        std::vector<DevPlan> plans;
+        std::vector<std::vector<std::vector<int32_t>>> slot_ents;   // [dev][slot]: entries
+        std::vector<std::vector<int32_t>> free_ents;                // [expert]: entries no GPU holds
+    };
+    PlanSet ps[2];
 
     /// Groups over (blob index, entries) in ascending blob order from `base` (`stride` apart), split at kEmax entries
     void add_groups(DevPlan& dp, const uint8_t* base, size_t stride,
-                    const std::vector<std::pair<int, const std::vector<int32_t>*>>& seq) {
+                    const std::vector<std::pair<int, const std::vector<int32_t>*>>& seq, const float* wts_h) {
         const int K = (int) m->g.top_k;
         std::vector<int32_t>& P = dp.P;
         size_t i = 0, off = 0;
@@ -4324,17 +4391,21 @@ struct Prompt {
             gr.o_rw = (int) P.size();
             for (const int k : loc) {
                 int32_t bits;
-                std::memcpy(&bits, &h_wts[ents[(size_t) k]], 4);
+                std::memcpy(&bits, &wts_h[ents[(size_t) k]], 4);
                 P.push_back(bits);
             }
             dp.groups.push_back(gr);
         }
     }
 
-    void plan_layer(Layer& l, int T) {
+    /// The plan of T rows' routing (ids_h, wts_h: the host's copies from the rows' first) into half hf's PlanSet
+    void plan_layer(Layer& l, int T, int hf, const int32_t* ids_h, const float* wts_h) {
         const auto& g = m->g;
         const int K = (int) g.top_k, nE = (int) g.n_expert;
         const size_t nd = devs.size();
+        auto& plans = ps[hf].plans;
+        auto& slot_ents = ps[hf].slot_ents;
+        auto& free_ents = ps[hf].free_ents;
         plans.assign(nd, DevPlan{});
         slot_ents.resize(nd);
         for (size_t d = 0; d < nd; ++d) {
@@ -4343,10 +4414,10 @@ struct Prompt {
         }
         free_ents.resize((size_t) nE);
         for (auto& v : free_ents) v.clear();
-        E.dump_route(1, l.il, T, h_ids);
+        E.dump_route(1, l.il, T, ids_h);
         int64_t on_gpus = 0;
         for (int e = 0; e < T * K; ++e) {
-            const int x = h_ids[e];
+            const int x = ids_h[e];
             l.use[(size_t) x] += 1.f;
             l.total[(size_t) x] += 1.f;
             int holder = -1;
@@ -4377,7 +4448,7 @@ struct Prompt {
                     for (size_t j = 0; j < bt.experts.size(); ++j)
                         seq.emplace_back((int) j, &free_ents[(size_t) bt.experts[j]]);
                     bt.g0 = (int) dp.groups.size();
-                    add_groups(dp, devs[d].stage[dp.batches.size() % 2], l.stride, seq);
+                    add_groups(dp, devs[d].stage[dp.batches.size() % 2], l.stride, seq, wts_h);
                     bt.g1 = (int) dp.groups.size();
                     dp.batches.push_back(std::move(bt));
                 }
@@ -4386,12 +4457,12 @@ struct Prompt {
             for (int s = 0; s < l.held[d].n; ++s)
                 if (!slot_ents[d][(size_t) s].empty()) seq.emplace_back(s, &slot_ents[d][(size_t) s]);
             const size_t g_before = dp.groups.size();
-            add_groups(dp, l.held[d].slots, l.stride, seq);
+            add_groups(dp, l.held[d].slots, l.stride, seq, wts_h);
             dp.n_slot_groups = (int) (dp.groups.size() - g_before);
         }
     }
 
-    void run_group(MoeDev& d, Layer& l, int T, const Group& gr) {
+    void run_group(MoeDev& d, Layer& l, int T, const Group& gr, float* acc) {
         const auto& g = m->g;
         const int Ld = (int) g.n_latent, F = (int) g.n_ff_exp;
         hy4p::k_gather_q8<<<gr.n_ent, 128, 0, d.st>>>(reinterpret_cast<const uint4*>(d.tq), reinterpret_cast<uint4*>(d.eq),
@@ -4425,20 +4496,24 @@ struct Prompt {
         dn.ld_dst = Ld;
         d.mmq->run(dn, d.st);
         hy4p::k_accum_runs<<<gr.n_runs, 256, 0, d.st>>>(d.rows, d.plan + gr.o_rtok, d.plan + gr.o_rstart, d.plan + gr.o_rent,
-                                                        reinterpret_cast<const float*>(d.plan + gr.o_rw), d.acc, Ld);
+                                                        reinterpret_cast<const float*>(d.plan + gr.o_rw), acc, Ld);
     }
 
-    void enqueue(MoeDev& d, Layer& l, int T) {
+    /// GPU d's share of half hf's experts (T rows from row r0 of the chunk): its plan, its input (a tier's from the
+    /// host), its groups (the streamer's batches copied from the arena between), a tier's sums out to the host
+    void enqueue(MoeDev& d, Layer& l, int T, int hf, int r0) {
         const auto& g = m->g;
         const int Ld = (int) g.n_latent;
-        DevPlan& dp = plans[(size_t) d.gi];
+        DevPlan& dp = ps[hf].plans[(size_t) d.gi];
         lamina::core::DeviceScope ds(d.dev, main_dev, d.gi > 0);
-        std::memcpy(d.plan_h, dp.P.data(), dp.P.size() * 4);
-        CK(cudaMemcpyAsync(d.plan, d.plan_h, dp.P.size() * 4, cudaMemcpyHostToDevice, d.st));
-        CK(cudaMemsetAsync(d.acc, 0, (size_t) T * Ld * 4, d.st));
-        if (d.gi > 0) CK(cudaMemcpyAsync(d.tq, tq_h, MMQ::q8_bytes(T, Ld), cudaMemcpyHostToDevice, d.st));
+        int32_t* plan_h = hf ? d.plan_h2 : d.plan_h;
+        float* acc = d.gi > 0 ? d.acc : d.acc + (size_t) r0 * Ld;   // a tier's from its row 0 (a half at a time)
+        std::memcpy(plan_h, dp.P.data(), dp.P.size() * 4);
+        CK(cudaMemcpyAsync(d.plan, plan_h, dp.P.size() * 4, cudaMemcpyHostToDevice, d.st));
+        CK(cudaMemsetAsync(acc, 0, (size_t) T * Ld * 4, d.st));
+        if (d.gi > 0) CK(cudaMemcpyAsync(d.tq, hf ? tq_h2 : tq_h, MMQ::q8_bytes(T, Ld), cudaMemcpyHostToDevice, d.st));
         const size_t n_batch_groups = dp.groups.size() - (size_t) dp.n_slot_groups;
-        for (size_t gi = n_batch_groups; gi < dp.groups.size(); ++gi) run_group(d, l, T, dp.groups[gi]);
+        for (size_t gi = n_batch_groups; gi < dp.groups.size(); ++gi) run_group(d, l, T, dp.groups[gi], acc);
         for (size_t b = 0; b < dp.batches.size(); ++b) {
             const Batch& bt = dp.batches[b];
             const int buf = (int) (b % 2);
@@ -4448,17 +4523,19 @@ struct Prompt {
                                    cudaMemcpyHostToDevice, d.cst));
             CK(cudaEventRecord(d.copied[buf], d.cst));
             CK(cudaStreamWaitEvent(d.st, d.copied[buf], 0));
-            for (int gi = bt.g0; gi < bt.g1; ++gi) run_group(d, l, T, dp.groups[(size_t) gi]);
+            for (int gi = bt.g0; gi < bt.g1; ++gi) run_group(d, l, T, dp.groups[(size_t) gi], acc);
             CK(cudaEventRecord(d.used[buf], d.st));
         }
         if (d.gi > 0) {   // the sums out (as halves: sum_f16)
             if (sum_f16) {
-                hy4p::k_to_half<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, d.st>>>(d.acc, d.acc16, (int64_t) T * Ld);
-                CK(cudaMemcpyAsync(d.acc_h, d.acc16, (size_t) T * Ld * 2, cudaMemcpyDeviceToHost, d.st));
+                __half* a16 = d.acc16;
+                hy4p::k_to_half<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, d.st>>>(acc, a16, (int64_t) T * Ld);
+                CK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d.acc_h) + (size_t) r0 * Ld * 2, a16, (size_t) T * Ld * 2,
+                                   cudaMemcpyDeviceToHost, d.st));
             } else {
-                CK(cudaMemcpyAsync(d.acc_h, d.acc, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, d.st));
+                CK(cudaMemcpyAsync(d.acc_h + (size_t) r0 * Ld, acc, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, d.st));
             }
-            CK(cudaEventRecord(d.done, d.st));
+            CK(cudaEventRecord(hf ? d.done2 : d.done, d.st));
         }
     }
 
@@ -4486,45 +4563,69 @@ struct Prompt {
         q8(sh, ts, F, shq);
         dense(l.s_down, shq, ts, out);
     }
-    /// The pass's part of an MoE layer over its T rows: the plan, every GPU's experts (the ones no GPU holds streamed
-    /// once), the sums, routed_up, the shared expert's rows added, the norm, iHC's post.  `shared_done`: the sub-chunks
-    /// made the shared expert's rows; else (one sub-chunk) it runs here, beside the experts.
-    void moe_b(Layer& l, int T, bool shared_done) {
+    /// Half hf's routing out (T rows from row r0): routed_down's input as q8_1 rows (the main GPU's experts read them,
+    /// the tiers a host copy), the picks and weights to the host; `routed` (routed2) marks them
+    void route_out(Layer& l, int T, int r0, int hf) {
         const auto& g = m->g;
-        const int N = (int) g.n_embd, hc = (int) g.hc, K = (int) g.top_k, Ld = (int) g.n_latent;
+        const int K = (int) g.top_k, Ld = (int) g.n_latent;
         MoeDev& d0 = devs[0];
-        q8(rin, T, Ld, d0.tq, l.fmt.gu_type);
-        CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaMemcpyAsync(h_wts, wts, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
-        if (devs.size() > 1) CK(cudaMemcpyAsync(tq_h, d0.tq, MMQ::q8_bytes(T, Ld), cudaMemcpyDeviceToHost, st));
-        CK(cudaEventRecord(routed, st));
-        CK(cudaEventSynchronize(routed));
+        q8(rin + (size_t) r0 * Ld, T, Ld, d0.tq, l.fmt.gu_type);
+        CK(cudaMemcpyAsync(h_ids + (size_t) r0 * K, ids + (size_t) r0 * K, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(h_wts + (size_t) r0 * K, wts + (size_t) r0 * K, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
+        if (devs.size() > 1)
+            CK(cudaMemcpyAsync(hf ? tq_h2 : tq_h, d0.tq, MMQ::q8_bytes(T, Ld), cudaMemcpyDeviceToHost, st));
+        CK(cudaEventRecord(hf ? routed2 : routed, st));
+    }
+    /// The host's wait for half hf's routing, its plan, every GPU's experts queued (the streamer's last)
+    void start_moe(Layer& l, int T, int r0, int hf) {
+        const int K = (int) m->g.top_k;
+        CK(cudaEventSynchronize(hf ? routed2 : routed));
         mark(1);
-        const auto t0 = Clock::now();
-        plan_layer(l, T);
+        plan_layer(l, T, hf, h_ids + (size_t) r0 * K, h_wts + (size_t) r0 * K);
         mark(2);
-        if (streamer != 0) enqueue(d0, l, T);
+        if (streamer != 0) enqueue(devs[0], l, T, hf, r0);
         for (size_t d = 1; d < devs.size(); ++d)
-            if ((int) d != streamer) enqueue(devs[d], l, T);
-        enqueue(devs[(size_t) streamer], l, T);
-        if (!shared_done) shared_expert(l, T, sy);
-        // the tiers' sums, in their order
+            if ((int) d != streamer) enqueue(devs[d], l, T, hf, r0);
+        enqueue(devs[(size_t) streamer], l, T, hf, r0);
+    }
+    /// Half hf's end of an MoE layer: the tiers' sums added in their order, routed_up, the shared expert's rows, the
+    /// norm, iHC's post (T rows from row r0)
+    void finish_moe(Layer& l, int T, int r0, int hf) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc, Ld = (int) g.n_latent;
+        MoeDev& d0 = devs[0];
+        float* acc = d0.acc + (size_t) r0 * Ld;
         for (size_t d = 1; d < devs.size(); ++d) {
-            CK(cudaStreamWaitEvent(st, devs[d].done, 0));
-            CK(cudaMemcpyAsync(tmp, devs[d].acc_h, (size_t) T * Ld * (sum_f16 ? 2 : 4), cudaMemcpyHostToDevice, st));
+            CK(cudaStreamWaitEvent(st, hf ? devs[d].done2 : devs[d].done, 0));
+            const size_t esz = sum_f16 ? 2 : 4;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(tmp) + (size_t) r0 * Ld * 4;
+            CK(cudaMemcpyAsync(dst, reinterpret_cast<const uint8_t*>(devs[d].acc_h) + (size_t) r0 * Ld * esz,
+                               (size_t) T * Ld * esz, cudaMemcpyHostToDevice, st));
             if (sum_f16)
                 hy4p::k_add_half<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(
-                    d0.acc, reinterpret_cast<const __half*>(tmp), (int64_t) T * Ld);
+                    acc, reinterpret_cast<const __half*>(dst), (int64_t) T * Ld);
             else
-                hy4k::k_add<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(d0.acc, tmp, (int64_t) T * Ld);
+                hy4k::k_add<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(acc, reinterpret_cast<const float*>(dst),
+                                                                                (int64_t) T * Ld);
         }
-        ms_moe += ms_since(t0);
         mark(3);
-        q8(d0.acc, T, Ld, mq);
-        dense(l.r_up, mq, T, y);
-        hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(y, sy, (int64_t) T * N);
-        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
-        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
+        float* yr = y + (size_t) r0 * N;
+        q8(acc, T, Ld, mq);
+        dense(l.r_up, mq, T, yr);
+        hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(yr, sy + (size_t) r0 * N, (int64_t) T * N);
+        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(yr, l.post_ffw, N, g.eps);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X + (size_t) r0 * hc * N, yr, post + (size_t) r0 * hc, hc, N);
+    }
+    /// The chunk's MoE over its T rows in one piece: the plan, every GPU's experts (the ones no GPU holds streamed once),
+    /// the sums, routed_up, the shared expert's rows added, the norm, iHC's post.  `shared_done`: the sub-chunks made the
+    /// shared expert's rows; else (one sub-chunk) it runs here, beside the experts.
+    void moe_b(Layer& l, int T, bool shared_done) {
+        route_out(l, T, 0, 0);
+        const auto t0 = Clock::now();
+        start_moe(l, T, 0, 0);
+        if (!shared_done) shared_expert(l, T, sy);
+        finish_moe(l, T, 0, 0);
+        ms_moe += ms_since(t0);
     }
 };
 
@@ -4793,7 +4894,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     std::string profile, profile_save;
     double save_every = 1.0;
     bool graphs = true;
-    int prefill = 4096, prefill_min = 24, prefill_pass = 0;
+    int prefill = 4096, prefill_min = 24, prefill_pass = 16384;
     double arena_pin = 72;
     double park_mib = 16384, reserve_mib = 6144;
     bool kv_grow = true;
