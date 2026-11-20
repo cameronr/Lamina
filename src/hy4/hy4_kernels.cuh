@@ -647,6 +647,21 @@ __global__ void __launch_bounds__(256) k_rms_post(const float* y, const float* a
     }
 }
 
+/// Waits until *flag (mapped host memory) is nonzero, or `limit_ns` passed (an error on the host's side must not
+/// leave the GPU spinning for ever: the forward is lost then, the process is not).
+__global__ void k_wait_flag(const volatile uint32_t* flag, unsigned long long limit_ns) {
+    unsigned long long t0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    for (;;) {
+        if (*flag != 0u) break;
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > limit_ns) break;
+        __nanosleep(500);
+    }
+    __threadfence_system();
+}
+
 /// A card kept running for `ns` (one block of one warp, spinning on the global timer): its driver sees it busy and
 /// brings its clocks up
 __global__ void k_keep(unsigned long long ns) {
