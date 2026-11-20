@@ -1858,6 +1858,14 @@ struct Engine {
         return v == nullptr || std::atoi(v) != 0;
     }();
     cudaStream_t sb1 = nullptr, sb2 = nullptr;
+    // the decode's chain with fewer kernels (quantizations in the kernel before them, the MoE's end and the post norm
+    // with iHC's post each one kernel): the same bytes (LAMINA_HY4_FUSE=0: the kernels apart)
+    bool fuse = [] {
+        const char* v = std::getenv("LAMINA_HY4_FUSE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    // the pre-mix's second pass quantizing xn too: its one block a row made it slower (an A/B, off)
+    bool fuse_pre = std::getenv("LAMINA_HY4_FUSE_PRE") != nullptr;
     cudaEvent_t ev_fork = nullptr, ev_j1 = nullptr, ev_j2 = nullptr, ev_q = nullptr;
     bool br_on() const { return branches && sb1 != nullptr && trace < 3; }
     void fork(cudaStream_t a, cudaStream_t b = nullptr) {
@@ -2033,20 +2041,27 @@ struct Engine {
                                                   kEngramEps);
             ph(1);
         }
-        hc_pre(l.hca_fn, l.hca_scale, l.hca_base, 2 * hc, g.hc_mag, post, l.attn_norm, T);
+        const bool xq_made = hc_pre(l.hca_fn, l.hca_scale, l.hca_base, 2 * hc, g.hc_mag, post, l.attn_norm, T, true);
         ph(2);
-        attend(l, T);
-        hc_post(T);
-        hc_pre(l.hcf_fn, l.hcf_scale, l.hcf_base, 2 * hc, g.hc_mag, post, l.ffn_norm, T);
-        quant(xn, T, N, xq);
+        const bool post_fused = fuse && trace < 3;
+        attend(l, T, xq_made, post_fused);
+        if (post_fused)   // the post-attention norm and iHC's post in one
+            hy4k::k_rms_post<<<dim3((unsigned) ((N + 255) / 256), T), 256, 0, st>>>(y, nullptr, l.post_attn, X, post, hc,
+                                                                                  N, g.eps);
+        else
+            hc_post(T);
+        if (!hc_pre(l.hcf_fn, l.hcf_scale, l.hcf_base, 2 * hc, g.hc_mag, post, l.ffn_norm, T, true)) quant(xn, T, N, xq);
         ph(2);
     }
 
     /// A layer's attention over T rows: its input normed in xn, its output (wo, the post-attention norm) in y
-    void attend(Layer& l, int T) {
+    /// `xq_made`: xn's q8_1 rows are in xq already; `post_fused`: y left before the post-attention norm (the caller's
+    /// k_rms_post does it with iHC's post)
+    void attend(Layer& l, int T, bool xq_made = false, bool post_fused = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, H = l.H;
-        quant(xn, T, N, xq);
+        const bool fz = fuse && trace < 3;
+        if (!xq_made) quant(xn, T, N, xq);
         // branches: sb1 kv_a and the cell; sb2 the gate, then (a sparse layer) the indexer once qrq is made; st q_a ..
         // k_b; joined before the attention
         const bool br = br_on();
@@ -2057,8 +2072,14 @@ struct Engine {
             kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta, g.eps);
         mmvq(l.gate, xq, gt, T, s2);
         mmvq(l.q_a, xq, qa, T);
-        hy4k::k_rms<<<T, hy4k::kThreads, 0, st>>>(qa, (int) g.q_lora, l.q_a_norm, qa, (int) g.q_lora, (int) g.q_lora, g.eps);
-        quant(qa, T, g.q_lora, qrq);
+        if (fz && g.q_lora % 256 == 0) {
+            hy4k::k_rms_q<<<T, 256, 0, st>>>(qa, (int) g.q_lora, l.q_a_norm, reinterpret_cast<hy4k::Q81*>(qrq),
+                                             (int) g.q_lora, g.eps);
+        } else {
+            hy4k::k_rms<<<T, hy4k::kThreads, 0, st>>>(qa, (int) g.q_lora, l.q_a_norm, qa, (int) g.q_lora, (int) g.q_lora,
+                                                      g.eps);
+            quant(qa, T, g.q_lora, qrq);
+        }
         const int32_t* cells = cells_swa;
         const int32_t* counts = n_swa;
         int ld = (int) g.n_swa;
@@ -2084,10 +2105,15 @@ struct Engine {
         }
         mmvq(l.q_b, qrq, q, T);
         ph(3);
-        hy4k::k_q_split<<<dim3(H, T), 256, 0, st>>>(q, qnope, qabs, H, (int) g.k_head, (int) g.nope());
-        hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
-                                                     l.theta);
-        quant(qnope, (int64_t) T * H, g.nope(), qnq);
+        if (fz && g.nope() % 32 == 0 && g.n_rot <= 64) {
+            hy4k::k_qsplit_rope_q<<<dim3(H, T), 256, 0, st>>>(q, reinterpret_cast<hy4k::Q81*>(qnq), qabs, H, (int) g.k_head,
+                                                              (int) g.nope(), (int) g.n_rot, pos_d, l.theta);
+        } else {
+            hy4k::k_q_split<<<dim3(H, T), 256, 0, st>>>(q, qnope, qabs, H, (int) g.k_head, (int) g.nope());
+            hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
+                                                         l.theta);
+            quant(qnope, (int64_t) T * H, g.nope(), qnq);
+        }
         hy4k::k_head_q8_0_w2<<<(unsigned) ((H * hy4k::kLatent + 15) / 16), 256, 0, st>>>(
             l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow, T);
         if (br) join(sb1, sb2);
@@ -2097,7 +2123,11 @@ struct Engine {
             (l.kv_q8 ? hy4p::k_attn_dec<true> : hy4p::k_attn_dec<false>)<<<dim3(n_split, H / hy4p::kQRows, T), 256,
                                                                           sizeof(hy4p::AttnSmem), st>>>(
                 qabs, l.kv, cells, counts, ld, H, per, 1.0f / sqrtf((float) g.k_head), part, n_split);
-            hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_split);
+            if (fz)
+                hy4k::k_mla_merge_q<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, reinterpret_cast<hy4k::Q81*>(attq), H,
+                                                                n_split);
+            else
+                hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_split);
         } else {
             const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
             const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
@@ -2106,13 +2136,19 @@ struct Engine {
             hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_chunks);
         }
         ph(6);
-        quant(att, (int64_t) T * H, hy4k::kLatent, attq);
+        if (!fz || H % hy4p::kQRows != 0) quant(att, (int64_t) T * H, hy4k::kLatent, attq);
         hy4k::k_head_q8_0_w2<<<(unsigned) ((H * g.v_head + 15) / 16), 256, 0, st>>>(
             l.v_b.d, attq, o, H, hy4k::kLatent, (int) g.v_head, H * (int) g.v_head, (int) g.v_head, T);
-        hy4k::k_gate_mul<<<blocks((int64_t) T * H * g.v_head), hy4k::kThreads, 0, st>>>(o, gt, (int64_t) T * H * g.v_head);
-        quant(o, T, (int64_t) H * g.v_head, oq);
+        if (fz && (H * g.v_head) % 32 == 0) {
+            hy4k::k_gate_mul_q<<<blocks((int64_t) T * H * g.v_head), hy4k::kThreads, 0, st>>>(
+                o, gt, reinterpret_cast<hy4k::Q81*>(oq), (int64_t) T * H * g.v_head);
+        } else {
+            hy4k::k_gate_mul<<<blocks((int64_t) T * H * g.v_head), hy4k::kThreads, 0, st>>>(o, gt,
+                                                                                         (int64_t) T * H * g.v_head);
+            quant(o, T, (int64_t) H * g.v_head, oq);
+        }
         mmvq(l.wo, oq, y, T);
-        hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_attn, N, g.eps);
+        if (!post_fused) hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_attn, N, g.eps);
         ph(7);
     }
 
@@ -2285,18 +2321,26 @@ struct Engine {
     /// The MoE layer's end: the CPU's rows merged (read through the mapping), the weighted sum, routed_up, the shared
     /// expert added, the FFN's norm, iHC's post.
     void moe_end(Layer& l, int T) {
-        moe_out(l, T);
-        hc_post(T);
+        const bool post_fused = fuse && trace < 3;
+        moe_out(l, T, post_fused);
+        if (post_fused)   // y + the shared expert's, the FFN's norm and iHC's post in one
+            hy4k::k_rms_post<<<dim3((unsigned) ((m->g.n_embd + 255) / 256), T), 256, 0, st>>>(
+                y, sy, l.post_ffw, X, post, (int) m->g.hc, (int) m->g.n_embd, m->g.eps);
+        else
+            hc_post(T);
     }
     /// iHC's pre-mix of the decode's T rows from X into xh (and xn with `wn`), `m_mix` mixes (2 hc for a layer: post
     /// weights into `post_out`; hc for the head), over many blocks
-    void hc_pre(const float* fn, const float* scale, const float* base, int m_mix, float mag, float* post_out,
-                const float* wn, int T) {
+    /// With `with_q`, xn's q8_1 rows into xq as well (true: made; else the caller quantizes)
+    bool hc_pre(const float* fn, const float* scale, const float* base, int m_mix, float mag, float* post_out,
+                const float* wn, int T, bool with_q = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, hc = (int) g.hc;
+        const bool fq = with_q && fuse_pre && wn != nullptr && N % 256 == 0;
         hy4k::k_hc_pre1<<<dim3(hy4k::kHcSlices, T), 256, 0, st>>>(X, fn, hc * N, m_mix, hc_part);
         hy4k::k_hc_pre2<<<T, 256, 0, st>>>(X, hc_part, scale, base, hc, N, m_mix, g.eps, g.hc_eps, mag, post_out, xh, wn,
-                                           xn, g.eps);
+                                           xn, g.eps, fq ? (void*) xq : nullptr);
+        return fq;
     }
     /// The entries the slots hold grouped by expert (k_group_slots_p, or the one-thread form for more experts)
     static void group_slots(const int32_t* ids_, int n_ent, int K_, int E_, const int32_t* slot_of, const uint8_t* slots,
@@ -2315,13 +2359,20 @@ struct Engine {
         hy4k::k_hc_post_c<<<dim3((unsigned) ((N + 255) / 256), T), 256, 0, st>>>(X, y, post, (int) m->g.hc, N);
     }
     /// The MoE layer's output in y: the CPU's rows merged, the weighted sum, routed_up, the shared expert added, the norm
-    void moe_out(Layer& l, int T) {
+    /// `post_fused`: y left as routed_up's (the caller adds the shared expert's and norms it with iHC's post)
+    void moe_out(Layer& l, int T, bool post_fused = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kk = (int) g.top_k, Ld = (int) g.n_latent;
-        hy4k::k_merge_cpu<<<T * Kk, hy4k::kThreads, 0, st>>>(parts, h_out_d, h_miss_d, Ld);
-        hy4k::k_moe_sum_c<<<dim3((unsigned) ((Ld + 255) / 256), T), 256, 0, st>>>(parts, wts, moe, Kk, Ld);
-        quant(moe, T, Ld, moeq);
+        if (fuse && trace < 3 && Ld % 256 == 0) {
+            hy4k::k_moe_end_q<<<dim3((unsigned) (Ld / 256), T), 256, 0, st>>>(parts, h_out_d, h_miss_d, wts,
+                                                                             reinterpret_cast<hy4k::Q81*>(moeq), Kk, Ld);
+        } else {
+            hy4k::k_merge_cpu<<<T * Kk, hy4k::kThreads, 0, st>>>(parts, h_out_d, h_miss_d, Ld);
+            hy4k::k_moe_sum_c<<<dim3((unsigned) ((Ld + 255) / 256), T), 256, 0, st>>>(parts, wts, moe, Kk, Ld);
+            quant(moe, T, Ld, moeq);
+        }
         mmvq(l.r_up, moeq, y, T);
+        if (post_fused) return;
         hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(y, sy, (int64_t) T * N);
         hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
     }

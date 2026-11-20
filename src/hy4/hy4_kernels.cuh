@@ -9,6 +9,7 @@
 // to the Q8_0 matrices, the rope of rope.cu's rope_norm.
 #pragma once
 
+#include "lamina/kernels/q8_1_finite.hpp"
 #include "lamina/kernels/warp.cuh"
 
 #include <cuda_fp16.h>
@@ -56,6 +57,25 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
     float s = 0.f;
     for (int i = 0; i < nw; ++i) s += sh[i];
     return s;
+}
+
+/// llama.cpp's q8_1 block (half2 d / sum, 32 int8)
+struct Q81 {
+    __half2 ds;
+    int8_t qs[32];
+};
+/// Value `xi` of a warp's 32 consecutive values into their q8_1 block `b` (quantize_q8_1_kernel's arithmetic and order:
+/// the same bytes); every lane of the warp calls it
+__device__ __forceinline__ void q81_warp(float xi, Q81* b, int lane) {
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    }
+    const float d = lamina::kernels::q8_1_finite(amax / 127.0f);
+    b->qs[lane] = lamina::kernels::q8_1_quant(xi, d, amax);
+    if (lane == 0) b->ds = lamina::kernels::q8_1_ds(d, sum);
 }
 
 /// y[r] = x[r] / sqrt(mean(x[r]^2) + eps) (* w when non-null), a block per row of n; rows `ld` floats apart.
@@ -161,7 +181,7 @@ __global__ void __launch_bounds__(256) k_hc_pre1(const float* __restrict__ X, co
 }
 __global__ void __launch_bounds__(256) k_hc_pre2(const float* X, const float* part, const float* scale, const float* base,
                                                   int hc, int n, int m, float eps_rms, float hc_eps, float mag, float* post,
-                                                  float* xh, const float* wn, float* xn, float eps_n) {
+                                                  float* xh, const float* wn, float* xn, float eps_n, void* xq = nullptr) {
     __shared__ float sh[32];
     __shared__ float mix[9];
     __shared__ float wpre[8];
@@ -191,7 +211,11 @@ __global__ void __launch_bounds__(256) k_hc_pre2(const float* X, const float* pa
     if (wn == nullptr) return;
     s2 = block_sum(s2, sh);
     const float r2 = rsqrtf(s2 / (float) n + eps_n);
-    for (int c = threadIdx.x; c < n; c += blockDim.x) xn[(size_t) t * n + c] = xh[(size_t) t * n + c] * r2 * wn[c];
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        const float v = xh[(size_t) t * n + c] * r2 * wn[c];
+        xn[(size_t) t * n + c] = v;
+        if (xq) q81_warp(v, reinterpret_cast<Q81*>(xq) + ((size_t) t * n + c) / 32, threadIdx.x & 31);
+    }
 }
 
 /// k_hc_post over columns: grid (ceil(n / 256), T), a thread a column of every stream.
@@ -513,6 +537,116 @@ __global__ void k_swiglu(const float* g, const float* u, float* h, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) h[i] = silu(g[i]) * u[i];
 }
+// ------------------------------------------------------------------------------------------------ fused forms
+/// The MoE's end of row t in one: each entry's row (the CPU's or a tier's through the mapping where miss, else the
+/// GPU's own), weighted and summed in pick order (k_merge_cpu then k_moe_sum_c), into q8_1 rows (n a multiple of 32).
+/// Grid (n / 256, T), 256.
+__global__ void k_moe_end_q(const float* __restrict__ parts, const float* cpu, const int32_t* miss, const float* w, Q81* y,
+                            int k, int n) {
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    auto row = [&](int j) {
+        const size_t e = (size_t) t * k + j;
+        return (miss[e] ? cpu : parts)[e * n + c];
+    };
+    float acc = row(0) * w[(size_t) t * k];
+    for (int j = 1; j < k; ++j) {
+        const float p = row(j) * w[(size_t) t * k + j];
+        acc = acc + p;
+    }
+    q81_warp(acc, y + ((size_t) t * n + c) / 32, threadIdx.x & 31);
+}
+
+/// k_rms of row t (a block, 256) with its result quantized into q8_1 rows (n a multiple of 32) instead of written
+__global__ void __launch_bounds__(256) k_rms_q(const float* x, int ldx, const float* w, Q81* y, int n, float eps) {
+    __shared__ float sh[32];
+    const float* xr = x + (size_t) blockIdx.x * ldx;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += xr[i] * xr[i];
+    s = block_sum(s, sh);
+    const float r = rsqrtf(s / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        q81_warp(w ? xr[i] * r * w[i] : xr[i] * r, y + ((size_t) blockIdx.x * n + i) / 32, threadIdx.x & 31);
+}
+
+/// k_q_split, k_rope_norm of the rope part and the q8_1 rows of the nope part in one: block (h, t) of 256; the nope
+/// part's 32-value blocks a warp each, the rope's pairs by the last warp
+__global__ void __launch_bounds__(256) k_qsplit_rope_q(const float* q, Q81* qnq, float* qabs, int H, int k_head, int nope,
+                                                       int n_rot, const int32_t* pos, float theta_scale) {
+    const int t = blockIdx.y, h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float* src = q + ((size_t) t * H + h) * k_head;
+    const int nb = nope / 32;
+    for (int b = warp; b < nb; b += (blockDim.x >> 5))
+        q81_warp(src[b * 32 + lane], qnq + ((size_t) t * H + h) * nb + b, lane);
+    if (warp == (int) (blockDim.x >> 5) - 1) {
+        float* dq = qabs + ((size_t) t * H + h) * kKvRow + kLatent;
+        const float p = (float) pos[t];
+        for (int i = lane; 2 * i < n_rot; i += 32) {
+            const float theta = p * powf(theta_scale, (float) i);
+            const float c = cosf(theta), s = sinf(theta);
+            const float x0 = src[nope + 2 * i], x1 = src[nope + 2 * i + 1];
+            dq[2 * i] = x0 * c - x1 * s;
+            dq[2 * i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/// k_mla_merge with its output quantized into q8_1 rows ([t][h] rows of 512) instead of written.  A block per (h, t),
+/// 128 threads.
+__global__ void k_mla_merge_q(const float* part, const float* sinks, Q81* out, int H, int n_chunks) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    const float* p0 = part + ((size_t) t * n_chunks * H + h) * (kLatent + 2);
+    const size_t step = (size_t) H * (kLatent + 2);
+    float M = sinks[h];
+    for (int k = 0; k < n_chunks; ++k) M = fmaxf(M, p0[k * step]);
+    float L = expf(sinks[h] - M);
+    for (int k = 0; k < n_chunks; ++k) {
+        const float m = p0[k * step];
+        if (m != -INFINITY) L += p0[k * step + 1] * expf(m - M);
+    }
+    const float inv = 1.f / L;
+    for (int d = threadIdx.x; d < kLatent; d += blockDim.x) {
+        float acc = 0.f;
+        for (int k = 0; k < n_chunks; ++k) {
+            const float m = p0[k * step];
+            if (m != -INFINITY) acc += p0[k * step + 2 + d] * expf(m - M);
+        }
+        q81_warp(acc * inv, out + (((size_t) t * H + h) * kLatent + d) / 32, threadIdx.x & 31);
+    }
+}
+
+/// o * sigmoid(g) for n values (a multiple of 32) into q8_1 rows (k_gate_mul then the quantization)
+__global__ void k_gate_mul_q(const float* o, const float* g, Q81* y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    q81_warp(o[i] * sigm(g[i]), y + i / 32, threadIdx.x & 31);
+}
+
+/// k_add, k_rms_inplace and iHC's post of row t in one (y + add, `add` optional, normed by w into X[t][i] += v *
+/// post[t][i]; y itself left as it was): grid (n / 256, T) of 256, each block its row's sum of squares as
+/// k_rms_inplace's 256 threads take it (the same rms in every block), then its 256 columns
+__global__ void __launch_bounds__(256) k_rms_post(const float* y, const float* add, const float* w, float* X,
+                                                  const float* post, int hc, int n, float eps) {
+    __shared__ float sh[32];
+    const int t = blockIdx.y;
+    const float* yr = y + (size_t) t * n;
+    const float* ar = add ? add + (size_t) t * n : nullptr;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = ar ? yr[i] + ar[i] : yr[i];
+        s += v * v;
+    }
+    s = block_sum(s, sh);
+    const float r = rsqrtf(s / (float) n + eps);
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const float v = (ar ? yr[c] + ar[c] : yr[c]) * r * w[c];
+    for (int j = 0; j < hc; ++j) {
+        float& x = X[((size_t) t * hc + j) * n + c];
+        x = x + v * post[(size_t) t * hc + j];
+    }
+}
+
 /// A slot table's entries written by a kernel, the values in its parameters: no copy engine, which the slots' copies
 /// from the arena keep busy (a small copy behind them waits for them)
 struct SlotTable {
