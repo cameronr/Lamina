@@ -624,11 +624,19 @@ private:
         const int patch_area = m_.patch_size * m_.patch_size * m_.n_merge * m_.n_merge;
         m_.size.align = m_.patch_size * m_.n_merge;
         if (m_.kind == Kind::qwen3vl) {
-            // 8 to 4,096 tokens a picture unless the caller says otherwise; letterboxed into its size, bicubic
+            // 8 to 4,096 tokens a picture unless the caller says otherwise.  The picture is resized straight to its
+            // size (bicubic), a side of a whole number of merged patches and a half going to the even one: what
+            // transformers' Qwen2VLImageProcessor does (smart_resize rounds with Python's round(), then resizes),
+            // and so what the model saw in training.  mtmd at the pinned commit instead rounds a half up and scales
+            // the picture to fit inside the size, the rest black (llama.cpp took the processor's way on 2026-10-19,
+            // its #30736): a 16:9 screenshot at 1,024 tokens then has 6 px of black above and below.
+            // LAMINA_VISION_LETTERBOX=1 keeps that, for comparisons with such a build.
             m_.size.min_pixels = (p.min_tokens > 0 ? p.min_tokens : 8) * patch_area;
             m_.size.max_pixels = (p.max_tokens > 0 ? p.max_tokens : 4096) * patch_area;
             m_.filter = Filter::bicubic;
-            m_.letterbox = true;
+            const char* letterbox = std::getenv("LAMINA_VISION_LETTERBOX");
+            m_.letterbox = letterbox != nullptr && std::atoi(letterbox) != 0;
+            m_.size.half_even = !m_.letterbox;
         } else {
             // the reference processor's 4 to 4,096 tokens, then the file's own pixel limits over them (the caller's
             // too, as the pull request has it); resized straight to its size, Lanczos

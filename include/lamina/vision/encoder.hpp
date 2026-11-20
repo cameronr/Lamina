@@ -10,11 +10,12 @@
 //   hy_v4_flash     Hy4-flash: the position table resampled on the host (HunyuanVL's sampling), no rotary positions,
 //                   an RMS norm, a 2x2 convolution of stride 2, GELU (erf), a 1x1 convolution, and a learned newline
 //                   row after each row of cells.  The text model reads the rows at text positions: one row of n.
-// A picture is first sized as the projector's reference processor sizes it (image.hpp).
+// A picture is first sized as the projector's reference processor sizes it (image.hpp): for Qwen's that is
+// transformers' way, a direct resize, where mtmd at the pinned commit letterboxes (LAMINA_VISION_LETTERBOX=1).
 //
 // The arithmetic is llama.cpp's mtmd's at the pinned commit, operation for operation on ggml (tools/mtmd, MIT; Hy4's
-// projector as its pull request 32517 has it), so on the CPU the rows are the ones that library gives: Qwen's the
-// same bytes.  One departure, on a GPU: the attention's heads of 72 values are zero-padded to 80, a size ggml's
+// projector as its pull request 32517 has it), so on the CPU the rows are the ones that library gives: Qwen's, with
+// its letterbox, the same bytes.  One departure, on a GPU: the attention's heads of 72 values are zero-padded to 80, a size ggml's
 // tensor-core flash attention kernel takes, which is faster and nearer the FP32 attention than the kernel it has for
 // 72 (ggml_encoder.cpp, GgmlEncoder::open; LAMINA_VISION_HEAD_PAD=0 gives mtmd's bytes there too).
 #pragma once
