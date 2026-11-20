@@ -384,6 +384,15 @@ __global__ void k_swiglu(const float* g, const float* u, float* h, int64_t n) {
     if (i < n) h[i] = silu(g[i]) * u[i];
 }
 /// y += a
+/// A slot table's entries written by a kernel, the values in its parameters: no copy engine, which the slots' copies
+/// from the arena keep busy (a small copy behind them waits for them)
+struct SlotTable {
+    int32_t v[512];
+};
+__global__ void k_slot_table(int32_t* dst, SlotTable t, int n) {
+    if ((int) threadIdx.x < n) dst[threadIdx.x] = t.v[threadIdx.x];
+}
+
 __global__ void k_add(float* y, const float* a, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = y[i] + a[i];

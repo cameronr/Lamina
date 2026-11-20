@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -188,11 +189,13 @@ struct Layer {
     Mat r_down, r_up, s_gate, s_up, s_down;
     C::NativeFmt fmt;
     uint8_t* arena = nullptr;   // n_expert blobs, `stride` bytes apart (host)
+    bool arena_pinned = false;
     size_t stride = 0;
     // the experts in VRAM: each GPU's slots (Engine::gpus: [0] the main GPU, then the expert tiers)
     K::NativeExpertLayout gl;          // the GPUs' view of a blob
     std::vector<SlotSet> held;
     std::vector<float> use;            // routing counts, halved at each rebalance
+    std::vector<char> moving;          // [n_expert]: a copy into some GPU's slot in flight (Engine::issue)
     std::vector<float> total;          // the run's routing counts (the learned profile's)
     std::vector<float> start;          // the start profile's shares (empty: none)
     // caches
@@ -545,6 +548,7 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     // each layer's block, in order, on a thread of its own: pinned while the limit allows (the GPUs copy from it at
     // their links' full rate, the host not waiting; whole layers until the next would pass it), else pageable
     std::vector<uint8_t*> bases(src.size(), nullptr);
+    std::vector<char> pinned_at(src.size(), 0);
     std::mutex mu;
     std::condition_variable cv;
     size_t made = 0;
@@ -563,6 +567,7 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
                 if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) == cudaSuccess) {
                     own(&Owned::pinned, h);
                     pinned += bytes;
+                    pinned_at[i] = 1;
                 } else {
                     h = nullptr;
                     (void) cudaGetLastError();
@@ -606,6 +611,7 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     for (size_t i = 0; i < src.size(); ++i) {
         if (bases[i] == nullptr) { err = "out of host memory for the routed experts"; return false; }
         src[i].y->arena = bases[i];
+        src[i].y->arena_pinned = pinned_at[i] != 0;
     }
     // BF16 experts (the MTP block's): each matrix through float into Q8_0 rows, gate, up (n_ff rows of n_latent), down
     std::atomic<size_t> next{0};
@@ -823,6 +829,120 @@ std::string build_images(const std::string& path, std::vector<int32_t>& ids, int
 }
 
 // ------------------------------------------------------------------------------------------------ the engine
+/// A planned move: expert e into slot k of GPU gi's slots of layer li (its resident `out` leaving it, or none)
+struct Planned {
+    float gain;
+    int li, gi, k;
+    int32_t e, out;
+};
+/// A slot's copy from the arena: expert e into slot k of GPU gi's slots of layer li, recorded by `ev` on that GPU's
+/// copy stream once `issued` (its queue's thread issues it)
+struct SlotMove {
+    int li = 0, gi = 0, k = 0;
+    int32_t e = -1;
+    uint8_t* dst = nullptr;
+    const uint8_t* src = nullptr;
+    size_t bytes = 0;
+    bool pinned = true;   // src in pinned memory, else staged through the queue's own pinned buffers
+    cudaEvent_t ev = nullptr;
+    std::atomic<bool> issued{false};
+    std::atomic<bool> ok{true};
+};
+/// A GPU's slot copies, issued in order on its copy stream by a thread of its own: a copy from pageable memory holds the
+/// thread that issues it until its bytes are staged, and the decode's thread must not wait for that
+struct CopyQueue {
+    int dev = 0;
+    cudaStream_t st = nullptr;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<SlotMove*> q;
+    bool quit = false;
+    // a copy from pageable memory staged here (the driver's own staging of one holds its API for the copy's time):
+    // kStage buffers in turn, each reused once its last copy has gone
+    static constexpr int kStage = 4;
+    uint8_t* stage[kStage] = {};
+    cudaEvent_t staged[kStage] = {};
+    size_t stage_bytes = 0;
+    int stage_at = 0;
+    bool bounce = true;   // the staging buffers made
+    // a copy in pieces: a small transfer of a forward (a tier's routed input) waits behind one piece, not an expert
+    // (the edit text's tiers' rows 8.3 ms a forward after the CPU's at 512 KB, 2.6 at 128, 0.8-1.0 without copies)
+    static constexpr size_t piece = (size_t) 256 << 10;
+    /// dst <- src in pieces on the queue's stream
+    bool copy(uint8_t* dst, const uint8_t* src, size_t n) {
+        for (size_t o = 0; o < n; o += piece)
+            if (cudaMemcpyAsync(dst + o, src + o, std::min(piece, n - o), cudaMemcpyHostToDevice, st) != cudaSuccess)
+                return false;
+        return true;
+    }
+    std::thread th;
+    CopyQueue(int d, cudaStream_t s, size_t blob) : dev(d), st(s), stage_bytes(blob) {
+        th = std::thread([this] { run(); });
+    }
+    ~CopyQueue() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
+        th.join();
+        for (int i = 0; i < kStage; ++i) {
+            if (staged[i] != nullptr) {
+                (void) cudaEventSynchronize(staged[i]);
+                (void) cudaEventDestroy(staged[i]);
+            }
+            if (stage[i] != nullptr) (void) cudaFreeHost(stage[i]);
+        }
+    }
+    void push(SlotMove* m) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            q.push_back(m);
+        }
+        cv.notify_one();
+    }
+    void run() {
+        (void) cudaSetDevice(dev);
+        if (bounce)
+            for (int i = 0; i < kStage; ++i)
+                if (cudaHostAlloc((void**) &stage[i], stage_bytes, cudaHostAllocPortable) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&staged[i], cudaEventDisableTiming) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    bounce = false;
+                }
+        for (;;) {
+            SlotMove* m = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return quit || !q.empty(); });
+                if (quit) return;
+                m = q.front();
+                q.pop_front();
+            }
+            const uint8_t* src = m->src;
+            if (!m->pinned && bounce && m->bytes <= stage_bytes) {
+                const int b = stage_at;
+                stage_at = (stage_at + 1) % kStage;
+                (void) cudaEventSynchronize(staged[b]);   // its last copy gone
+                std::memcpy(stage[b], m->src, m->bytes);
+                src = stage[b];
+                if (!copy(m->dst, src, m->bytes) || cudaEventRecord(staged[b], st) != cudaSuccess ||
+                    cudaEventRecord(m->ev, st) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    m->ok.store(false);
+                }
+                m->issued.store(true, std::memory_order_release);
+                continue;
+            }
+            if (!copy(m->dst, src, m->bytes) || cudaEventRecord(m->ev, st) != cudaSuccess) {
+                (void) cudaGetLastError();
+                m->ok.store(false);
+            }
+            m->issued.store(true, std::memory_order_release);
+        }
+    }
+};
+
 struct Engine {
     Model* m = nullptr;
     int64_t ctx = 0;     // cells of the sparse layers' caches
@@ -1222,7 +1342,10 @@ struct Engine {
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
         const int64_t free_chunks = fr > kReserve ? (int64_t) ((fr - kReserve) / G) : 0;
-        if ((int64_t) spare.size() + free_chunks < need) shrink_main(need - (int64_t) spare.size() - free_chunks);
+        if ((int64_t) spare.size() + free_chunks < need) {
+            settle(true);   // no copy in flight into a slot that moves or goes
+            shrink_main(need - (int64_t) spare.size() - free_chunks);
+        }
         auto take = [&]() -> lamina::core::VmmChunk {
             if (spare.empty()) return 0;
             const lamina::core::VmmChunk h = spare.back();
@@ -1381,6 +1504,11 @@ struct Engine {
                           size = (seg + pieces - 1) / pieces;
             for (int64_t sd = 0; sd < seg;) {
                 const int T = (int) std::min<int64_t>(size, seg - sd);
+                settle(false);
+                if (moves_waiting()) {   // the slots it empties idle first: the last piece's work done
+                    CK(cudaStreamSynchronize(st));
+                    pump();
+                }
                 if (chunks) {
                     chunk_fn(toks + done + sd, T);
                 } else {
@@ -2290,8 +2418,27 @@ struct Engine {
         unsigned* counter_d = nullptr;
         std::map<int, cudaGraphExec_t> graphs;   // layer * 16 + rows
         int64_t hits = 0;
+        // the slots' copies from the arena: their stream, the copies in flight in order, their events, the queue
+        cudaStream_t cst = nullptr;
+        std::deque<SlotMove> moves;
+        std::vector<cudaEvent_t> free_ev;
+        std::unique_ptr<CopyQueue> mover;
+        double h2d_gbps = 6.0;   // its copies from the arena (the slots' first fill), for the copies kept in flight
+        std::vector<Planned> backlog;   // the last plan's moves for it, the largest gain first; `next` the first not started
+        size_t next = 0;
     };
     std::vector<Gpu> gpus;   // [0]: the main GPU
+    static constexpr int32_t kPending = -2;   // slot_expert of a slot whose copy is in flight
+    // the moves: when an answer starts, the slots toward the ranking with the prompt's routing counted, every copy it
+    // takes (LAMINA_HY4_ANSWER_MOVE=0: none); every 128 generated tokens up to move_budget copies
+    int move_at_start = [] {
+        const char* v = std::getenv("LAMINA_HY4_ANSWER_MOVE");
+        return v ? std::max(0, std::atoi(v)) : 512;
+    }();
+    int move_budget = [] {
+        const char* v = std::getenv("LAMINA_HY4_MOVE_BUDGET");
+        return v ? std::max(0, std::atoi(v)) : 32;
+    }();
     int main_dev = 0;
     std::vector<char> tier_used;   // a forward's layer: the tiers given entries
 
@@ -2318,7 +2465,7 @@ struct Engine {
         cudaDeviceProp pr{};
         CK(cudaGetDeviceProperties(&pr, main_dev));
         g0.name = pr.name;
-        gpus.push_back(g0);
+        gpus.push_back(std::move(g0));
         for (const int d : tier_devs) {
             lamina::core::DeviceScope ds(d, main_dev);
             Gpu t;
@@ -2349,11 +2496,22 @@ struct Engine {
             CK(cudaMemcpy(t.flag_d, &none, sizeof none, cudaMemcpyHostToDevice));
             CK(cudaMemset(t.counter_d, 0, sizeof(unsigned)));
             t.S = slots_for(-1, (size_t) 1280 << 20);
-            gpus.push_back(t);
+            gpus.push_back(std::move(t));
+        }
+        for (Gpu& gp : gpus) {   // the slots' copies: a stream and an issuing thread a GPU
+            lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
+            CK(cudaStreamCreateWithFlags(&gp.cst, cudaStreamNonBlocking));
+            own(&Owned::streams, gp.cst);
+            size_t blob = 0;
+            for (const Layer& l : m->layers)
+                if (!l.dense) blob = std::max(blob, l.fmt.bytes);
+            gp.mover = std::make_unique<CopyQueue>(gp.dev, gp.cst, blob);
         }
         load_profile();
+        const auto fill0 = Clock::now();
         for (Layer& l : m->layers) {
             if (l.dense) continue;
+            l.moving.assign((size_t) g.n_expert, 0);
             l.gl = K::native_expert_layout(l.fmt.gu_type, l.fmt.d_type, g.n_latent, g.n_ff_exp);
             l.gl.swiglu_limit = l.fmt.swiglu_limit;
             if (l.use.empty()) l.use.assign((size_t) g.n_expert, 0.f);
@@ -2386,9 +2544,17 @@ struct Engine {
                 for (int k = 0; k < l.held[gi].n && at < order.size(); ++k) put_slot(l, (int) gi, k, order[at++]);
             for (size_t gi = 0; gi < gpus.size(); ++gi) upload_table(l, (int) gi);
         }
-        for (const Gpu& gp : gpus) {
-            lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
-            CK(cudaDeviceSynchronize());
+        {   // each GPU's fill as one stretch: its copy rate from the arena
+            size_t blob = 0;
+            for (const Layer& l : m->layers)
+                if (!l.dense) blob += l.fmt.bytes;
+            for (Gpu& gp : gpus) {
+                lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
+                CK(cudaStreamSynchronize(gp.st));
+                const double sec = ms_since(fill0) / 1000.0;
+                if (gp.S > 0 && sec > 0.05) gp.h2d_gbps = std::max(1.0, (double) gp.S * (double) blob / sec / 1e9);
+                CK(cudaDeviceSynchronize());
+            }
         }
         tier_used.assign(gpus.size(), 0);
         s_max = gpus.empty() ? 0 : std::max(gpus[0].S, 0);
@@ -2408,7 +2574,13 @@ struct Engine {
     void upload_table(Layer& l, int gi) {
         lamina::core::DeviceScope ds(gpus[(size_t) gi].dev, main_dev, gi > 0);
         SlotSet& s = l.held[(size_t) gi];
-        CK(cudaMemcpyAsync(s.slot_of_d, s.slot_of.data(), s.slot_of.size() * 4, cudaMemcpyHostToDevice, gpus[(size_t) gi].st));
+        for (size_t at = 0; at < s.slot_of.size(); at += 512) {   // by a kernel: the copy engine has the slots' copies
+            hy4k::SlotTable t;
+            const int n = (int) std::min<size_t>(512, s.slot_of.size() - at);
+            std::memcpy(t.v, s.slot_of.data() + at, (size_t) n * 4);
+            hy4k::k_slot_table<<<1, 512, 0, gpus[(size_t) gi].st>>>(s.slot_of_d + at, t, n);
+        }
+        CK(cudaGetLastError());
     }
     /// Expert e into GPU gi's slot k (its blob from the RAM arena), out of any other GPU's slot
     void put_slot(Layer& l, int gi, int k, int32_t e) {
@@ -2428,59 +2600,218 @@ struct Engine {
         s.slot_expert[(size_t) k] = e;
         s.slot_of[(size_t) e] = k;
     }
-    /// The GPUs' slots toward the ranking: in each layer, GPU by GPU (the main first), the experts its share of the
-    /// ranking holds that it lacks take its empty slots, then the slots of its experts outside that share (the least
-    /// used first) while they are used less (by 1.25x); at most `max_swaps` copies in all; then the counts are halved.
-    /// `waiting` (if set) is asked before each copy: true ends the copies there (the counts are halved all the same).
-    int rebalance(int max_swaps, const std::function<bool()>& waiting = nullptr) {
-        dump_route(4, max_swaps, 0, nullptr);
-        int swaps = 0;
-        for (Layer& l : m->layers) {
+    /// The GPUs' slots toward the ranking: in each layer the experts the GPUs hold together should be the most used, as
+    /// many as they have slots; each of those on the CPU takes an empty slot, else the slot of the least used resident
+    /// outside them while that one is used less (by 1.25x).  Which GPU holds an expert is left as it is (a tier's rows
+    /// come beside the CPU's).  The moves, the largest gain first, at most `max_copies` (and no fewer than the moves
+    /// still waiting from the last plan), replace those: pump() copies them a GPU's link at a time, a resident leaving
+    /// its slot when its copy starts, an expert switched in when its copy has landed (settle).  With `halve` the counts
+    /// are halved after.
+    int plan_moves(int max_copies, bool halve) {
+        dump_route(4, halve ? max_copies : -max_copies, 0, nullptr);   // negative: the counts not halved
+        std::vector<Planned> cand;
+        for (size_t li = 0; li < m->layers.size(); ++li) {
+            Layer& l = m->layers[li];
             if (l.dense || l.held.empty()) continue;
             const std::vector<int32_t> order = ranking(l);
-            std::vector<int> want(order.size(), -1);   // expert -> the GPU its rank gives it
-            size_t at = 0;
-            for (size_t gi = 0; gi < l.held.size(); ++gi)
-                for (int k = 0; k < l.held[gi].n && at < order.size(); ++k) want[(size_t) order[at++]] = (int) gi;
-            std::vector<char> changed(l.held.size(), 0);
-            for (size_t gi = 0; gi < l.held.size() && swaps < max_swaps; ++gi) {
-                SlotSet& s = l.held[gi];
-                if (s.n == 0) continue;
-                std::vector<int32_t> in, out;
-                for (const int32_t e : order)
-                    if (want[(size_t) e] == (int) gi && s.slot_of[(size_t) e] < 0) in.push_back(e);   // most used first
+            int total = 0;
+            for (const SlotSet& s : l.held) total += s.n;
+            std::vector<char> top(order.size(), 0);
+            for (int i = 0; i < total && i < (int) order.size(); ++i) top[(size_t) order[(size_t) i]] = 1;
+            auto on_gpu = [&](int32_t e) {
+                for (const SlotSet& s : l.held)
+                    if (s.n > 0 && s.slot_of[(size_t) e] >= 0) return true;
+                return false;
+            };
+            std::vector<int32_t> in;   // the most used first
+            for (int i = 0; i < total && i < (int) order.size(); ++i) {
+                const int32_t e = order[(size_t) i];
+                if (!on_gpu(e) && !l.moving[(size_t) e]) in.push_back(e);
+            }
+            if (in.empty()) continue;
+            struct Slot {
+                int gi, k;
+                int32_t e;
+            };
+            std::vector<Slot> free, out;
+            for (size_t gi = 0; gi < l.held.size(); ++gi) {
+                const SlotSet& s = l.held[gi];
                 for (int k = 0; k < s.n; ++k) {
                     const int32_t e = s.slot_expert[(size_t) k];
-                    if (e >= 0 && want[(size_t) e] != (int) gi) out.push_back(e);
-                }
-                std::sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.use[(size_t) a] < l.use[(size_t) b]; });
-                size_t oi = 0;
-                for (const int32_t e : in) {
-                    if (swaps < max_swaps && waiting && waiting()) max_swaps = swaps;
-                    if (swaps >= max_swaps) break;
-                    int k = -1;
-                    for (int j = 0; j < s.n && k < 0; ++j)
-                        if (s.slot_expert[(size_t) j] < 0) k = j;
-                    if (k < 0) {
-                        if (oi >= out.size() || l.use[(size_t) e] <= 1.25f * l.use[(size_t) out[oi]] + 0.5f) break;
-                        k = s.slot_of[(size_t) out[oi++]];
-                    }
-                    for (size_t hi = 0; hi < l.held.size(); ++hi)   // the GPU it leaves
-                        if (!l.held[hi].slot_of.empty() && l.held[hi].slot_of[(size_t) e] >= 0) changed[hi] = 1;
-                    put_slot(l, (int) gi, k, e);
-                    changed[gi] = 1;
-                    ++swaps;
+                    if (e == -1) free.push_back({(int) gi, k, -1});
+                    else if (e >= 0 && !top[(size_t) e] && !l.moving[(size_t) e]) out.push_back({(int) gi, k, e});
                 }
             }
-            for (size_t gi = 0; gi < l.held.size(); ++gi)
-                if (changed[gi]) upload_table(l, (int) gi);
-            for (float& u : l.use) u *= 0.5f;
+            std::stable_sort(out.begin(), out.end(),
+                             [&](const Slot& a, const Slot& b) { return l.use[(size_t) a.e] < l.use[(size_t) b.e]; });
+            size_t fi = 0, oi = 0;
+            for (const int32_t e : in) {
+                if (fi < free.size()) {
+                    const Slot& f = free[fi++];
+                    cand.push_back({l.use[(size_t) e], (int) li, f.gi, f.k, e, -1});
+                    continue;
+                }
+                if (oi >= out.size() || l.use[(size_t) e] <= 1.25f * l.use[(size_t) out[oi].e] + 0.5f) break;
+                const Slot& r = out[oi++];
+                cand.push_back({l.use[(size_t) e] - l.use[(size_t) r.e], (int) li, r.gi, r.k, e, r.e});
+            }
         }
-        for (const Gpu& gp : gpus) {
-            lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
-            CK(cudaStreamSynchronize(gp.st));
+        std::stable_sort(cand.begin(), cand.end(), [](const Planned& a, const Planned& b) { return a.gain > b.gain; });
+        size_t waiting = 0;
+        for (const Gpu& gp : gpus) waiting += gp.backlog.size() - gp.next;
+        const size_t keep = std::max<size_t>((size_t) std::max(0, max_copies), waiting);
+        if (cand.size() > keep) cand.resize(keep);
+        for (Gpu& gp : gpus) {
+            gp.backlog.clear();
+            gp.next = 0;
         }
-        return swaps;
+        for (const Planned& c : cand) gpus[(size_t) c.gi].backlog.push_back(c);
+        if (halve)
+            for (Layer& l : m->layers)
+                for (float& u : l.use) u *= 0.5f;
+        pump();
+        return (int) cand.size();
+    }
+    /// The planned moves started while each GPU's copies in flight are under about a window's worth of its link
+    /// (`kMoveWindowMs`), each checked against the slots as they are now: its resident out of the slot first.  Between
+    /// forwards only (the slots it empties are not being read).
+    static constexpr double kMoveWindowMs = 100.0;
+    int pump() {
+        std::vector<std::vector<char>> dirty;
+        int started = 0;
+        for (size_t gi = 0; gi < gpus.size(); ++gi) {
+            Gpu& gp = gpus[gi];
+            if (gp.next >= gp.backlog.size()) continue;
+            size_t blob = 0;
+            for (const Layer& l : m->layers)
+                if (!l.dense) blob = std::max(blob, l.fmt.bytes);
+            const size_t cap = std::max<size_t>(8, (size_t) (gp.h2d_gbps * 1e9 * kMoveWindowMs / 1000.0 / (double) std::max<size_t>(blob, 1)));
+            while (gp.moves.size() < cap && gp.next < gp.backlog.size()) {
+                const Planned c = gp.backlog[gp.next++];
+                Layer& l = m->layers[(size_t) c.li];
+                SlotSet& s = l.held[gi];
+                if (c.k >= s.n || l.moving[(size_t) c.e]) continue;
+                bool held = false;
+                for (const SlotSet& so : l.held) held = held || (so.n > 0 && so.slot_of[(size_t) c.e] >= 0);
+                if (held) continue;
+                if (c.out >= 0) {
+                    if (s.slot_expert[(size_t) c.k] != c.out || l.moving[(size_t) c.out]) continue;
+                    s.slot_of[(size_t) c.out] = -1;
+                    s.slot_expert[(size_t) c.k] = -1;
+                    if (dirty.empty()) dirty.assign(m->layers.size(), std::vector<char>(gpus.size(), 0));
+                    dirty[(size_t) c.li][gi] = 1;
+                } else if (s.slot_expert[(size_t) c.k] != -1) {
+                    continue;
+                }
+                issue(c.li, (int) gi, c.k, c.e);
+                ++started;
+            }
+            if (gp.next >= gp.backlog.size()) {
+                gp.backlog.clear();
+                gp.next = 0;
+            }
+        }
+        for (size_t li = 0; li < dirty.size(); ++li)
+            for (size_t gi = 0; gi < gpus.size(); ++gi)
+                if (dirty[li][gi]) upload_table(m->layers[li], (int) gi);
+        return started;
+    }
+    /// Between forwards: the copies that have landed switched in, more started
+    void step_moves() {
+        settle(false);
+        pump();
+    }
+    bool moves_waiting() const {
+        for (const Gpu& gp : gpus)
+            if (gp.next < gp.backlog.size()) return true;
+        return false;
+    }
+    /// Expert e's copy into slot k (empty) of GPU gi's slots of layer li, queued on that GPU's copy thread
+    void issue(int li, int gi, int k, int32_t e) {
+        Layer& l = m->layers[(size_t) li];
+        Gpu& gp = gpus[(size_t) gi];
+        SlotSet& s = l.held[(size_t) gi];
+        s.slot_expert[(size_t) k] = kPending;
+        l.moving[(size_t) e] = 1;
+        if (gp.free_ev.empty()) {
+            lamina::core::DeviceScope ds(gp.dev, main_dev, gi > 0);
+            cudaEvent_t made = nullptr;
+            CK(cudaEventCreateWithFlags(&made, cudaEventDisableTiming));
+            own(&Owned::events, made);
+            gp.free_ev.push_back(made);
+        }
+        gp.moves.emplace_back();
+        SlotMove& mv = gp.moves.back();
+        mv.li = li;
+        mv.gi = gi;
+        mv.k = k;
+        mv.e = e;
+        mv.dst = s.slots + (size_t) k * l.stride;
+        mv.src = l.arena + (size_t) e * l.stride;
+        mv.bytes = l.fmt.bytes;
+        mv.pinned = l.arena_pinned;
+        mv.ev = gp.free_ev.back();
+        gp.free_ev.pop_back();
+        gp.mover->push(&mv);
+    }
+    /// The slot copies that have landed (`wait`: all of them, waited for) switched into their GPUs' tables: the expert
+    /// into its new slot and out of a slot it had on another GPU.  Between forwards only.  Returns the copies switched.
+    int64_t moves_landed = 0;   // copies switched in since the start
+    int settle(bool wait) {
+        std::vector<std::vector<char>> dirty;
+        int n = 0;
+        for (size_t gi = 0; gi < gpus.size(); ++gi) {
+            Gpu& gp = gpus[gi];
+            while (!gp.moves.empty()) {   // in order: a copy that has not landed has none after it that has
+                SlotMove& mv = gp.moves.front();
+                if (!mv.issued.load(std::memory_order_acquire)) {
+                    if (!wait) break;
+                    while (!mv.issued.load(std::memory_order_acquire)) std::this_thread::yield();
+                }
+                if (mv.ok.load()) {
+                    lamina::core::DeviceScope ds(gp.dev, main_dev, gi > 0);
+                    if (wait) {
+                        CK(cudaEventSynchronize(mv.ev));
+                    } else {
+                        const cudaError_t qr = cudaEventQuery(mv.ev);
+                        if (qr == cudaErrorNotReady) break;
+                        CK(qr);
+                    }
+                }
+                Layer& l = m->layers[(size_t) mv.li];
+                if (dirty.empty()) dirty.assign(m->layers.size(), std::vector<char>(gpus.size(), 0));
+                SlotSet& s = l.held[gi];
+                if (mv.ok.load() && mv.k < s.n && s.slot_expert[(size_t) mv.k] == kPending) {
+                    for (size_t oi = 0; oi < l.held.size(); ++oi) {   // out of another GPU's slot
+                        SlotSet& so = l.held[oi];
+                        if (oi == gi || so.slot_of.empty() || so.slot_of[(size_t) mv.e] < 0) continue;
+                        so.slot_expert[(size_t) so.slot_of[(size_t) mv.e]] = -1;
+                        so.slot_of[(size_t) mv.e] = -1;
+                        dirty[(size_t) mv.li][oi] = 1;
+                    }
+                    s.slot_expert[(size_t) mv.k] = mv.e;
+                    s.slot_of[(size_t) mv.e] = mv.k;
+                    dirty[(size_t) mv.li][gi] = 1;
+                    ++n;
+                    ++moves_landed;
+                } else if (mv.k < s.n && s.slot_expert[(size_t) mv.k] == kPending) {
+                    s.slot_expert[(size_t) mv.k] = -1;   // a copy that failed: the slot empty again
+                }
+                l.moving[(size_t) mv.e] = 0;
+                gp.free_ev.push_back(mv.ev);
+                gp.moves.pop_front();
+            }
+        }
+        for (size_t li = 0; li < dirty.size(); ++li)
+            for (size_t gi = 0; gi < gpus.size(); ++gi)
+                if (dirty[li][gi]) upload_table(m->layers[li], (int) gi);
+        return n;
+    }
+    /// Slot copies queued or in flight
+    size_t moves_pending() const {
+        size_t n = 0;
+        for (const Gpu& gp : gpus) n += gp.moves.size();
+        return n;
     }
     /// A tier's share of an MoE layer, on its GPU (current): the routing and the routed input from the host, its entries
     /// grouped and run, their rows into the mapped h_out (the next segment merges them as the CPU's)
@@ -3542,6 +3873,9 @@ struct Serve {
             E.host_logits(last, lg);
             E.snapshot(lg);
         }
+        E.settle(false);
+        const int64_t landed0 = E.moves_landed;
+        const int moved_at_start = E.move_at_start > 0 ? E.plan_moves(E.move_at_start, false) : 0;   // the slots toward the prompt's routing, beside the answer
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist;   // the penalties' history: the prompt's text (as llama.cpp's sampler, no picture)
         for (const int32_t t : ids)
@@ -3565,6 +3899,7 @@ struct Serve {
             return true;
         };
         while (true) {
+            E.step_moves();
             const int nx = pre >= 0 ? pre : lamina::program::sample(lg, smp, hist, rng);
             pre = -1;
             if (nx < 0) { finish = "nonfinite"; break; }
@@ -3586,7 +3921,7 @@ struct Serve {
                 E.forward(&one, 1);
                 E.host_logits(0, lg);
             }
-            if (produced / 128 != before / 128) E.rebalance(32);
+            if (produced / 128 != before / 128) E.plan_moves(E.move_budget, true);
         }
         if (E.drafts_on && E.m->has_mtp && !rows.empty() && E.pos() >= (int64_t) rows.size())   // the block caught up
             E.mtp_catch_up(rows.data(), (int64_t) rows.size(), E.pos() - (int64_t) rows.size());
@@ -3595,14 +3930,13 @@ struct Serve {
         const long long hits = E.hits - hits0, lookups = E.lookups - lookups0;
         serve_print("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld 0 0 0.0 %lld 0\n", produced, ids.size(),
                     prompt_ms, decode_ms, finish, kept, offered, reuse, hits, lookups, (long long) fresh);
-        const auto r0 = Clock::now();
+        E.settle(false);
+        const long long landed = (long long) (E.moves_landed - landed0);
         E.relax();
-        const int swaps = E.rebalance(512, [&] {
-            std::lock_guard<std::mutex> lk(mu);
-            return eof || !lines.empty();
-        });
+        const int queued = E.plan_moves(512, true);
         E.save_profile(false);
-        if (swaps > 0) std::fprintf(stderr, "lamina: %d experts moved into VRAM slots in %.0f ms\n", swaps, ms_since(r0));
+        std::fprintf(stderr, "lamina: expert copies: %d planned at the answer's start, %lld landed during it, %d planned "
+                     "after it\n", moved_at_start, landed, queued);
         std::fprintf(stderr, "lamina: %zu prompt tokens (%zu reused) in %.1f ms, %lld generated in %.1f ms (%.2f tok/s), "
                      "%s%s\n", ids.size(), reuse, prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, finish,
@@ -3818,6 +4152,11 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.trace_print("the prompt");
     const double cpu0 = E.cpu_ms, tab0 = E.table_ms;
     E.dump_route(3, 0, 0, nullptr);
+    E.settle(false);
+    if (E.move_at_start > 0) {
+        const int q = E.plan_moves(E.move_at_start, false);
+        std::fprintf(stderr, "lamina: %d expert copies queued at the answer's start\n", q);
+    }
     const auto t1 = Clock::now();
     std::vector<int32_t> gen;
     int64_t offered = 0, kept = 0, windows = 0;
@@ -3825,6 +4164,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         std::vector<int32_t> rows;
         int32_t x = argmax(lg);
         while (true) {
+            E.step_moves();
             gen.push_back(x);
             if (ff) std::fwrite(lg.data(), 4, lg.size(), ff);
             if ((int) gen.size() >= n_gen) break;
@@ -3842,7 +4182,7 @@ int run_engine(int argc, char** argv, bool check_only) {
             kept += w.kept;
             if ((int) gen.size() >= n_gen) break;
             x = w.next >= 0 ? w.next : argmax(lg);
-            if (gen.size() / 128 != before / 128) E.rebalance(32);
+            if (gen.size() / 128 != before / 128) E.plan_moves(E.move_budget, true);
         }
     } else {
         for (int i = 0; i < n_gen; ++i) {
@@ -3851,9 +4191,10 @@ int run_engine(int argc, char** argv, bool check_only) {
             if (ff) std::fwrite(lg.data(), 4, lg.size(), ff);
             if (i + 1 == n_gen) break;
             const int32_t nx = i < (int) forced.size() ? forced[(size_t) i] : a;
+            E.step_moves();
             E.forward(&nx, 1);
             E.host_logits(0, lg);
-            if ((i + 1) % 128 == 0) E.rebalance(32);
+            if ((i + 1) % 128 == 0) E.plan_moves(E.move_budget, true);
         }
     }
     const double tg_ms = ms_since(t1);
