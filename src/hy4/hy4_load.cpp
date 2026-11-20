@@ -86,7 +86,12 @@ bool read_slices(const std::vector<SliceRun>& runs, int threads, bool uncached, 
             const SliceRun& s = runs[pc.run];
             uint8_t* dst = base(s.group);
             if (dst == nullptr) { fail("no memory for the routed experts"); break; }
-            dst += s.dst_off + (uint64_t) pc.first * s.stride + pc.off;
+            // slice i's place: its own (places) or the run's stride
+            auto place = [&](int64_t i) {
+                return s.places ? s.places[pc.first + i] + s.dst_off + pc.off
+                                : dst + s.dst_off + (uint64_t) (pc.first + i) * s.stride + pc.off;
+            };
+            dst = place(0);
             const uint64_t at = s.offset + (uint64_t) pc.first * s.bytes + pc.off;
             const uint64_t n = pc.len ? pc.len : (uint64_t) pc.n * s.bytes;   // bytes
             const uint64_t slice = pc.len ? pc.len : s.bytes;                  // one slice's (or part's)
@@ -118,11 +123,10 @@ bool read_slices(const std::vector<SliceRun>& runs, int threads, bool uncached, 
                 }
                 src = buf;
             }
-            if (pc.n == 1 || s.stride == s.bytes) {
+            if (pc.n == 1 || (!s.places && s.stride == s.bytes)) {
                 std::memcpy(dst, src, (size_t) n);
             } else {
-                for (int64_t i = 0; i < pc.n; ++i)
-                    std::memcpy(dst + (uint64_t) i * s.stride, src + (uint64_t) i * s.bytes, (size_t) s.bytes);
+                for (int64_t i = 0; i < pc.n; ++i) std::memcpy(place(i), src + (uint64_t) i * s.bytes, (size_t) s.bytes);
             }
 #else
             int fd = -1;
@@ -136,7 +140,7 @@ bool read_slices(const std::vector<SliceRun>& runs, int threads, bool uncached, 
             }
             // the slices straight into their places, one forward read (a short read resumed where it stopped)
             iov.resize((size_t) pc.n);
-            for (int64_t i = 0; i < pc.n; ++i) iov[(size_t) i] = {dst + (uint64_t) i * s.stride, (size_t) slice};
+            for (int64_t i = 0; i < pc.n; ++i) iov[(size_t) i] = {place(i), (size_t) slice};
             struct iovec* v = iov.data();
             int left_n = (int) pc.n;
             uint64_t pos = at;

@@ -189,8 +189,11 @@ struct Layer {
     const float *router = nullptr, *bias = nullptr;
     Mat r_down, r_up, s_gate, s_up, s_down;
     C::NativeFmt fmt;
-    uint8_t* arena = nullptr;   // n_expert blobs, `stride` bytes apart (host)
-    bool arena_pinned = false;
+    // the routed experts' blobs in host memory, `stride` bytes each: expert e's at blob[e], in pinned memory or not; a
+    // layer's blobs in two blocks (its hottest experts by the start profile pageable, the rest pinned, as the pin
+    // budget allows)
+    std::vector<uint8_t*> blob;
+    std::vector<char> blob_pinned;
     size_t stride = 0;
     // the experts in VRAM: each GPU's slots (Engine::gpus: [0] the main GPU, then the expert tiers)
     K::NativeExpertLayout gl;          // the GPUs' view of a blob
@@ -374,7 +377,34 @@ void bf16_rows_q8_0(const uint8_t* bf16, uint8_t* dst, int64_t rows, int64_t col
     ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), dst, 0, rows, cols, nullptr);
 }
 
-bool load(const std::string& path, Model& m, int threads, double pin_gib, bool want_mtp, bool file_cache, std::string& err) {
+/// The start profile's order of each MoE layer's experts (the learned one first, as load_profile takes them): the most
+/// used first; empty when there is none of this model's shape
+std::vector<std::vector<int32_t>> profile_order(const std::vector<std::string>& paths, int64_t n_layers, int64_t n_dense,
+                                                int64_t n_expert) {
+    for (const std::string& path : paths) {
+        if (path.empty()) continue;
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) continue;
+        int32_t hdr[3] = {};
+        bool ok = std::fread(hdr, 4, 3, f) == 3 && hdr[0] == 0x50345948 && hdr[1] == (int32_t) n_layers &&
+                  hdr[2] == (int32_t) n_expert;
+        std::vector<std::vector<int32_t>> out;
+        std::vector<float> sh((size_t) n_expert);
+        for (int64_t l = n_dense; ok && l < n_layers; ++l) {
+            ok = std::fread(sh.data(), 4, sh.size(), f) == sh.size();
+            std::vector<int32_t> order((size_t) n_expert);
+            for (int64_t e = 0; e < n_expert; ++e) order[(size_t) e] = (int32_t) e;
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return sh[(size_t) a] > sh[(size_t) b]; });
+            out.push_back(std::move(order));
+        }
+        std::fclose(f);
+        if (ok) return out;
+    }
+    return {};
+}
+
+bool load(const std::string& path, Model& m, int threads, double pin_gib, bool want_mtp, bool file_cache,
+          const std::vector<std::string>& profiles, std::string& err) {
     const auto t0 = Clock::now();
     const lamina::GgufModel gm = lamina::GgufModel::open(path);
     if (std::string e = lamina::hy4::read_geometry(gm.meta(), m.g); !e.empty()) { err = e; return false; }
@@ -546,10 +576,33 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         src.push_back(s);
     }
     m.arena_gib = (double) total / (double) (1ull << 30);
-    // each layer's block, in order, on a thread of its own: pinned while the limit allows (the GPUs copy from it at
-    // their links' full rate, the host not waiting; whole layers until the next would pass it), else pageable
+    // each layer's blocks, in order, on a thread of its own.  Pinned while the limit allows: the GPUs copy from it at
+    // their links' full rate, the host not waiting.  With a start profile each layer keeps its `hot` most used experts
+    // (the GPUs' at the start, rarely streamed to a GPU) in a pageable block, as many in every layer as the pin budget
+    // leaves out, and the rest pinned, so what a prompt streams is pinned in every layer; without one, whole layers
+    // pinned until the next would pass the budget
+    const std::vector<std::vector<int32_t>> order = profile_order(profiles, g.n_layers, g.n_dense, g.n_expert);
+    int64_t hot = 0;
+    {
+        size_t trunk = 0, per_expert = 0;
+        int n_moe = 0;
+        for (const Src& s : src)
+            if (!s.y->mtp) {
+                trunk += s.y->stride * (size_t) g.n_expert;
+                per_expert += s.y->stride;
+                ++n_moe;
+            }
+        const double budget = pin_gib * (double) (1ull << 30);
+        if (!order.empty() && (int) order.size() == n_moe && (double) trunk > budget && per_expert > 0 &&
+            std::getenv("LAMINA_HY4_ARENA_LAYERS") == nullptr)
+            hot = std::min<int64_t>(g.n_expert, (int64_t) (((double) trunk - budget) / (double) per_expert) + 1);
+    }
     std::vector<uint8_t*> bases(src.size(), nullptr);
     std::vector<char> pinned_at(src.size(), 0);
+    for (Src& s : src) {
+        s.y->blob.assign((size_t) g.n_expert, nullptr);
+        s.y->blob_pinned.assign((size_t) g.n_expert, 0);
+    }
     std::mutex mu;
     std::condition_variable cv;
     size_t made = 0;
@@ -562,24 +615,53 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         const auto ta = Clock::now();
         if (!serial) (void) cudaSetDevice(dev);   // no context made on another GPU for this thread
         size_t pinned = 0;
-        for (size_t i = 0; i < src.size(); ++i) {
-            const size_t bytes = src[i].y->stride * (size_t) g.n_expert;
+        auto pin = [&](size_t bytes) -> uint8_t* {   // pinned within the budget, else null
             void* h = nullptr;
-            if ((double) (pinned + bytes) <= pin_gib * (double) (1ull << 30)) {
-                if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) == cudaSuccess) {
-                    own(&Owned::pinned, h);
-                    pinned += bytes;
-                    pinned_at[i] = 1;
-                } else {
-                    h = nullptr;
-                    (void) cudaGetLastError();
+            if (bytes == 0 || (double) (pinned + bytes) > pin_gib * (double) (1ull << 30)) return nullptr;
+            if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return nullptr;
+            }
+            own(&Owned::pinned, h);
+            pinned += bytes;
+            return (uint8_t*) h;
+        };
+        for (size_t i = 0; i < src.size(); ++i) {
+            Layer& y = *src[i].y;
+            const size_t st = y.stride;
+            // the hot experts (the profile's first `hot` of this layer; none for the MTP block) and the cold ones
+            std::vector<char> is_hot((size_t) g.n_expert, 0);
+            const size_t li = (size_t) (y.il - g.n_dense);
+            if (hot > 0 && !y.mtp && li < order.size())
+                for (int64_t k = 0; k < hot; ++k) is_hot[(size_t) order[li][(size_t) k]] = 1;
+            size_t n_hot = 0;
+            for (const char c : is_hot) n_hot += c ? 1 : 0;
+            const size_t n_cold = (size_t) g.n_expert - n_hot;
+            uint8_t* cold = pin(n_cold * st);
+            const bool cold_pinned = cold != nullptr;
+            // a hot block pinned only while the later layers' cold blocks still fit the budget
+            size_t later_cold = 0;
+            for (size_t j = i + 1; j < src.size(); ++j)
+                later_cold += src[j].y->stride * (size_t) (g.n_expert - (src[j].y->mtp ? 0 : hot));
+            uint8_t* hotb = n_hot && (double) (pinned + n_hot * st + later_cold) <= pin_gib * (double) (1ull << 30)
+                                ? pin(n_hot * st) : nullptr;
+            const bool hot_pinned = hotb != nullptr;
+            if (!cold) cold = (uint8_t*) heap_new(std::max<size_t>(n_cold * st, 64));
+            if (n_hot && !hotb) hotb = (uint8_t*) heap_new(n_hot * st);
+            bool ok = cold != nullptr && (n_hot == 0 || hotb != nullptr);
+            if (ok) {
+                size_t ic = 0, ih = 0;
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const bool h = is_hot[(size_t) e] != 0;
+                    y.blob[(size_t) e] = h ? hotb + (ih++) * st : cold + (ic++) * st;
+                    y.blob_pinned[(size_t) e] = h ? (char) hot_pinned : (char) cold_pinned;
                 }
             }
-            if (h == nullptr) h = heap_new(bytes);
             std::lock_guard<std::mutex> lk(mu);
-            bases[i] = (uint8_t*) h;
+            bases[i] = ok ? y.blob[0] : nullptr;
+            pinned_at[i] = cold_pinned && (n_hot == 0 || hot_pinned);
             made = i + 1;
-            if (h == nullptr) break;
+            if (!ok) break;
             if (i + 1 == src.size()) m.pinned = pinned;
             cv.notify_all();
         }
@@ -602,9 +684,10 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         const Src& s = src[i];
         if (s.bf16) continue;
         const uint64_t st = s.y->stride;
-        runs.push_back({s.gp, s.go, s.gsz, 0, st, g.n_expert, (int) i});
-        runs.push_back({s.up, s.uo, s.gsz, s.gsz, st, g.n_expert, (int) i});
-        runs.push_back({s.dp, s.dof, s.dsz, 2 * s.gsz, st, g.n_expert, (int) i});
+        uint8_t* const* pl = s.y->blob.data();   // filled by the allocation before base(i) returns
+        runs.push_back({s.gp, s.go, s.gsz, 0, st, g.n_expert, (int) i, pl});
+        runs.push_back({s.up, s.uo, s.gsz, s.gsz, st, g.n_expert, (int) i, pl});
+        runs.push_back({s.dp, s.dof, s.dsz, 2 * s.gsz, st, g.n_expert, (int) i, pl});
         read_bytes += (uint64_t) (2 * s.gsz + s.dsz) * (uint64_t) g.n_expert;
     }
     double read_s = 0;
@@ -613,11 +696,8 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     for (size_t i = 0; i < src.size(); ++i) base((int) i);   // every block made (or the allocation's end)
     if (alloc.joinable()) alloc.join();
     if (!read_ok) return false;
-    for (size_t i = 0; i < src.size(); ++i) {
+    for (size_t i = 0; i < src.size(); ++i)
         if (bases[i] == nullptr) { err = "out of host memory for the routed experts"; return false; }
-        src[i].y->arena = bases[i];
-        src[i].y->arena_pinned = pinned_at[i] != 0;
-    }
     // BF16 experts (the MTP block's): each matrix through float into Q8_0 rows, gate, up (n_ff rows of n_latent), down
     std::atomic<size_t> next{0};
     std::vector<size_t> bf;
@@ -628,7 +708,7 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         for (size_t j; (j = next.fetch_add(1)) < jobs;) {
             const Src& s = src[bf[j / (size_t) g.n_expert]];
             const size_t e = j % (size_t) g.n_expert;
-            uint8_t* dst = s.y->arena + e * s.y->stride;
+            uint8_t* dst = s.y->blob[e];
             bf16_rows_q8_0(s.g + e * s.gsz, dst, g.n_ff_exp, g.n_latent);
             bf16_rows_q8_0(s.u + e * s.gsz, dst + s.y->fmt.up_off, g.n_ff_exp, g.n_latent);
             bf16_rows_q8_0(s.d + e * s.dsz, dst + s.y->fmt.down_off, g.n_latent, g.n_ff_exp);
@@ -640,9 +720,11 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         for (auto& t : th) t.join();
     }
     std::fprintf(stderr, "lamina: Hy4-flash: %lld layers%s, dense weights on the GPU in %.1f s, the routed experts "
-                 "(%.1f GiB, %.1f of it pinned) in host memory in %.1f s (read %s the file cache at %.1f GiB/s; the "
-                 "blocks made in %.1f s beside)\n", (long long) g.n_layers, m.has_mtp ? " and the MTP block" : "",
-                 dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30), ms_since(t0) / 1000.0 - dense_s,
+                 "(%.1f GiB, %.1f of it pinned%s) in host memory in %.1f s (read %s the file cache at %.1f GiB/s; "
+                 "the blocks made in %.1f s beside)\n", (long long) g.n_layers, m.has_mtp ? " and the MTP block" : "",
+                 dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30),
+                 hot > 0 ? (", each layer's " + std::to_string(hot) + " most used experts pageable").c_str() : "",
+                 ms_since(t0) / 1000.0 - dense_s,
                  file_cache ? "through" : "past", read_s > 0 ? (double) read_bytes / read_s / (double) (1ull << 30) : 0.0,
                  alloc_s);
     return true;
@@ -2085,7 +2167,7 @@ struct Engine {
             auto it = open.find(ex);
             if (it == open.end() || jobs[it->second].nt == C::MAXT) {
                 C::ExpertJobMulti j;
-                j.blob = l.arena + (size_t) ex * l.stride;
+                j.blob = l.blob[(size_t) ex];
                 jobs.push_back(j);
                 it = open.insert_or_assign(ex, jobs.size() - 1).first;
             }
@@ -2684,7 +2766,7 @@ struct Engine {
         if (s.slot_expert[(size_t) k] >= 0) s.slot_of[(size_t) s.slot_expert[(size_t) k]] = -1;
         {
             lamina::core::DeviceScope ds(gpus[(size_t) gi].dev, main_dev, gi > 0);
-            CK(cudaMemcpyAsync(s.slots + (size_t) k * l.stride, l.arena + (size_t) e * l.stride, l.fmt.bytes,
+            CK(cudaMemcpyAsync(s.slots + (size_t) k * l.stride, l.blob[(size_t) e], l.fmt.bytes,
                                cudaMemcpyHostToDevice, gpus[(size_t) gi].st));
         }
         s.slot_expert[(size_t) k] = e;
@@ -2837,9 +2919,9 @@ struct Engine {
         mv.k = k;
         mv.e = e;
         mv.dst = s.slots + (size_t) k * l.stride;
-        mv.src = l.arena + (size_t) e * l.stride;
+        mv.src = l.blob[(size_t) e];
         mv.bytes = l.fmt.bytes;
-        mv.pinned = l.arena_pinned;
+        mv.pinned = l.blob_pinned[(size_t) e] != 0;
         mv.ev = gp.free_ev.back();
         gp.free_ev.pop_back();
         gp.mover->push(&mv);
@@ -3779,7 +3861,7 @@ struct Prompt {
             const int buf = (int) (b % 2);
             CK(cudaStreamWaitEvent(d.cst, d.used[buf], 0));
             for (size_t j = 0; j < bt.experts.size(); ++j)
-                CK(cudaMemcpyAsync(d.stage[buf] + j * l.stride, l.arena + (size_t) bt.experts[j] * l.stride, l.fmt.bytes,
+                CK(cudaMemcpyAsync(d.stage[buf] + j * l.stride, l.blob[(size_t) bt.experts[j]], l.fmt.bytes,
                                    cudaMemcpyHostToDevice, d.cst));
             CK(cudaEventRecord(d.copied[buf], d.cst));
             CK(cudaStreamWaitEvent(d.st, d.copied[buf], 0));
@@ -4188,7 +4270,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     }
     if (check_only) return 0;
     Model m;
-    if (!load(model, m, 8, arena_pin, use_mtp && dfly_path.empty(), file_cache, err) ||
+    if (!load(model, m, 8, arena_pin, use_mtp && dfly_path.empty(), file_cache, {profile_save, profile}, err) ||
         (!dfly_path.empty() && !load_dfly(dfly_path, m, err))) {
         std::fprintf(stderr, "lamina: %s\n", err.c_str());
         return 1;
