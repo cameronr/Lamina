@@ -6,6 +6,7 @@
 // for its size, ggml's scheduler placing each operation on the GPU or the CPU.  The graph's nodes are added in mtmd's
 // order, so the backend's kernels see the same work and the rows come out the same.
 #include "lamina/vision/encoder.hpp"
+#include "lamina/vision/projector.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -43,7 +44,7 @@ void backends_init() {
     (void) once;
 }
 
-enum class Kind { qwen3vl, hy4 };
+using Kind = ProjectorKind;
 
 struct Layer {
     ggml_tensor* ln_1_w = nullptr;
@@ -66,18 +67,7 @@ struct Layer {
     ggml_tensor* ff_down_b = nullptr;
 };
 
-struct Model {
-    Kind kind = Kind::qwen3vl;
-    int n_embd = 0, n_head = 0, n_embd_head = 0, n_head_kv = 0, n_layer = 0, projection_dim = 0;
-    int patch_size = 0, n_merge = 2;
-    float eps = 0.0f;
-    float mean[3] = {}, std[3] = {};
-    // the picture's sizing (image.hpp)
-    SizeRule size;
-    Filter filter = Filter::bicubic;
-    bool letterbox = true;
-    std::array<uint8_t, 3> pad = {0, 0, 0};
-
+struct Model : ProjectorParams {
     ggml_tensor* patch_embd_0 = nullptr;
     ggml_tensor* patch_embd_1 = nullptr;
     ggml_tensor* patch_bias = nullptr;
@@ -118,7 +108,7 @@ struct Graph {
         : m(model), ctx0(ctx), gf(ggml_new_graph_custom(ctx, kMaxNodes, false)), img_w(w), img_h(h),
           patch_size(model.patch_size), n_patches_x(w / model.patch_size), n_patches_y(h / model.patch_size),
           n_patches(n_patches_x * n_patches_y), n_embd(model.n_embd), n_head(model.n_head),
-          n_head_kv(model.n_head_kv), d_head(model.n_embd_head > 0 ? model.n_embd_head : model.n_embd / model.n_head),
+          n_head_kv(model.n_head_kv), d_head(model.d_head()),
           n_layer(model.n_layer), eps(model.eps), kq_scale(1.0f / sqrtf((float) d_head)), flash(flash_attention),
           head_pad(pad) {}
 
@@ -358,7 +348,7 @@ struct Graph {
         const int pw = n_patches_x;
         const int ph = n_patches_y;
 
-        // the position table at the picture's grid: an input, resampled on the host (hy4_positions)
+        // the position table at the picture's grid: an input, resampled on the host (hy4_position_table)
         pos_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ph * pw);
         ggml_set_name(pos_embd, "hunyuanvl_pos_embd");
         ggml_set_input(pos_embd);
@@ -421,57 +411,6 @@ std::vector<int32_t> qwen_positions(int pw, int ph, int merge) {
     return positions;
 }
 
-// Hy4's position table at out_w x out_h (mtmd's encode, HunyuanVL's): bilinear between the table's cells, a sample's
-// place by the scale (target + 0.1) / n_grid, pixel centres (align_corners off).  dst[(y * out_w + x) * n_embd + c].
-std::vector<float> hy4_positions(const std::vector<float>& src, int64_t n_embd, int n_grid, int out_w, int out_h) {
-    std::vector<float> dst((size_t) n_embd * out_h * out_w);
-
-    const float sx = (float) (out_w + 0.1f) / (float) n_grid;
-    const float sy = (float) (out_h + 0.1f) / (float) n_grid;
-
-    for (int y = 0; y < out_h; ++y) {
-        const float fy = ((float) y + 0.5f) / sy - 0.5f;
-        int y0 = (int) std::floor(fy);
-        int y1 = y0 + 1;
-        y0 = std::clamp(y0, 0, n_grid - 1);
-        y1 = std::clamp(y1, 0, n_grid - 1);
-        float wy1 = std::clamp(fy - (float) y0, 0.0f, 1.0f);
-        const float wy0 = 1.0f - wy1;
-        for (int x = 0; x < out_w; ++x) {
-            const float fx = ((float) x + 0.5f) / sx - 0.5f;
-            int x0 = (int) std::floor(fx);
-            int x1 = x0 + 1;
-            x0 = std::clamp(x0, 0, n_grid - 1);
-            x1 = std::clamp(x1, 0, n_grid - 1);
-            float wx1 = std::clamp(fx - (float) x0, 0.0f, 1.0f);
-            const float wx0 = 1.0f - wx1;
-
-            const float w00 = wy0 * wx0;
-            const float w01 = wy0 * wx1;
-            const float w10 = wy1 * wx0;
-            const float w11 = wy1 * wx1;
-
-            const float* s00 = &src[((size_t) y0 * n_grid + x0) * n_embd];
-            const float* s01 = &src[((size_t) y0 * n_grid + x1) * n_embd];
-            const float* s10 = &src[((size_t) y1 * n_grid + x0) * n_embd];
-            const float* s11 = &src[((size_t) y1 * n_grid + x1) * n_embd];
-            float* d = &dst[((size_t) y * out_w + x) * n_embd];
-            for (int c = 0; c < n_embd; ++c) {
-                d[c] = w00 * s00[c] + w01 * s01[c] + w10 * s10[c] + w11 * s11[c];
-            }
-        }
-    }
-    return dst;
-}
-
-int seek64(std::FILE* f, uint64_t at) {
-#ifdef _WIN32
-    return _fseeki64(f, (long long) at, SEEK_SET);
-#else
-    return fseeko(f, (off_t) at, SEEK_SET);
-#endif
-}
-
 class GgmlEncoder final : public Encoder {
 public:
     GgmlEncoder() = default;
@@ -507,7 +446,9 @@ public:
         bufts_.push_back(ggml_backend_get_default_buffer_type(backend_cpu_));
         sched_.reset(ggml_backend_sched_new(backends_.data(), bufts_.data(), (int) backends_.size(), kMaxNodes, false, true));
 
-        load(p);
+        proj_.open(p);
+        static_cast<ProjectorParams&>(m_) = proj_;
+        load();
         // ggml's CUDA flash attention has tensor-core kernels for heads of 64, 80, 96, 112 and 128 values; a head
         // of another size (this tower's 72) goes to its tile kernel, which at the pinned commit is slower and, the
         // more patches a picture has, further from the FP32 attention: Hy4's 3,645-row screenshot 3.05 s and rows
@@ -516,7 +457,7 @@ public:
         // to the next of those sizes (mtmd leaves them: Qwen's rows on a GPU are no longer its bytes; on the CPU
         // they are).  LAMINA_VISION_HEAD_PAD=N pads them to N values (0: none), for comparisons.
         if (backend_ != backend_cpu_) {
-            const int d_head = m_.n_embd_head > 0 ? m_.n_embd_head : m_.n_embd / m_.n_head;
+            const int d_head = m_.d_head();
             int to = d_head;
             for (const int size : {64, 80, 96, 112, 128})
                 if (to == d_head && size >= d_head) to = size;
@@ -540,123 +481,16 @@ public:
 
 private:
     // ---- the projector file ----------------------------------------------------------------------------------------
-    int find(const char* key) const { return (int) gguf_find_key(gguf_.get(), key); }
-    /// an integer key's value; `dflt` when the key is not there and not `required`
-    int get_int(const char* key, bool required, int dflt = 0) const {
-        const int i = find(key);
-        if (i < 0) {
-            if (required) throw std::runtime_error(std::string("the projector has no ") + key);
-            return dflt;
-        }
-        int64_t v = 0;
-        switch (gguf_get_kv_type(gguf_.get(), i)) {
-            case GGUF_TYPE_UINT8: v = gguf_get_val_u8(gguf_.get(), i); break;
-            case GGUF_TYPE_INT8: v = gguf_get_val_i8(gguf_.get(), i); break;
-            case GGUF_TYPE_UINT16: v = gguf_get_val_u16(gguf_.get(), i); break;
-            case GGUF_TYPE_INT16: v = gguf_get_val_i16(gguf_.get(), i); break;
-            case GGUF_TYPE_UINT32: v = gguf_get_val_u32(gguf_.get(), i); break;
-            case GGUF_TYPE_INT32: v = gguf_get_val_i32(gguf_.get(), i); break;
-            case GGUF_TYPE_UINT64: v = (int64_t) gguf_get_val_u64(gguf_.get(), i); break;
-            case GGUF_TYPE_INT64: v = gguf_get_val_i64(gguf_.get(), i); break;
-            default: throw std::runtime_error(std::string("the projector's ") + key + " is not an integer");
-        }
-        if (v < 0 || v > std::numeric_limits<int32_t>::max())
-            throw std::runtime_error(std::string("the projector's ") + key + " is out of range");
-        return (int) v;
-    }
-    float get_f32(const char* key) const {
-        const int i = find(key);
-        if (i < 0) throw std::runtime_error(std::string("the projector has no ") + key);
-        if (gguf_get_kv_type(gguf_.get(), i) != GGUF_TYPE_FLOAT32)
-            throw std::runtime_error(std::string("the projector's ") + key + " is not a float");
-        return gguf_get_val_f32(gguf_.get(), i);
-    }
-    bool get_bool(const char* key) const {
-        const int i = find(key);
-        return i >= 0 && gguf_get_kv_type(gguf_.get(), i) == GGUF_TYPE_BOOL && gguf_get_val_bool(gguf_.get(), i);
-    }
-    std::string get_str(const char* key) const {
-        const int i = find(key);
-        if (i < 0 || gguf_get_kv_type(gguf_.get(), i) != GGUF_TYPE_STRING) return "";
-        return gguf_get_val_str(gguf_.get(), i);
-    }
-    void get_rgb(const char* key, float out[3]) const {
-        const int i = find(key);
-        if (i < 0 || gguf_get_kv_type(gguf_.get(), i) != GGUF_TYPE_ARRAY ||
-            gguf_get_arr_type(gguf_.get(), i) != GGUF_TYPE_FLOAT32 || gguf_get_arr_n(gguf_.get(), i) < 3)
-            throw std::runtime_error(std::string("the projector's ") + key + " is not three floats");
-        const float* v = (const float*) gguf_get_arr_data(gguf_.get(), i);
-        for (int c = 0; c < 3; ++c) out[c] = v[c];
-    }
-
-    void load(const EncoderParams& p) {
-        ggml_context* meta = nullptr;
-        gguf_init_params gp = {/*.no_alloc =*/ true, /*.ctx =*/ &meta};
-        gguf_.reset(gguf_init_from_file(p.mmproj.c_str(), gp));
-        if (!gguf_) throw std::runtime_error("not a GGUF file that can be read");
-        meta_.reset(meta);
-
-        // the tower's shape and the picture's sizing
-        if (!get_bool("clip.has_vision_encoder")) throw std::runtime_error("the file has no vision encoder");
-        std::string type = get_str("clip.projector_type");
-        if (type.empty()) type = get_str("clip.vision.projector_type");
-        if (type == "qwen3vl_merger") m_.kind = Kind::qwen3vl;
-        else if (type == "hy_v4_flash") m_.kind = Kind::hy4;
-        else
-            throw std::runtime_error("its projector type is " + (type.empty() ? std::string("not named") : type) +
-                                     ": this encoder reads qwen3vl_merger and hy_v4_flash");
-        m_.n_embd = get_int("clip.vision.embedding_length", true);
-        m_.n_head = get_int("clip.vision.attention.head_count", true);
-        m_.n_embd_head = get_int("clip.vision.attention.head_dim", false);
-        m_.n_head_kv = get_int("clip.vision.attention.head_count_kv", false, m_.n_head);
-        m_.n_layer = get_int("clip.vision.block_count", true);
-        m_.projection_dim = get_int("clip.vision.projection_dim", true);
-        m_.eps = get_f32("clip.vision.attention.layer_norm_epsilon");
-        m_.patch_size = get_int("clip.vision.patch_size", true);
-        get_rgb("clip.vision.image_mean", m_.mean);
-        get_rgb("clip.vision.image_std", m_.std);
-        if (!get_bool("clip.use_gelu")) throw std::runtime_error("its feed-forward activation is not GELU");
-        if (m_.n_embd <= 0 || m_.n_head <= 0 || m_.n_layer <= 0 || m_.patch_size <= 0 || m_.n_embd % m_.n_head != 0 ||
-            m_.n_head_kv != m_.n_head)
-            throw std::runtime_error("its tower's sizes are not ones this encoder reads");
-        m_.n_merge = get_int("clip.vision.spatial_merge_size", false, 2);
-        if (m_.n_merge != 2) throw std::runtime_error("its spatial merge is not 2x2");
-        const int patch_area = m_.patch_size * m_.patch_size * m_.n_merge * m_.n_merge;
-        m_.size.align = m_.patch_size * m_.n_merge;
-        if (m_.kind == Kind::qwen3vl) {
-            // 8 to 4,096 tokens a picture unless the caller says otherwise.  The picture is resized straight to its
-            // size (bicubic), a side of a whole number of merged patches and a half going to the even one: what
-            // transformers' Qwen2VLImageProcessor does (smart_resize rounds with Python's round(), then resizes),
-            // and so what the model saw in training.  mtmd at the pinned commit instead rounds a half up and scales
-            // the picture to fit inside the size, the rest black (llama.cpp took the processor's way on 2026-10-19,
-            // its #30736): a 16:9 screenshot at 1,024 tokens then has 6 px of black above and below.
-            // LAMINA_VISION_LETTERBOX=1 keeps that, for comparisons with such a build.
-            m_.size.min_pixels = (p.min_tokens > 0 ? p.min_tokens : 8) * patch_area;
-            m_.size.max_pixels = (p.max_tokens > 0 ? p.max_tokens : 4096) * patch_area;
-            m_.filter = Filter::bicubic;
-            const char* letterbox = std::getenv("LAMINA_VISION_LETTERBOX");
-            m_.letterbox = letterbox != nullptr && std::atoi(letterbox) != 0;
-            m_.size.half_even = !m_.letterbox;
-        } else {
-            // the reference processor's 4 to 4,096 tokens, then the file's own pixel limits over them (the caller's
-            // too, as the pull request has it); resized straight to its size, Lanczos
-            m_.size.min_pixels = (p.min_tokens > 0 ? p.min_tokens : 4) * patch_area;
-            m_.size.max_pixels = (p.max_tokens > 0 ? p.max_tokens : 4096) * patch_area;
-            m_.size.min_pixels = get_int("clip.vision.image_min_pixels", false, m_.size.min_pixels);
-            m_.size.max_pixels = get_int("clip.vision.image_max_pixels", false, m_.size.max_pixels);
-            m_.filter = Filter::lanczos;
-            m_.letterbox = false;
-        }
-
+    void load() {
         // the weights: each tensor's description copied into a context of its own, then allocated on the backend
-        const int64_t n_tensors = gguf_get_n_tensors(gguf_.get());
+        const int64_t n_tensors = gguf_get_n_tensors(proj_.gguf());
         ggml_init_params ip = {/*.mem_size =*/ (size_t) (n_tensors + 1) * ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr,
                                /*.no_alloc =*/ true};
         data_.reset(ggml_init(ip));
         if (!data_) throw std::runtime_error("no memory for the projector's tensors");
         std::vector<ggml_tensor*> to_load;
         auto get = [&](const std::string& name, bool required = true) -> ggml_tensor* {
-            ggml_tensor* cur = ggml_get_tensor(meta_.get(), name.c_str());
+            ggml_tensor* cur = ggml_get_tensor(proj_.meta(), name.c_str());
             if (cur == nullptr) {
                 if (required) throw std::runtime_error("the projector has no tensor " + name);
                 return nullptr;
@@ -668,8 +502,6 @@ private:
         };
         auto blk = [](int il, const char* what) { return "v.blk." + std::to_string(il) + "." + what; };
 
-        if (ggml_get_tensor(meta_.get(), "v.class_embd") != nullptr)
-            throw std::runtime_error("its tower has a class embedding, which this encoder does not read");
         m_.pre_ln_w = get("v.pre_ln.weight", false);
         m_.pre_ln_b = get("v.pre_ln.bias", false);
         m_.post_ln_w = get("v.post_ln.weight", false);
@@ -702,13 +534,6 @@ private:
             l.ff_up_b = get(blk(il, "ffn_up.bias"), false);
             l.ff_down_w = get(blk(il, "ffn_down.weight"));
             l.ff_down_b = get(blk(il, "ffn_down.bias"), false);
-            // what mtmd's tower builder would also apply, and these projectors do not have
-            for (const char* other : {"attn_q_norm.weight", "attn_k_norm.weight", "ls1.weight", "ls2.weight",
-                                      "ffn_gate.weight", "attn_post_norm.weight", "ffn_post_norm.weight"})
-                if (ggml_get_tensor(meta_.get(), blk(il, other).c_str()) != nullptr)
-                    throw std::runtime_error("its tower has " + blk(il, other) + ", which this encoder does not read");
-            if (ggml_get_tensor(meta_.get(), ("v.deepstack." + std::to_string(il) + ".fc1.weight").c_str()) != nullptr)
-                throw std::runtime_error("its tower has deepstack layers, which the engine's models do not take");
         }
         m_.mm_0_w = get("mm.0.weight");
         m_.mm_0_b = get("mm.0.bias");
@@ -732,28 +557,19 @@ private:
         if (!buf_) throw std::runtime_error("the projector's weights do not fit the device's memory");
         ggml_backend_buffer_set_usage(buf_.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        std::FILE* f = ggml_fopen(p.mmproj.c_str(), "rb");
-        if (f == nullptr) throw std::runtime_error("the file cannot be opened");
-        struct Close {
-            std::FILE* f;
-            ~Close() { std::fclose(f); }
-        } close{f};
         const bool host = ggml_backend_buft_is_host(buft);
         std::vector<uint8_t> read_buf;
         for (ggml_tensor* t : to_load) {
-            const int64_t idx = gguf_find_tensor(gguf_.get(), t->name);
-            if (idx < 0) throw std::runtime_error(std::string("the projector has no tensor ") + t->name);
-            const uint64_t at = gguf_get_data_offset(gguf_.get()) + gguf_get_tensor_offset(gguf_.get(), idx);
-            const size_t n = ggml_nbytes(t);
-            bool ok = seek64(f, at) == 0;
-            if (ok && host) {
-                ok = std::fread(t->data, 1, n, f) == n;   // the CPU's buffer: read in place
-            } else if (ok) {
-                read_buf.resize(n);
-                ok = std::fread(read_buf.data(), 1, n, f) == n;
-                if (ok) ggml_backend_tensor_set(t, read_buf.data(), 0, n);
+            const TensorInfo* info = proj_.find(t->name);
+            if (info == nullptr || info->bytes != ggml_nbytes(t))
+                throw std::runtime_error(std::string("the projector has no tensor ") + t->name);
+            if (host) {
+                proj_.read(t->name, *info, t->data);   // the CPU's buffer: read in place
+            } else {
+                read_buf.resize(info->bytes);
+                proj_.read(t->name, *info, read_buf.data());
+                ggml_backend_tensor_set(t, read_buf.data(), 0, info->bytes);
             }
-            if (!ok) throw std::runtime_error(std::string("the file ends inside the tensor ") + t->name);
         }
         if (m_.kind == Kind::hy4) {
             pos_host_.resize((size_t) ggml_nelements(m_.position_embd));
@@ -823,7 +639,7 @@ private:
             ggml_backend_tensor_set(g->positions, positions.data(), 0, ggml_nbytes(g->positions));
         } else {
             const int n_grid = (int) std::lround(std::sqrt((double) m_.position_embd->ne[1]));
-            const std::vector<float> table = hy4_positions(pos_host_, m_.n_embd, n_grid, pw, ph);
+            const std::vector<float> table = hy4_position_table(pos_host_, m_.n_embd, n_grid, pw, ph);
             ggml_backend_tensor_set(g->pos_embd, table.data(), 0, ggml_nbytes(g->pos_embd));
         }
 
@@ -853,9 +669,9 @@ private:
         ggml_backend_tensor_get(rows, out.data.data(), 0, ggml_nbytes(rows));
     }
 
+    Projector proj_;
     Model m_;
-    gguf_context_ptr gguf_;
-    ggml_context_ptr meta_, data_;
+    ggml_context_ptr data_;
     ggml_backend_t backend_ = nullptr, backend_cpu_ = nullptr;
     std::vector<ggml_backend_t> backends_;
     std::vector<ggml_backend_buffer_type_t> bufts_;

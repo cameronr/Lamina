@@ -78,7 +78,8 @@ add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 set(CMAKE_SKIP_INSTALL_RULES OFF)
 
 set(_lamina_src ${CMAKE_CURRENT_SOURCE_DIR}/../../src/vision)
-add_executable(lamina-vision lamina_vision.cpp ${_lamina_src}/image.cpp ${_lamina_src}/ggml_encoder.cpp)
+add_executable(lamina-vision lamina_vision.cpp ${_lamina_src}/image.cpp ${_lamina_src}/projector.cpp
+               ${_lamina_src}/ggml_encoder.cpp)
 if(MSVC)   # UTF-8 as its code page: image and model paths outside the ANSI code page (../../cmake/utf8.manifest)
   target_sources(lamina-vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/utf8.manifest)
 endif()
