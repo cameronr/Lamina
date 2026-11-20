@@ -11,6 +11,7 @@
 #include "sync.hpp"
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -29,10 +30,21 @@ inline constexpr uint64_t kImagePixelsMax = 178956970;
 
 class Vision {
 public:
-    /// the config's "vision" section (mmproj, gpu, cuda_device, threads, max_tokens, min_tokens, q8; its paths
+    /// the config's "vision" section (mmproj, gpu, cuda_device, threads, max_tokens, min_tokens, q8, lend; its paths
     /// absolute); loaded now unless `lazy`.  std::runtime_error when the build has no encoder, the projector is not
     /// one it reads, or its GPU is not there.
     explicit Vision(const json& cfg, bool lazy = false);
+    /// "lend": on a GPU the encoder holds nothing between pictures.  For a request's new pictures it is loaded into
+    /// VRAM `lend` gets from the engine (Engine::lend: its expert cache's last slots on that card, which a prompt's
+    /// buffers take too) and `unlend` gives back; where the engine lends none, into the card's free VRAM; where
+    /// that has no room, the CPU encodes.  Set once the engine exists, and called under the service's turn.
+    using Lend = std::function<void*(int device, uint64_t bytes, std::string& why)>;
+    void set_lender(Lend lend, std::function<void()> unlend);
+    /// whether it borrows ("lend" with a GPU)
+    bool lends() const { return lend_; }
+    /// a borrowing encoder, the engine running: a picture at the projector's limit through a loan, so that the
+    /// first picture's time is a picture's; the log says what the loan took
+    void warm_up();
     /// for good (#914): the encoder's memory goes back and its directory (one .sve file per picture) with it
     ~Vision();
     bool alive();
@@ -61,11 +73,21 @@ public:
     std::string dir;   ///< the pictures' files: a path without a space (#480: the GENI line splits at spaces)
 
 private:
-    struct Loaded;   ///< the encoder, and its GPU kept from the engine's resets
+    struct Loaded;   ///< an encoder: its GPU kept from the engine's resets, or the loan it is in
+    struct Plan;     ///< what the section asks for, settled at the start
     void start();
+    /// the encoder for a picture (mu_ held): the resident one, or a borrowing one's lease, made now
+    void* encoder_now(std::string& err);
+    void lease_end();
 
     json cfg_;
-    std::unique_ptr<Loaded> loaded_;
+    std::unique_ptr<Plan> plan_;
+    std::unique_ptr<Loaded> loaded_;   ///< the resident encoder; a borrowing one's lease, for a request's pictures
+    std::unique_ptr<Loaded> cpu_;      ///< borrowing: the CPU's encoder, once a picture found no VRAM
+    bool lend_ = false;
+    int holds_ = 0;                    ///< encode_all runs: a lease stays for its pictures
+    Lend lender_;
+    std::function<void()> unlender_;
     std::atomic<bool> alive_{false};
     std::mutex mu_;   ///< the encoder and the cache: a picture at a time
     std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> cache_;   ///< key -> (file, tokens), oldest first

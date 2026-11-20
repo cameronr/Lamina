@@ -100,7 +100,11 @@ The server builds a config for the file and says in its window what it took:
   it runs on a GPU (the projector's size and 0.1-0.3 GB of buffers of its VRAM: 0.7 GB with Lamina's Q8_0 projector,
   1.0 GB with an F16 one, 1.2 GB with Hy4-flash's): of the cards besides the main one, the one with the least VRAM that
   drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another (`nvidia-smi -L` lists
-  the UUIDs). `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
+  the UUIDs). With `--vision-lend` beside it the encoder keeps none of that VRAM: for each new picture it borrows the
+  engine's expert cache on its card, as a prompt does, and gives it back (Qwen3.8-Flash-Next on any card the engine
+  uses, Hy4-flash on its main one, which is then the card it takes; the other models' engines lend none, and the
+  encoder keeps its VRAM). On a PC with one GPU that is a new picture in about half a second in place of the CPU's
+  seconds, with the cache at its full size. `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
   projector or the encoder the window says why there are none. For Qwen3.8-Flash-Next on the CPU, download Lamina's Q8_0
   projector into the model's folder: `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
   [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) beside the
@@ -211,7 +215,7 @@ preset ([above](#a-model-file)). Its keys:
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does), `q8` (a Q8_0 projector on a GPU: `mmq`, the default, multiplies its blocks as llama.cpp does, `fp16` its values as FP16, nearer the unquantized projector's embeddings; the answers measured the same). The encoder is a part of the server |
+| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does), `lend` (on a GPU: `true` has the encoder hold no VRAM between pictures and borrow the engine's expert cache on its card for each new one; without `cuda_device` that card is the engine's main one), `q8` (a Q8_0 projector on a GPU: `mmq`, the default, multiplies its blocks as llama.cpp does, `fp16` its values as FP16, nearer the unquantized projector's embeddings; the answers measured the same). The encoder is a part of the server |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):

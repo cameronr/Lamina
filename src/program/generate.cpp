@@ -4471,8 +4471,88 @@ int lamina::program::run(int argc, char** argv) {
             return c;
         };
         TierCounters req_tiers{};
+        // The server's image encoder, which runs in this process, holds no VRAM of its own between pictures where the
+        // server has it borrow (its "vision" section's "lend"): for a new picture it asks for a GPU's last cache
+        // slots, as a prompt's buffers take them, loads its weights there, encodes and gives them back, all between
+        // two requests.  LEND <device> <bytes> -> LENT <address> <bytes> <slots> <experts out> or ERR; UNLEND ->
+        // UNLENT, the slots' experts copied in again from the arena.
+        SlotLoan enc_loan;
+        const auto enc_unlend = [&](std::string& why) {
+            if (enc_loan.cache == nullptr) return true;
+            const bool ok = enc_loan.give_back(*srcp, g.n_expert, why);
+            enc_loan = SlotLoan{};
+            return ok;
+        };
         while (next_line(line)) {
             if (line == "QUIT") break;
+            if (line.rfind("LEND ", 0) == 0) {
+                long long dev = -1;
+                unsigned long long bytes = 0;
+                std::string why;
+                if (std::sscanf(line.c_str() + 5, "%lld %llu", &dev, &bytes) != 2 || bytes == 0) {
+                    why = "expected LEND <device> <bytes>";
+                } else if (!io.in_process) {
+                    why = "a loan is memory of the engine's own process";
+                } else if (enc_loan.cache != nullptr) {
+                    why = "a loan is out already";
+                } else if (srcp == nullptr) {
+                    why = "the experts have no arena to come back from";
+                } else {
+                    SlotLoan l;
+                    if (dev == o.main_gpu && d_res != nullptr && !host_res.empty()) {
+                        l.cache = &xcache;
+                        l.res = &host_res;
+                        l.d_res = d_res;
+                        l.keep = (int64_t) pin1.size();
+                    }
+                    for (int t = 0; t < n_tiers && l.cache == nullptr; ++t)
+                        if (tiers[(size_t) t].gpu.device() == dev && !tiers[(size_t) t].res.empty()) {
+                            l.cache = &tiers[(size_t) t].gpu.cache();
+                            l.res = &tiers[(size_t) t].res;
+                            l.keep = (int64_t) work_pins[(size_t) t].size();
+                        }
+                    l.device = (int) dev;
+                    l.main_device = o.main_gpu;
+                    if (l.cache == nullptr) {
+                        why = "the engine has no expert cache on GPU " + std::to_string(dev);
+                    } else {
+                        tier.apply_pending(true);   // no copy may still land in a lent slot
+                        for (TierSlot& ts : tiers) ts.adapt.apply_pending(true);
+                        if (!l.plan((bytes + 255) & ~255ull)) {
+                            why = "GPU " + std::to_string(dev) + "'s expert cache cannot spare " +
+                                  std::to_string(bytes >> 20) + " MiB";
+                        } else if (l.cache == &xcache && kvg.on && l.first < kvg.top) {
+                            // (the slots below the prompt path's worst loan are the elastic K/V's to take)
+                            why = "the main GPU's cache lends " +
+                                  std::to_string(((uint64_t) xcache.bytes() - l.offset(kvg.top)) >> 20) +
+                                  " MiB above the slots the K/V may take, less than the " + std::to_string(bytes >> 20) + " asked for";
+                        } else {
+                            l.lend();
+                            enc_loan = l;
+                        }
+                    }
+                }
+                if (why.empty())
+                    serve_print("LENT %llu %llu %lld %zu\n", (unsigned long long) (uintptr_t) enc_loan.base(),
+                                (unsigned long long) enc_loan.bytes(), (long long) enc_loan.slots(), enc_loan.lent.size());
+                else
+                    serve_print("ERR no loan: %s\n", why.c_str());
+                continue;
+            }
+            if (line == "UNLEND") {
+                std::string why;
+                if (enc_unlend(why)) serve_print("UNLENT\n");
+                else serve_print("ERR refilling a lent slot failed: %s\n", why.c_str());
+                continue;
+            }
+            if (enc_loan.cache != nullptr) {   // a request while a loan is out: the slots come back first
+                std::string why;
+                std::fprintf(stderr, "lamina serve: a request came while the image encoder's loan was out: taken back\n");
+                if (!enc_unlend(why)) {
+                    serve_print("ERR refilling a lent slot failed: %s\n", why.c_str());
+                    return 1;
+                }
+            }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();             // and so is a stopped request's "cancelled"
             const bool geni = line.rfind("GENI ", 0) == 0;

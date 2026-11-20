@@ -183,7 +183,9 @@ window said why at the start.
 
 **Pictures take seconds.** The image encoder runs on the CPU: about 9 s for a picture of ~1,000 image tokens on an
 8-core CPU. The config's `vision.max_tokens` caps a picture's tokens (1,024 in the configs). With a GPU that has
-~1 GB to spare, `--vision-gpu` runs the encoder there (about 0.2 s for such a picture on an RTX 3090).
+~1 GB to spare, `--vision-gpu` runs the encoder there (about 0.2 s for such a picture on an RTX 3090); with
+`--vision-lend` beside it the encoder borrows that VRAM from the engine's expert cache for each new picture
+(0.4-0.6 s) and no GPU needs room to spare.
 
 **Two runs of one greedy request differ.** Where an expert is computed changes its rounding a little, and the GPUs'
 expert caches change as their copies land, so runs can part at a near-tie

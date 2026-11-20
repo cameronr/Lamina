@@ -308,6 +308,63 @@ void LaminaEngine::load() {
     }
 }
 
+std::string LaminaEngine::ask(const std::string& line, std::initializer_list<const char*> answers, double timeout_s) {
+    out_->clear();   // nothing of an earlier request is left to read
+    send(line);
+    const auto t0 = Clock::now();
+    for (;;) {
+        const double left = timeout_s - std::chrono::duration<double>(Clock::now() - t0).count();
+        std::string l;
+        if (left <= 0 || out_->pop(l, left) != 1) return "";
+        if (starts_with(l, "ERR")) return l;
+        for (const char* a : answers)
+            if (starts_with(l, a)) return l;
+    }
+}
+
+void* LaminaEngine::lend(int device, uint64_t bytes, std::string& why) {
+    // the loan is memory of the engine's process, handed over between two requests
+    if (!process_.exe.empty()) {
+        why = "the engine runs in a process of its own";
+        return nullptr;
+    }
+    if (batch_) {
+        why = "the engine's batch slots run requests at once";
+        return nullptr;
+    }
+    if (!alive()) {
+        why = "the engine is not running";
+        return nullptr;
+    }
+    std::string l;
+    try {
+        l = ask("LEND " + std::to_string(device) + " " + std::to_string(bytes), {"LENT "}, 120.0);
+    } catch (const EngineDied& e) {
+        why = e.what();
+        return nullptr;
+    }
+    const std::vector<std::string> f = split_ws(l);
+    if (f.size() < 3 || f[0] != "LENT") {
+        why = l.empty() ? "the engine did not answer" : std::string(strip(l.substr(std::min<size_t>(l.size(), 3))));
+        return nullptr;
+    }
+    const unsigned long long at = std::strtoull(f[1].c_str(), nullptr, 10), got = std::strtoull(f[2].c_str(), nullptr, 10);
+    if (at == 0 || got < bytes) {   // (not what was asked for: handed back)
+        unlend();
+        why = "the engine lent " + f[2] + " bytes";
+        return nullptr;
+    }
+    why = f.size() >= 5 ? f[3] + " slots, " + f[4] + " experts out" : "";
+    return (void*) (uintptr_t) at;
+}
+
+void LaminaEngine::unlend() {
+    try {
+        if (in_ != nullptr && !ended_.load()) (void) ask("UNLEND", {"UNLENT"}, 300.0);
+    } catch (const EngineDied&) {   // (its memory went with it)
+    }
+}
+
 void LaminaEngine::send(const std::string& line) {
     if (in_ == nullptr || ended_.load()) throw EngineDied("the engine stopped unexpectedly (exit code " +
                                                           std::to_string(rc_.load()) + ")");

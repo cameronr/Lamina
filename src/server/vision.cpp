@@ -375,14 +375,31 @@ const char* vision_not_built() {
 #if LAMINA_VISION
 struct Vision::Loaded {
     std::unique_ptr<vision::Encoder> encoder;
-    int device = -1;   // a GPU's encoder: its CUDA device, kept from the engine's resets while it is loaded
+    int device = -1;                 // a resident GPU encoder's CUDA device, kept from the engine's resets
+    std::function<void()> unlend;    // a lease in the engine's memory: given back after the encoder
+    std::string where;               // a lease: what it runs in
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    int pictures = 0;
     ~Loaded() {
         encoder.reset();
+        if (unlend) unlend();
         if (device >= 0) core::gpu_keep(device, false);
     }
 };
+struct Vision::Plan {
+    vision::EncoderParams params;
+    std::string where = "on the CPU";   // "on GPU 1, NVIDIA GeForce RTX 3090"
+    uint64_t need = 0;                  // borrowing: what the encoder takes of its GPU
+    bool said_free = false, said_cpu = false;
+};
+namespace {
+double seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+}  // namespace
 #else
 struct Vision::Loaded {};
+struct Vision::Plan {};
 #endif
 
 Vision::Vision(const json& cfg, bool lazy) : dir(work_dir()), cfg_(cfg) {
@@ -396,12 +413,18 @@ Vision::~Vision() {
     fs::remove_all(u8_path(dir), ec);
 }
 
+void Vision::set_lender(Lend lend, std::function<void()> unlend) {
+    const std::lock_guard<std::mutex> lk(mu_);
+    lender_ = std::move(lend);
+    unlender_ = std::move(unlend);
+}
+
 void Vision::start() {
 #if LAMINA_VISION
     using Clock = std::chrono::steady_clock;
-    auto seconds = [](Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); };
     const json& cfg = cfg_;
-    vision::EncoderParams p;
+    auto plan = std::make_unique<Plan>();
+    vision::EncoderParams& p = plan->params;
     p.mmproj = jstr(cfg, "mmproj");
     p.gpu = truthy(jget(cfg, "gpu"));
     auto number = [](const json& v) { return v.is_number() ? (int) v.get<double>() : 0; };
@@ -409,8 +432,8 @@ void Vision::start() {
     p.max_tokens = number(jget(cfg, "max_tokens"));
     p.min_tokens = number(jget(cfg, "min_tokens"));   // #767
     p.q8_fp16 = lower(jstr(cfg, "q8")) == "fp16";
+    const bool lend = p.gpu && truthy(jget(cfg, "lend"));
     auto loaded = std::make_unique<Loaded>();
-    std::string where = "on the CPU";
     if (p.gpu) {
         // its card among this process's CUDA devices: a UUID or its start, a PCI bus id, a name, or a number, which
         // counts the cards in the PCI buses' order as nvidia-smi does
@@ -436,22 +459,37 @@ void Vision::start() {
             throw std::runtime_error("the vision encoder did not start: its GPU" + (spec.empty() ? std::string() : " " + spec) +
                                      " is not there (" + why + "): name a card that is there in the config's vision "
                                      "\"cuda_device\" (nvidia-smi -L lists them), or set \"gpu\" to false");
-        where = "on GPU " + std::to_string(p.device) + ", " + gpus[(size_t) p.device].name;
+        plan->where = "on GPU " + std::to_string(p.device) + ", " + gpus[(size_t) p.device].name;
         // the encoder's kernels are the engine's: a card they do not run on (older than an RTX 30, or one this build
         // has no kernels for) is said before anything is loaded
         if (const std::string no = core::gpu_unusable(p.device); !no.empty())
-            throw std::runtime_error("the vision encoder did not start " + where + ": " + no + "; name another card in the "
-                                     "config's vision \"cuda_device\", or set \"gpu\" to false (the CPU)");
+            throw std::runtime_error("the vision encoder did not start " + plan->where + ": " + no + "; name another card in "
+                                     "the config's vision \"cuda_device\", or set \"gpu\" to false (the CPU)");
+    }
+    std::string err;
+    if (lend) {
+        // nothing is loaded: the file is read for what a loan must hold, and that it is a projector the encoder reads
+        plan->need = vision::encoder_gpu_bytes(p, err);
+        if (plan->need == 0) throw std::runtime_error("the vision encoder did not start: " + p.mmproj + " (" + err + ")");
+        std::fprintf(stderr, "lamina: the image encoder %s borrows %llu MiB of VRAM for a picture: %s\n", plan->where.c_str(),
+                     (unsigned long long) (plan->need >> 20), p.mmproj.c_str());
+        const std::lock_guard<std::mutex> lk(mu_);
+        plan_ = std::move(plan);
+        lend_ = true;
+        alive_ = true;
+        return;
+    }
+    if (p.gpu) {
         core::gpu_keep(p.device, true);
         loaded->device = p.device;
     }
     const auto t0 = Clock::now();
-    std::string err;
     loaded->encoder = vision::open_encoder(p, err);
     if (!loaded->encoder)
         throw std::runtime_error("the vision encoder did not start: " + p.mmproj + " (" + err + ")");
     const uint64_t vram = loaded->encoder->gpu_bytes();
-    std::fprintf(stderr, "lamina: the image encoder %s: %s loaded in %.1f s%s\n", where.c_str(), p.mmproj.c_str(), seconds(t0),
+    std::fprintf(stderr, "lamina: the image encoder %s: %s loaded in %.1f s%s\n", plan->where.c_str(), p.mmproj.c_str(),
+                 seconds_since(t0),
                  vram == 0 ? "" : (", " + std::to_string(vram >> 20) + " MiB of VRAM for its weights and buffers").c_str());
     if (p.gpu) {
         // A picture at the projector's limit now: what a picture takes of the GPU (the buffers, cuBLAS's, the kernels'
@@ -464,11 +502,117 @@ void Vision::start() {
         vision::Rows rows;
         if (!loaded->encoder->encode(grey, rows, err))
             throw std::runtime_error("the vision encoder did not start: a picture at its limit failed (" + err + ")");
-        std::fprintf(stderr, "lamina: the image encoder warmed up at %d image tokens in %.1f s\n", rows.n, seconds(w0));
+        std::fprintf(stderr, "lamina: the image encoder warmed up at %d image tokens in %.1f s\n", rows.n, seconds_since(w0));
     }
     const std::lock_guard<std::mutex> lk(mu_);
+    plan_ = std::move(plan);
+    lend_ = false;
     loaded_ = std::move(loaded);
     alive_ = true;
+#endif
+}
+
+void* Vision::encoder_now(std::string& err) {
+#if LAMINA_VISION
+    if (loaded_ != nullptr) return loaded_->encoder.get();
+    if (!lend_ || plan_ == nullptr) {
+        err = "the vision encoder is unloaded";
+        return nullptr;
+    }
+    // a lease for this request's pictures: the engine's loan, else the card's free VRAM, else the CPU
+    auto lease = std::make_unique<Loaded>();
+    vision::EncoderParams p = plan_->params;
+    std::string why = "no engine lends";
+    // (LAMINA_VISION_NO_LOAN=1: no loan is asked for, for testing what follows a refusal)
+    const bool ask = lender_ != nullptr && std::getenv("LAMINA_VISION_NO_LOAN") == nullptr;
+    if (!ask && lender_ != nullptr) why = "LAMINA_VISION_NO_LOAN";
+    if (ask) {
+        if (void* at = lender_(p.device, plan_->need, why)) {
+            lease->unlend = unlender_;
+            lease->where = "the engine's cache (" + why + ")";
+            p.gpu_arena = at;
+            p.gpu_arena_bytes = plan_->need;
+            lease->encoder = vision::open_encoder(p, err);
+            if (!lease->encoder) {   // (the loan goes back with the lease)
+                why = err;
+                lease = std::make_unique<Loaded>();
+            }
+        }
+    }
+    if (!lease->encoder) {
+        // only where the card has the room: an allocation past its free memory does not fail under WDDM, it pages
+        const uint64_t free_now = vision::gpu_free_bytes(p.device), room = plan_->need + ((uint64_t) 64 << 20);
+        p.gpu_arena = nullptr;
+        p.gpu_arena_bytes = 0;
+        lease->where = "the card's free VRAM";
+        if (free_now >= room) lease->encoder = vision::open_encoder(p, err);
+        else err = std::to_string(free_now >> 20) + " MiB free, " + std::to_string(room >> 20) + " needed";
+        if (lease->encoder && !plan_->said_free) {
+            plan_->said_free = true;
+            std::fprintf(stderr, "lamina: the image encoder %s found no loan (%s): in the card's free VRAM\n",
+                         plan_->where.c_str(), why.c_str());
+        }
+    }
+    if (!lease->encoder) {
+        if (cpu_ == nullptr) {
+            auto cpu = std::make_unique<Loaded>();
+            p.gpu = false;
+            std::string cpu_err;
+            cpu->encoder = vision::open_encoder(p, cpu_err);
+            if (!cpu->encoder) {
+                err = cpu_err;
+                return nullptr;
+            }
+            cpu_ = std::move(cpu);
+        }
+        if (!plan_->said_cpu) {
+            plan_->said_cpu = true;
+            std::fprintf(stderr, "lamina: the image encoder %s found no VRAM for a picture (no loan: %s; the card's free "
+                                 "VRAM: %s): the CPU encodes\n", plan_->where.c_str(), why.c_str(), err.c_str());
+        }
+        err.clear();
+        return cpu_->encoder.get();
+    }
+    loaded_ = std::move(lease);
+    return loaded_->encoder.get();
+#else
+    err = vision_not_built();
+    return nullptr;
+#endif
+}
+
+void Vision::lease_end() {
+#if LAMINA_VISION
+    if (!lend_ || loaded_ == nullptr) return;
+    const std::string where = loaded_->where;
+    const int pictures = loaded_->pictures;
+    const auto since = loaded_->since;
+    const double used = seconds_since(since);
+    loaded_.reset();   // the encoder, then the loan (the engine's slots refilled)
+    std::fprintf(stderr, "lamina: the image encoder borrowed %s for %d picture%s: %.2f s, and %.2f s to give it back\n",
+                 where.c_str(), pictures, pictures == 1 ? "" : "s", used, seconds_since(since) - used);
+#endif
+}
+
+void Vision::warm_up() {
+#if LAMINA_VISION
+    const std::lock_guard<std::mutex> lk(mu_);
+    if (!lend_ || plan_ == nullptr) return;
+    std::string err;
+    auto* enc = (vision::Encoder*) encoder_now(err);
+    if (enc == nullptr) {
+        std::fprintf(stderr, "lamina: the image encoder's warm-up found no encoder (%s)\n", err.c_str());
+        return;
+    }
+    if (loaded_ == nullptr) return;   // (the CPU: nothing to warm)
+    vision::Rgb grey;
+    grey.w = grey.h = 2048;
+    grey.px.assign((size_t) grey.w * grey.h * 3, 128);
+    vision::Rows rows;
+    if (!enc->encode(grey, rows, err))
+        std::fprintf(stderr, "lamina: the image encoder's warm-up picture failed (%s)\n", err.c_str());
+    loaded_->pictures = 1;
+    lease_end();
 #endif
 }
 
@@ -485,6 +629,7 @@ void Vision::close() {
     const std::lock_guard<std::mutex> lk(mu_);
     alive_ = false;
     loaded_.reset();
+    cpu_.reset();
 }
 
 std::string Vision::load(const std::string& source) {
@@ -576,6 +721,18 @@ std::string Vision::normalize(const std::string& data) {
 
 std::vector<std::pair<std::string, int64_t>> Vision::encode_all(const std::vector<std::pair<std::string, bool>>& sources,
                                                                 Cancel* cancel) {
+    // a borrowing encoder's lease holds for all of the request's new pictures
+    struct Hold {
+        Vision& v;
+        explicit Hold(Vision& vision) : v(vision) {
+            const std::lock_guard<std::mutex> lk(v.mu_);
+            ++v.holds_;
+        }
+        ~Hold() {
+            const std::lock_guard<std::mutex> lk(v.mu_);
+            if (--v.holds_ == 0) v.lease_end();
+        }
+    } hold(*this);
     std::vector<std::pair<std::string, int64_t>> out;
     for (const auto& [src, is_bytes] : sources) {
         if (cancel != nullptr && cancel->is_set()) throw ClientGone();
@@ -600,13 +757,21 @@ std::pair<std::string, int64_t> Vision::encode(const std::string& source, bool i
     const fs::path out = u8_path(dir) / (key + ".sve");
     int64_t ntok = 0;
 #if LAMINA_VISION
-    if (loaded_ == nullptr) throw std::invalid_argument("the image could not be read: the vision encoder is unloaded");
     vision::Rgb picture;
     vision::Rows rows;
     std::string err;
     if (!vision::decode_memory((const uint8_t*) data.data(), data.size(), picture, err))
         throw std::invalid_argument("the image could not be read (" + err + ")");
-    if (!loaded_->encoder->encode(picture, rows, err)) throw std::invalid_argument("the image could not be read: " + err);
+    struct LeaseEnd {   // a picture encoded outside encode_all: its lease ends with it
+        Vision& v;
+        ~LeaseEnd() {
+            if (v.holds_ == 0) v.lease_end();
+        }
+    } lease_end_{*this};
+    auto* encoder = (vision::Encoder*) encoder_now(err);
+    if (encoder == nullptr) throw std::invalid_argument("the image could not be read: " + err);
+    if (!encoder->encode(picture, rows, err)) throw std::invalid_argument("the image could not be read: " + err);
+    if (lend_ && loaded_ != nullptr) ++loaded_->pictures;
     if (!vision::write_rows(u8_str(out), rows)) {
         std::error_code ec;
         fs::remove(out, ec);

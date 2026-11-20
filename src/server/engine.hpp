@@ -1,7 +1,8 @@
 // src/server/engine.hpp - the engine as the server sees it (LaminaEngine and MockEngine).
 //
 // LaminaEngine runs the engine (lamina::program::run) on a thread of this process and speaks its --serve line
-// protocol through in-process channels: GEN / GENI requests (sampling keys between max_new and the ids), STOP, QUIT;
+// protocol through in-process channels: GEN / GENI requests (sampling keys between max_new and the ids), STOP, QUIT,
+// and between requests LEND / UNLEND (VRAM of its expert cache for the image encoder: LENT, UNLENT);
 // T tokens, PP prompt progress, LP / TIERS notes, DONE figures, ERR, READY and INFO. A request runs through generate(),
 // whose callbacks take each token and the heartbeats; a callback that returns false ends the request (STOP, then
 // the rest of it is read to its DONE).
@@ -94,6 +95,15 @@ public:
     virtual void unload() {}
     virtual void load() {}
     virtual void close() {}
+    /// `bytes` of the VRAM the engine's expert cache holds on its CUDA device `device`, lent until unlend(): the
+    /// address, or null with `why` (an engine in another process, batch slots, a model whose engine lends none, a
+    /// cache that cannot spare it).  Between two requests only: the caller holds the service's turn.
+    virtual void* lend(int device, uint64_t bytes, std::string& why) {
+        (void) device, (void) bytes;
+        why = "this engine lends no VRAM";
+        return nullptr;
+    }
+    virtual void unlend() {}
     virtual int64_t max_context() const { return max_context_; }
     virtual int64_t known_ctx() const { return known_ctx_; }
     virtual bool starting() const { return starting_.load(); }
@@ -188,6 +198,8 @@ public:
     void unload() override;
     void load() override;
     void close() override;
+    void* lend(int device, uint64_t bytes, std::string& why) override;
+    void unlend() override;
     bool unloaded() const override { return unloaded_; }
     bool auto_load() const override { return true; }
     /// the engine's own words on why it ended (its log's tail)
@@ -204,6 +216,9 @@ public:
 private:
     void start();
     void send(const std::string& line);
+    /// `line` to the idle engine and its answer, the first line that starts with one of `answers` or with ERR ("":
+    /// none within `timeout_s`, or the engine ended)
+    std::string ask(const std::string& line, std::initializer_list<const char*> answers, double timeout_s);
     bool note_line(const std::string& line);
     /// a CACHE line: the prompt cache's state at READY and after each request (the Conversation cache card)
     void cache_line(const std::string& line);

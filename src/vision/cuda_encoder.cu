@@ -23,8 +23,11 @@
 // On the device: the weights in one block in the file's types (BF16 turned to FP16; a Q8_0 matrix its blocks, which
 // FP16 products dequantize into a scratch a product), sized by a first pass of load(); two buffers of a row a patch
 // for the largest picture the projector's limit gives (made again for a picture past it), q, k and v, and a
-// product's input and output for kChunk rows.  The adapters leave the rows in one of the two buffers.
-// LAMINA_VISION_MEM=1 prints the device's free memory after each step of the start.
+// product's input and output for kChunk rows.  The adapters leave the rows in one of the two buffers.  All of it is
+// the encoder's own allocation or, lent, one block of its caller's (EncoderParams::gpu_arena: the weights at its
+// start, the buffers after them): lamina-server's encoder borrows the engine's expert-cache slots that way for a
+// picture and loads its weights each time, the file's matrices read into one pinned buffer (0.17-0.31 s).
+// LAMINA_VISION_MEM=1 prints the device's free memory and the time after each step of the start.
 #include "backends.hpp"
 
 #include "lamina/kernels/warp.cuh"
@@ -36,6 +39,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -478,12 +482,24 @@ public:
         cudaSetDevice(dev_);
         mctx_.reset();
         if (blas_ != nullptr) cublasDestroy(blas_);
+        stage_free();
         for (void* p : work_) cudaFree(p);
-        if (arena_ != nullptr) cudaFree(arena_);
+        if (arena_ != nullptr && !lent_) cudaFree(arena_);
         if (st_ != nullptr) cudaStreamDestroy(st_);
     }
     CudaEncoder(const CudaEncoder&) = delete;
     CudaEncoder& operator=(const CudaEncoder&) = delete;
+
+    /// What open() takes of the device for `p`: the weights' block and the buffers for the projector's largest
+    /// picture.  No CUDA call.  throws std::runtime_error
+    uint64_t measure(const EncoderParams& p) {
+        proj_.open(p);
+        settle(p);
+        measuring_ = true;
+        load();
+        measuring_ = false;
+        return up(arena_used_) + alloc(first_patches(), true);
+    }
 
     /// throws std::runtime_error
     void open(const EncoderParams& p) {
@@ -500,18 +516,23 @@ public:
         mem("cublasCreate");
         ck(cudaFuncSetAttribute(va::k_vit_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(va::Smem)),
            "the attention kernel's shared memory");
-        const char* attn = std::getenv("LAMINA_VISION_ATTN");
-        ref_attn_ = attn != nullptr && std::string(attn) == "ref";
-        // a Q8_0 matrix through MMQ (int8 tensor cores, the activations q8_1, llama.cpp's arithmetic for it) unless
-        // the caller asks for FP16 products or MMQ has no tile for it here
-        q8_fp16_ = p.q8_fp16 || !mmq::built() || !mmq::supported(kQ8_0);
+        settle(p);
         // the weights in one block: load() once to measure it, once to fill it
         measuring_ = true;
         load();
         measuring_ = false;
         arena_bytes_ = arena_used_;
         arena_used_ = 0;
-        if (cudaMalloc(&arena_, arena_bytes_) != cudaSuccess) {
+        if (p.gpu_arena != nullptr) {   // the caller's memory: the weights at its start, the buffers after them
+            lent_ = true;
+            const uint64_t need = up(arena_bytes_) + alloc(first_patches(), true);
+            if (p.gpu_arena_bytes < need)
+                throw std::runtime_error("the memory lent to the encoder (" + std::to_string(p.gpu_arena_bytes >> 20) +
+                                         " MiB) is less than it takes (" + std::to_string((need >> 20) + 1) + " MiB)");
+            arena_ = p.gpu_arena;
+            lent_work_ = (uint8_t*) p.gpu_arena + up(arena_bytes_);
+            lent_work_bytes_ = p.gpu_arena_bytes - up(arena_bytes_);
+        } else if (cudaMalloc(&arena_, arena_bytes_) != cudaSuccess) {
             (void) cudaGetLastError();
             arena_ = nullptr;
             throw std::runtime_error("the projector's weights (" + std::to_string(arena_bytes_ >> 20) +
@@ -519,9 +540,20 @@ public:
         }
         load();
         mem("the weights");
-        alloc(proj_.size.max_pixels / (proj_.patch_size * proj_.patch_size));
+        alloc(first_patches(), false);
         mem("the buffers");
     }
+    /// what the environment and the build settle of `p`
+    void settle(const EncoderParams& p) {
+        const char* attn = std::getenv("LAMINA_VISION_ATTN");
+        ref_attn_ = attn != nullptr && std::string(attn) == "ref";
+        // a Q8_0 matrix through MMQ (int8 tensor cores, the activations q8_1, llama.cpp's arithmetic for it) unless
+        // the caller asks for FP16 products or MMQ has no tile for it here
+        q8_fp16_ = p.q8_fp16 || !mmq::built() || !mmq::supported(kQ8_0);
+    }
+    /// the patches of the largest picture the projector's limit gives: the buffers start at this size
+    int64_t first_patches() const { return proj_.size.max_pixels / (proj_.patch_size * proj_.patch_size); }
+    static uint64_t up(uint64_t bytes) { return (bytes + 255) & ~(uint64_t) 255; }
     /// LAMINA_VISION_MEM=1: the device's free memory after a step of the start, and what the step took
     void mem(const char* step) {
         if (std::getenv("LAMINA_VISION_MEM") == nullptr) return;
@@ -529,10 +561,14 @@ public:
         if (cudaMemGetInfo(&fr, &total) != cudaSuccess) return;
         const std::string took =
             mem_last_ == 0 ? "" : " (-" + std::to_string(((long long) mem_last_ - (long long) fr) / 1048576) + " MiB)";
-        std::fprintf(stderr, "vision mem: %s: %.0f MiB free%s\n", step, (double) fr / 1048576.0, took.c_str());
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "vision mem: %s: %.0f MiB free%s, %.0f ms\n", step, (double) fr / 1048576.0, took.c_str(),
+                     mem_last_ == 0 ? 0.0 : std::chrono::duration<double, std::milli>(now - mem_at_).count());
+        mem_at_ = now;
         mem_last_ = fr;
     }
     size_t mem_last_ = 0;
+    std::chrono::steady_clock::time_point mem_at_{};
 
     int n_embd() const override { return proj_.projection_dim; }
     uint64_t gpu_bytes() const override { return arena_bytes_ + work_bytes_; }
@@ -589,6 +625,25 @@ private:
         if ((int64_t) v.size() != n) throw std::runtime_error("the tensor " + name + " has another size than the tower's");
         return upload(v);
     }
+    /// The matrices' staging buffer: pinned, as large as the largest of them (the measure's count), so each is read
+    /// from the file's cache into the same warm pages and copied at the link's rate; pageable where pinning fails.
+    uint8_t* stage(size_t bytes) {
+        if (stage_ == nullptr && stage_pageable_.empty()) {
+            if (cudaHostAlloc(&stage_, std::max(stage_need_, bytes), cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                stage_ = nullptr;
+            }
+        }
+        if (stage_ != nullptr && bytes <= stage_need_) return (uint8_t*) stage_;
+        if (stage_pageable_.size() < bytes) stage_pageable_.resize(bytes);
+        return stage_pageable_.data();
+    }
+    void stage_free() {
+        if (stage_ != nullptr) cudaFreeHost(stage_);
+        stage_ = nullptr;
+        std::vector<uint8_t>().swap(stage_pageable_);
+    }
+
     /// A matrix as the file has it: F16 as it is, BF16 turned to FP16, Q8_0 as blocks (or, for FP16 products, its
     /// values), F32 as it is.
     Mat mat(const std::string& name, int64_t n_out, int64_t n_in) {
@@ -597,10 +652,14 @@ private:
         if (info->ne[0] != n_in || info->ne[1] != n_out || info->ne[2] != 1)
             throw std::runtime_error("the tensor " + name + " has another shape than the tower's");
         const size_t bytes = info->bytes;
-        std::vector<uint8_t> raw;
+        stage_need_ = std::max(stage_need_, bytes);
+        struct Raw {   // the file's bytes, in the staging buffer (the measure: none)
+            const uint8_t* p = nullptr;
+            const uint8_t* data() const { return p; }
+        } raw;
         if (!measuring_) {
-            raw.resize(bytes);
-            proj_.read(name, *info, raw.data());
+            raw.p = stage(bytes);
+            proj_.read(name, *info, (void*) raw.p);
         }
         Mat m;
         m.n_out = n_out;
@@ -769,19 +828,30 @@ private:
         }
         if (qwen && (mm1_.n_out != proj || mm0_.n_out != 4 * E))
             throw std::runtime_error("its adapter's output is not its projection_dim wide");
-        ck(cudaStreamSynchronize(st_), "the weights' conversion");
+        if (!measuring_) {
+            ck(cudaStreamSynchronize(st_), "the weights' conversion");
+            stage_free();
+        }
     }
 
     /// The buffers for pictures of up to `n` patches.  The projector's limit gives the size they start with; a
     /// picture past it (the sizing's lower limit and its clamp to one merged patch a side can pass the upper limit)
-    /// has them made again.
-    void alloc(int64_t n) {
-        free_work();
+    /// has them made again.  In lent memory they are carved after the weights, each time from its start.  `count`:
+    /// nothing is made, their bytes are returned (256 apart, as lent memory holds them).
+    uint64_t alloc(int64_t n, bool count) {
+        if (!count) free_work();
         const int E = proj_.n_embd, H = proj_.n_head;
-        n_max_ = n;
-        chunk_ = std::min<int64_t>(kChunk, n_max_);
+        const int64_t n_max = n, chunk = std::min<int64_t>(kChunk, n);
         const int64_t wide = std::max<int64_t>({3 * (int64_t) E, n_ff_, 4 * (int64_t) E, n_mid_, proj_.projection_dim});
-        auto work = [&](size_t bytes) {
+        // lent memory holds the buffers of the projector's largest picture; one past it (the sizing's lower limit can
+        // pass the upper one) has them from the device's free memory, as an encoder with memory of its own
+        const bool in_loan = !count && lent_ && alloc(n, true) <= lent_work_bytes_;
+        uint64_t total = 0;
+        auto work = [&](size_t bytes) -> void* {
+            const uint64_t at = total;
+            total += up(std::max<size_t>(bytes, 16));
+            if (count) return nullptr;
+            if (in_loan) return lent_work_ + at;
             void* p = nullptr;
             if (cudaMalloc(&p, std::max<size_t>(bytes, 16)) != cudaSuccess) {
                 (void) cudaGetLastError();
@@ -790,32 +860,46 @@ private:
                                          " patches do not fit the GPU's free memory");
             }
             work_.push_back(p);
-            work_bytes_ += bytes;
             return p;
         };
         // the two streams' buffers: a row of the tower's width a patch, or a quarter of an adapter's row where that
         // is wider (the 27B's rows of 5,120): the adapters leave their rows in them, a row a group of four patches
         const int64_t adapter = std::max<int64_t>(n_mid_, proj_.projection_dim);
-        const size_t stream = (size_t) n_max_ * (size_t) std::max<int64_t>(E, (adapter + 3) / 4) * 4;
-        x_ = (float*) work(stream);
-        h_ = (float*) work(stream);
-        c32_ = (float*) work((size_t) chunk_ * wide * 4);
-        x16_ = (__half*) work((size_t) chunk_ * wide * 2);
-        q16_ = (__half*) work((size_t) n_max_ * H * kHeadPad * 2);
-        k16_ = (__half*) work((size_t) n_max_ * H * kHeadPad * 2);
-        v16_ = (__half*) work((size_t) n_max_ * H * kHeadPad * 2);
-        cs_ = (float*) work((size_t) n_max_ * kRopeFreqs * 2 * 4);
-        if (any_mmq_) {
-            if (!mctx_) mctx_ = std::make_unique<mmq::Context>();
-            xq_ = work(mmq::q8_bytes(chunk_, wide));
-        }
-        if (q8_elems_ > 0) w16_ = (__half*) work((size_t) q8_elems_ * 2);
-        if (ref_attn_) {
-            ref_b_ = std::max<int64_t>(1, std::min<int64_t>(n_max_, ((int64_t) 1 << 26) / n_max_));   // query rows at once
-            ref_s_ = (float*) work((size_t) ref_b_ * n_max_ * 4);
-            ref_v_ = (float*) work((size_t) n_max_ * kHeadPad * 4);
-            ref_o_ = (float*) work((size_t) ref_b_ * kHeadPad * 4);
-        }
+        const size_t stream = (size_t) n_max * (size_t) std::max<int64_t>(E, (adapter + 3) / 4) * 4;
+        void* const x = work(stream);
+        void* const h = work(stream);
+        void* const c32 = work((size_t) chunk * wide * 4);
+        void* const x16 = work((size_t) chunk * wide * 2);
+        void* const q16 = work((size_t) n_max * H * kHeadPad * 2);
+        void* const k16 = work((size_t) n_max * H * kHeadPad * 2);
+        void* const v16 = work((size_t) n_max * H * kHeadPad * 2);
+        void* const cs = work((size_t) n_max * kRopeFreqs * 2 * 4);
+        void* const xq = any_mmq_ ? work(mmq::q8_bytes(chunk, wide)) : nullptr;
+        void* const w16 = q8_elems_ > 0 ? work((size_t) q8_elems_ * 2) : nullptr;
+        const int64_t ref_b = std::max<int64_t>(1, std::min<int64_t>(n_max, ((int64_t) 1 << 26) / std::max<int64_t>(1, n_max)));
+        void* const ref_s = ref_attn_ ? work((size_t) ref_b * n_max * 4) : nullptr;
+        void* const ref_v = ref_attn_ ? work((size_t) n_max * kHeadPad * 4) : nullptr;
+        void* const ref_o = ref_attn_ ? work((size_t) ref_b * kHeadPad * 4) : nullptr;
+        if (count) return total;
+        if (any_mmq_ && !mctx_) mctx_ = std::make_unique<mmq::Context>();
+        n_max_ = n_max;
+        chunk_ = chunk;
+        work_bytes_ = total;
+        x_ = (float*) x;
+        h_ = (float*) h;
+        c32_ = (float*) c32;
+        x16_ = (__half*) x16;
+        q16_ = (__half*) q16;
+        k16_ = (__half*) k16;
+        v16_ = (__half*) v16;
+        cs_ = (float*) cs;
+        xq_ = xq;
+        w16_ = (__half*) w16;
+        ref_b_ = ref_b;
+        ref_s_ = (float*) ref_s;
+        ref_v_ = (float*) ref_v;
+        ref_o_ = (float*) ref_o;
+        return total;
     }
 
     // ---- products --------------------------------------------------------------------------------------------------
@@ -895,7 +979,7 @@ private:
         const bool qwen = proj_.kind == ProjectorKind::qwen3vl;
         const int E = proj_.n_embd, H = proj_.n_head, D = proj_.d_head(), P = proj_.patch_size;
         const int pw = tw / P, ph = th / P, N = pw * ph, in = 3 * P * P;
-        if (N > n_max_) alloc(N);
+        if (N > n_max_) alloc(N, false);
 
         // the patches as rows (channel, row, column), and the position table, in the tokens' order: Qwen's the 2x2
         // groups' (a group's four patches one after the other), Hy4's the grid's
@@ -1085,6 +1169,12 @@ private:
     cublasHandle_t blas_ = nullptr;
     void* arena_ = nullptr;       // the weights' block
     size_t arena_bytes_ = 0, arena_used_ = 0;
+    void* stage_ = nullptr;       // load(): the matrices' pinned staging buffer
+    size_t stage_need_ = 0;       // the largest matrix's bytes
+    std::vector<uint8_t> stage_pageable_;
+    bool lent_ = false;           // the caller's memory (EncoderParams::gpu_arena): the weights, then the buffers
+    uint8_t* lent_work_ = nullptr;
+    uint64_t lent_work_bytes_ = 0;
     bool measuring_ = false;      // load() counts the block's bytes
     uint8_t measure_dummy_ = 0;   // a weight's place while it does
     std::vector<void*> work_;     // the buffers (alloc)
@@ -1124,6 +1214,24 @@ private:
 };
 
 }  // namespace
+
+uint64_t gpu_free_bytes(int device) {
+    size_t fr = 0, total = 0;
+    if (cudaSetDevice(device) != cudaSuccess || cudaMemGetInfo(&fr, &total) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    return fr;
+}
+
+uint64_t cuda_encoder_bytes(const EncoderParams& params, std::string& err) {
+    try {
+        return CudaEncoder().measure(params);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return 0;
+    }
+}
 
 std::unique_ptr<Encoder> open_cuda_encoder(const EncoderParams& params, std::string& err) {
     auto enc = std::make_unique<CudaEncoder>();

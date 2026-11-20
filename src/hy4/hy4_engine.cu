@@ -1545,6 +1545,12 @@ struct Engine {
         std::fprintf(stderr, "lamina: the context takes the main GPU's expert slots %d -> %d a layer (%d experts moved "
                      "down, %d gone)\n", S, s2, moved, gone);
     }
+    /// the layers whose experts the main GPU's slots hold (a slot a layer given up is this many slots)
+    int lent_layers() const {
+        int n = 0;
+        for (const Layer& l : m->layers) n += l.slot_vm ? 1 : 0;
+        return n;
+    }
     /// n chunks for a buffer the prompt path maps for a while: the spare ones, the free VRAM above kReserve (new chunks),
     /// the rest from the main GPU's last slots (shrink_main puts theirs in spare)
     bool lend_chunks(int64_t n) {
@@ -4847,8 +4853,75 @@ struct Serve {
     Serve(Engine& e, int32_t eos_id, int drafts_) : E(e), eos(eos_id), drafts(drafts_) {}
     int drafts = 0;   // the drafts a window (E.drafts_on)
 
+    // The server's image encoder, which runs in this process, holds no VRAM of its own between pictures where the
+    // server has it borrow (its "vision" section's "lend"): for a new picture it asks for memory of the main GPU,
+    // mapped here from the chunks its last expert slots give up (and the free VRAM above the reserve), as the prompt
+    // path's pass buffers are; given back, the slots grow again and the residents they displaced are queued back.
+    std::unique_ptr<lamina::core::VmmRange> enc_vm;
+    void enc_back() {
+        if (!enc_vm) return;
+        CK(cudaDeviceSynchronize());   // the encoder's last kernels
+        for (int64_t c = 0; c < enc_vm->chunks(); ++c)
+            if (enc_vm->mapped(c)) E.spare.push_back(enc_vm->unmap(c));
+        enc_vm.reset();
+        E.slots_back();
+        const int q = E.queue_restore();
+        std::fprintf(stderr, "lamina: the image encoder's loan back to the main GPU's slots (%d residents queued back)\n", q);
+    }
+    void lend(const std::string& line, bool in_process) {
+        long long dev = -1;
+        unsigned long long bytes = 0;
+        std::string why;
+        const int s0 = E.gpus.empty() ? 0 : E.gpus[0].S;
+        if (std::sscanf(line.c_str() + 5, "%lld %llu", &dev, &bytes) != 2 || bytes == 0) {
+            why = "expected LEND <device> <bytes>";
+        } else if (!in_process) {
+            why = "a loan is memory of the engine's own process";
+        } else if (enc_vm) {
+            why = "a loan is out already";
+        } else if (dev != E.main_dev) {
+            why = "Hy4-flash's engine lends on its main GPU alone (GPU " + std::to_string(E.main_dev) + ")";
+        } else if (!E.elastic) {
+            why = "the main GPU's slots are not mapped in chunks (--no-kv-grow, or no VMM)";
+        } else {
+            auto vm = std::make_unique<lamina::core::VmmRange>();
+            if (!vm->reserve(bytes)) {
+                why = "no address range of " + std::to_string(bytes >> 20) + " MiB";
+            } else if (!E.lend_chunks(vm->chunks())) {
+                why = "the main GPU's slots cannot spare " + std::to_string(bytes >> 20) + " MiB";
+            } else {
+                auto take = [&]() -> lamina::core::VmmChunk {
+                    if (E.spare.empty()) return 0;
+                    const lamina::core::VmmChunk h = E.spare.back();
+                    E.spare.pop_back();
+                    return h;
+                };
+                if (vm->map_range(0, vm->chunks(), take)) {
+                    enc_vm = std::move(vm);
+                } else {
+                    for (int64_t c = 0; c < vm->chunks(); ++c)
+                        if (vm->mapped(c)) E.spare.push_back(vm->unmap(c));
+                    E.slots_back();
+                    E.queue_restore();
+                    why = "the main GPU has no " + std::to_string(bytes >> 20) + " MiB to map";
+                }
+            }
+        }
+        if (why.empty()) {
+            const long long out = (long long) (s0 - E.gpus[0].S) * (long long) E.lent_layers();
+            serve_print("LENT %llu %llu %lld %lld\n", (unsigned long long) (uintptr_t) enc_vm->base(),
+                        (unsigned long long) enc_vm->chunks() * lamina::core::vmm_granularity(), out, out);
+        } else {
+            serve_print("ERR no loan: %s\n", why.c_str());
+        }
+    }
+
     void request(const std::string& line) {
         const auto& g = E.m->g;
+        if (enc_vm) {   // a request while a loan is out: the chunks come back first
+            std::fprintf(stderr, "lamina: a request came while the image encoder's loan was out: taken back\n");
+            enc_back();
+        }
         E.warm_up();   // a request after a pause: the cards brought up beside its first work
         struct Ended {   // the request's end, for the next one's pause
             Engine& e;
@@ -5082,6 +5155,11 @@ struct Serve {
             if (line.empty()) continue;
             if (line.rfind("GEN ", 0) == 0 || line.rfind("GENI ", 0) == 0) {
                 request(line);
+            } else if (line.rfind("LEND ", 0) == 0) {
+                lend(line, io.in_process);
+            } else if (line == "UNLEND") {
+                enc_back();
+                serve_print("UNLENT\n");
             } else if (line == "QUIT") {
                 std::lock_guard<std::mutex> lk(mu);
                 eof = true;

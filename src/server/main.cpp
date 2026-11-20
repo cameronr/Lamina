@@ -299,13 +299,38 @@ void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
     }
     if (gpus.empty()) gpus = nvidia_gpus();
     const std::vector<int> engine = engine_gpus(cfg, gpus);
-    const int pick = pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
+    // "lend": the engine's main GPU, whose cache every engine that lends lends from; else a card beside it
+    const bool lend = truthy(jget(v, "lend")) && !engine.empty();
+    const int pick = lend ? engine.front() : pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
     for (const GpuInfo& g : gpus)
         if (g.index == pick) {
             cfg["vision"]["cuda_device"] = g.uuid;
             say("[lamina] the image encoder on GPU " + std::to_string(g.index) + ", " + g.name +
+                (lend ? ", the engine's main one, whose cache lends it VRAM for a picture" : "") +
                 " (--vision-cuda-device names another)");
         }
+}
+
+/// Why the image encoder cannot borrow the engine's VRAM for its pictures (the vision section's "lend"), "" when it
+/// can: the loan is memory of an engine in this process that runs one request at a time, on a card where it keeps
+/// an expert cache it lends from (Flash-Next: each of its cards; Hy4-flash: its main one).
+std::string no_lending(const json& cfg, const std::string& arch, bool replicas, std::vector<GpuInfo>& gpus) {
+    const json& v = jget(cfg, "vision");
+    if (!truthy(jget(v, "gpu"))) return "the encoder runs on the CPU";
+    if (replicas) return "the replicas' engines are processes of their own";
+    const std::vector<std::string> args = engine_args(cfg);
+    if (std::find(args.begin(), args.end(), "--batch") != args.end() || std::find(args.begin(), args.end(), "--slots") != args.end())
+        return "the engine's batch slots run requests at once";
+    if (arch != "qwen4exp" && arch != "hy_v4_flash") return "this model's engine lends no VRAM";
+    const json& dev = jget(v, "cuda_device");
+    if (dev.is_null()) return "";
+    if (gpus.empty()) gpus = nvidia_gpus();
+    const std::vector<int> on = engine_gpus(cfg, gpus);
+    const int card = find_gpu(dev.is_string() ? dev.get<std::string>() : py_dumps(dev), gpus);
+    if (card < 0 || on.empty()) return "";   // (nvidia-smi lists nothing: the engine answers when asked)
+    if (std::find(on.begin(), on.end(), card) == on.end()) return "the engine keeps no expert cache on the encoder's card";
+    if (arch == "hy_v4_flash" && card != on.front()) return "Hy4-flash's engine lends on its main GPU alone";
+    return "";
 }
 
 int run(int argc, char** argv) {
@@ -593,6 +618,7 @@ int run(int argc, char** argv) {
     }
     std::shared_ptr<Engine> engine;
     std::shared_ptr<Vision> vision;
+    bool vision_lends = false;   // its section's "lend", where the engine can lend
     json sampling_defaults = json::object();
     std::optional<std::vector<std::string>> effort_end;
     std::vector<std::vector<int>> groups;
@@ -633,6 +659,15 @@ int run(int argc, char** argv) {
                 json vcfg = cfg["vision"];   // a relative path is the config's cwd's, as for the engine
                 if (const std::string f = jstr(vcfg, "mmproj"); !f.empty() && !u8_path(f).is_absolute())
                     vcfg["mmproj"] = u8_str(cfg_dir / u8_path(f));
+                // "lend": where the engine can lend VRAM on the encoder's card; else the encoder keeps its own
+                if (truthy(jget(vcfg, "lend"))) {
+                    if (const std::string why = no_lending(cfg, tok->architecture, !groups.empty(), gpus); !why.empty()) {
+                        say("[lamina] the vision section's \"lend\" is left out (" + why + "): the image encoder keeps "
+                            "its VRAM");
+                        vcfg["lend"] = false;
+                    }
+                }
+                vision_lends = truthy(jget(vcfg, "lend"));
                 vision = std::make_shared<Vision>(vcfg, lazy);
             }
             say(lazy ? "model unloaded; the first request loads it ..." : "loading the model (the first start takes a minute or two) ...");
@@ -650,6 +685,11 @@ int run(int argc, char** argv) {
                 auto le = std::make_shared<LaminaEngine>(args, log, lazy);
                 le->silence_s = silence;
                 engine = le;
+            }
+            if (vision != nullptr && vision_lends) {   // the encoder's loans for its pictures, and the first one now
+                vision->set_lender([engine](int device, uint64_t bytes, std::string& why) { return engine->lend(device, bytes, why); },
+                                   [engine] { engine->unlend(); });
+                if (!lazy) vision->warm_up();
             }
         } else {
             std::vector<std::string> scripts;

@@ -51,6 +51,11 @@ struct EncoderParams {
     /// A GPU, a Q8_0 projector: each matrix's values as FP16 and the products as the other files' (FP16 in, FP32
     /// sums), in place of MMQ over its blocks (the activations rounded to q8_1, llama.cpp's arithmetic for the file).
     bool q8_fp16 = false;
+    /// A GPU: memory of `device` the caller lends the encoder for its whole life, at least encoder_gpu_bytes(): the
+    /// weights and the buffers are carved from it and the encoder allocates none of its own (cuBLAS's handle and
+    /// MMQ's pool aside: 12 and 36 MiB).  Null: its own allocations.
+    void* gpu_arena = nullptr;
+    uint64_t gpu_arena_bytes = 0;
 };
 
 /// A picture's rows: n = nx * ny rows of n_embd floats.
@@ -74,6 +79,14 @@ public:
 /// The rows as the record the engine reads a picture from (program/serve_io.hpp): int32 {0x31455653 'SVE1', n, nx,
 /// ny, n_embd}, then the n x n_embd floats.  False when the file cannot be written whole.
 bool write_rows(const std::string& path, const Rows& rows);
+
+/// What a GPU's encoder for `params` takes of its device: the weights in the file's types and the buffers for the
+/// projector's largest picture.  The file's header is read, no GPU touched.  0 with `err`.
+uint64_t encoder_gpu_bytes(const EncoderParams& params, std::string& err);
+
+/// The free memory of this process's CUDA device `device`, which becomes the calling thread's current one (0 when
+/// it cannot be asked).  Under WDDM an allocation past it does not fail: Windows pages the GPU's memory.
+uint64_t gpu_free_bytes(int device);
 
 /// The encoder: a GPU's (the weights and the buffers for the largest picture taken on params.device now) or the
 /// CPU's.  nullptr with `err`: a file that is not a projector of the two types, weights that do not fit, no such

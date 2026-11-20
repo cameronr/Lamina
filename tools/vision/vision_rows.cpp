@@ -9,6 +9,8 @@
 //   --flash-attn    the CPU's attention: off computes it as two products in FP32, the reference a GPU's rows are
 //                   measured against
 //   --q8            a GPU, a Q8_0 projector: its products through MMQ (the default) or as FP16 products
+//   --lent          a GPU: the encoder in memory this program allocates for it first (encoder_gpu_bytes), as the
+//                   server lends it expert-cache slots: the same rows, and what a loan must hold
 //   --model <file>  taken and not read (the encoder programs before this one named the text model)
 //
 // It prints "READY <n_embd>", then per stdin line
@@ -17,6 +19,8 @@
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
 // row i at grid position (x = i % nx, y = i / nx): the record the engine reads a picture from.
 #include "lamina/vision/encoder.hpp"
+
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <cstdio>
@@ -44,6 +48,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 int main(int argc, char** argv) {
     using lamina::vision::FlashAttention;
     lamina::vision::EncoderParams params;
+    bool lent = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -58,6 +63,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-tokens") params.max_tokens = std::atoi(next().c_str());
         else if (a == "--min-tokens") params.min_tokens = std::atoi(next().c_str());
         else if (a == "--q8") params.q8_fp16 = next() == "fp16";
+        else if (a == "--lent") lent = true;
         else if (a == "--flash-attn") params.flash_attention = next() == "off" ? FlashAttention::off : FlashAttention::on;
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -66,8 +72,17 @@ int main(int argc, char** argv) {
                              "[--min-tokens N] [--flash-attn on|off] [--q8 mmq|fp16]\n");
         return 2;
     }
-    const auto load_t0 = std::chrono::steady_clock::now();
     std::string err;
+    if (lent && params.gpu) {
+        params.gpu_arena_bytes = lamina::vision::encoder_gpu_bytes(params, err);
+        if (params.gpu_arena_bytes == 0 || cudaSetDevice(params.device) != cudaSuccess ||
+            cudaMalloc(&params.gpu_arena, params.gpu_arena_bytes) != cudaSuccess) {
+            std::printf("ERR no memory to lend the encoder (%s)\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "vision_rows: %.0f MiB lent to the encoder\n", (double) params.gpu_arena_bytes / 1048576.0);
+    }
+    const auto load_t0 = std::chrono::steady_clock::now();
     std::unique_ptr<lamina::vision::Encoder> enc = lamina::vision::open_encoder(params, err);
     if (!enc) {
         std::printf("ERR cannot load the image encoder %s (%s)\n", params.mmproj.c_str(), err.c_str());
