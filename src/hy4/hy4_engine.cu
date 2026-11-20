@@ -1201,6 +1201,14 @@ struct Engine {
         own(&Owned::events, ev);
         CK(cudaEventCreateWithFlags(&ev_mtp, cudaEventDisableTiming));
         own(&Owned::events, ev_mtp);
+        for (cudaStream_t* b : {&sb1, &sb2}) {
+            CK(cudaStreamCreateWithFlags(b, cudaStreamNonBlocking));
+            own(&Owned::streams, *b);
+        }
+        for (cudaEvent_t* e : {&ev_fork, &ev_j1, &ev_j2, &ev_q}) {
+            CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+            own(&Owned::events, *e);
+        }
         ev_moe = ev;
         const size_t T = kMaxT, N = (size_t) g.n_embd, hc = (size_t) g.hc;
         size_t hmax = 0;
@@ -1840,7 +1848,34 @@ struct Engine {
         std::fprintf(stderr, "lamina: a parked conversation of %lld tokens resumed\n", (long long) p);
     }
 
-    void quant(const float* x, int64_t rows, int64_t n, uint8_t* out) { K::quantize_q8_1_rows(x, rows, n, out, st); }
+    void quant(const float* x, int64_t rows, int64_t n, uint8_t* out, cudaStream_t s_ = nullptr) {
+        K::quantize_q8_1_rows(x, rows, n, out, s_ ? s_ : st);
+    }
+    // the decode's branches: sb1 and sb2 forked from st at a layer's points and joined (fork(): the branch streams wait
+    // for st; join(): st waits for them), events made at the start and used again by every layer and capture
+    bool branches = [] {
+        const char* v = std::getenv("LAMINA_HY4_BRANCHES");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    cudaStream_t sb1 = nullptr, sb2 = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_j1 = nullptr, ev_j2 = nullptr, ev_q = nullptr;
+    bool br_on() const { return branches && sb1 != nullptr && trace < 3; }
+    void fork(cudaStream_t a, cudaStream_t b = nullptr) {
+        CK(cudaEventRecord(ev_fork, st));
+        CK(cudaStreamWaitEvent(a, ev_fork, 0));
+        if (b) CK(cudaStreamWaitEvent(b, ev_fork, 0));
+    }
+    void join(cudaStream_t a, cudaStream_t b = nullptr) {
+        CK(cudaEventRecord(ev_j1, a));
+        CK(cudaStreamWaitEvent(st, ev_j1, 0));
+        if (b) {
+            CK(cudaEventRecord(ev_j2, b));
+            CK(cudaStreamWaitEvent(st, ev_j2, 0));
+        }
+    }
+    void mmvq(const Mat& w, const uint8_t* xq_, float* y_, int T, cudaStream_t s_) {
+        K::native_mmvq(w.type, w.d, xq_, y_, w.n_in, w.n_out, T, s_);
+    }
     void mmvq(const Mat& w, const uint8_t* xq_, float* y_, int T) {
         K::native_mmvq(w.type, w.d, xq_, y_, w.n_in, w.n_out, T, st);
     }
@@ -2012,22 +2047,18 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd, H = l.H;
         quant(xn, T, N, xq);
+        // branches: sb1 kv_a and the cell; sb2 the gate, then (a sparse layer) the indexer once qrq is made; st q_a ..
+        // k_b; joined before the attention
+        const bool br = br_on();
+        cudaStream_t s1 = br ? sb1 : st, s2 = br ? sb2 : st;
+        if (br) fork(sb1, sb2);
+        mmvq(l.kv_a, xq, kva, T, s1);
+        (l.kv_q8 ? hy4k::k_kv_store<true> : hy4k::k_kv_store<false>)<<<T, hy4k::kThreads, 0, s1>>>(
+            kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta, g.eps);
+        mmvq(l.gate, xq, gt, T, s2);
         mmvq(l.q_a, xq, qa, T);
         hy4k::k_rms<<<T, hy4k::kThreads, 0, st>>>(qa, (int) g.q_lora, l.q_a_norm, qa, (int) g.q_lora, (int) g.q_lora, g.eps);
         quant(qa, T, g.q_lora, qrq);
-        mmvq(l.q_b, qrq, q, T);
-        mmvq(l.kv_a, xq, kva, T);
-        mmvq(l.gate, xq, gt, T);
-        ph(3);
-        hy4k::k_q_split<<<dim3(H, T), 256, 0, st>>>(q, qnope, qabs, H, (int) g.k_head, (int) g.nope());
-        hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
-                                                     l.theta);
-        quant(qnope, (int64_t) T * H, g.nope(), qnq);
-        hy4k::k_head_q8_0_w2<<<(unsigned) ((H * hy4k::kLatent + 15) / 16), 256, 0, st>>>(
-            l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow, T);
-        (l.kv_q8 ? hy4k::k_kv_store<true> : hy4k::k_kv_store<false>)<<<T, hy4k::kThreads, 0, st>>>(
-            kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta, g.eps);
-        ph(4);
         const int32_t* cells = cells_swa;
         const int32_t* counts = n_swa;
         int ld = (int) g.n_swa;
@@ -2036,17 +2067,31 @@ struct Engine {
             counts = l.ext_n;
             ld = l.ext_ld;
         } else if (!l.swa) {
-            indexer(l, T);
+            if (br) {   // the indexer reads qrq
+                CK(cudaEventRecord(ev_q, st));
+                CK(cudaStreamWaitEvent(s2, ev_q, 0));
+            }
+            indexer(l, T, s2);
             cells = cells_sel;
             counts = n_sel;
             ld = (int) g.idx_top_k;
             if (const int sl = m->dfly.on ? dfly_slot(l.il) : -1; sl >= 0) {   // a layer DFly reads: its picks kept
                 CK(cudaMemcpyAsync(snap_cells + (size_t) sl * kMaxT * g.idx_top_k, cells_sel,
-                                   (size_t) T * g.idx_top_k * 4, cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpyAsync(snap_n + (size_t) sl * kMaxT, n_sel, (size_t) T * 4, cudaMemcpyDeviceToDevice, st));
+                                   (size_t) T * g.idx_top_k * 4, cudaMemcpyDeviceToDevice, s2));
+                CK(cudaMemcpyAsync(snap_n + (size_t) sl * kMaxT, n_sel, (size_t) T * 4, cudaMemcpyDeviceToDevice, s2));
             }
             ph(5);
         }
+        mmvq(l.q_b, qrq, q, T);
+        ph(3);
+        hy4k::k_q_split<<<dim3(H, T), 256, 0, st>>>(q, qnope, qabs, H, (int) g.k_head, (int) g.nope());
+        hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
+                                                     l.theta);
+        quant(qnope, (int64_t) T * H, g.nope(), qnq);
+        hy4k::k_head_q8_0_w2<<<(unsigned) ((H * hy4k::kLatent + 15) / 16), 256, 0, st>>>(
+            l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow, T);
+        if (br) join(sb1, sb2);
+        ph(4);
         if (H % hy4p::kQRows == 0) {   // on the tensor cores, the cells in splits of `per`
             const int per = std::max(64, (ld / 16 + 31) / 32 * 32), n_split = (ld + per - 1) / per;
             (l.kv_q8 ? hy4p::k_attn_dec<true> : hy4p::k_attn_dec<false>)<<<dim3(n_split, H / hy4p::kQRows, T), 256,
@@ -2073,26 +2118,26 @@ struct Engine {
 
     /// The sparse layer's indexer: the rows' index keys into the tail, the groups they complete pooled, and each row's
     /// cells: every cell while its visible groups (those before its own) are within the reach, else the top groups'.
-    void indexer(Layer& l, int T) {
+    void indexer(Layer& l, int T, cudaStream_t is) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, ih = (int) g.idx_heads, idd = (int) g.idx_dim, pool_n = (int) g.idx_pool;
-        mmvq(l.iq_b, qrq, iq, T);
-        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, st>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, pos_d, 0, l.theta);
-        mmvq(l.ik, xq, ik, T);
-        hy4k::k_rms<<<T, 128, 0, st>>>(ik, idd, l.ik_norm, ik, idd, idd, g.eps);
-        quant(ik, T, idd, ikq);
-        mmvq(l.icv, ikq, ivg, T);
-        mmvq(l.icg, ikq, ivg + (size_t) kMaxT * idd, T);
-        hy4k::k_tail_store<<<T, 128, 0, st>>>(ivg, ivg + (size_t) kMaxT * idd, l.tail, pos_d, kTail, idd);
-        hy4k::k_pool_rows<<<T, 128, 0, st>>>(l.tail, kTail, idd, pool_n, l.ape, l.ipool_norm, g.eps, l.theta,
+        mmvq(l.iq_b, qrq, iq, T, is);
+        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, is>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, pos_d, 0, l.theta);
+        mmvq(l.ik, xq, ik, T, is);
+        hy4k::k_rms<<<T, 128, 0, is>>>(ik, idd, l.ik_norm, ik, idd, idd, g.eps);
+        quant(ik, T, idd, ikq, is);
+        mmvq(l.icv, ikq, ivg, T, is);
+        mmvq(l.icg, ikq, ivg + (size_t) kMaxT * idd, T, is);
+        hy4k::k_tail_store<<<T, 128, 0, is>>>(ivg, ivg + (size_t) kMaxT * idd, l.tail, pos_d, kTail, idd);
+        hy4k::k_pool_rows<<<T, 128, 0, is>>>(l.tail, kTail, idd, pool_n, l.ape, l.ipool_norm, g.eps, l.theta,
                                              (int) g.n_rot, pos_d, l.pooled);
         const int reach = (int) (g.idx_top_k / pool_n - (g.idx_tail ? 1 : 0));
-        hy4k::k_gemv_f32<<<dim3((unsigned) ((ih + 7) / 8), T), 256, 0, st>>>(l.iproj, xn, iw, N, ih,
+        hy4k::k_gemv_f32<<<dim3((unsigned) ((ih + 7) / 8), T), 256, 0, is>>>(l.iproj, xn, iw, N, ih,
                                                                            1.0f / sqrtf((float) (idd * ih)));
         const size_t smem = ((size_t) ih * idd + ih) * sizeof(float);
-        hy4k::k_index_scores_pos<<<dim3(kScoreBlocks, T), 256, smem, st>>>(iq, iw, l.pooled, pos_d, pool_n, reach, ih,
+        hy4k::k_index_scores_pos<<<dim3(kScoreBlocks, T), 256, smem, is>>>(iq, iw, l.pooled, pos_d, pool_n, reach, ih,
                                                                             idd, scores, (int) (ctx / pool_n));
-        hy4k::k_select_cells<<<T, 1024, 0, st>>>(scores, (int) (ctx / pool_n), pos_d, pool_n, reach, cells_sel,
+        hy4k::k_select_cells<<<T, 1024, 0, is>>>(scores, (int) (ctx / pool_n), pos_d, pool_n, reach, cells_sel,
                                                  (int) g.idx_top_k, n_sel);
     }
 
@@ -2114,14 +2159,18 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd, E = (int) g.n_expert, Kk = (int) g.top_k, Ld = (int) g.n_latent,
                   F = (int) g.n_ff_exp;
-        hy4k::k_gemv_f32<<<dim3((unsigned) ((E + 7) / 8), T), 256, 0, st>>>(l.router, xn, logits_r, N, E, 1.f);
+        const bool br = br_on();
+        cudaStream_t s1 = br ? sb1 : st;
+        if (br) fork(sb1);   // the router and its picks beside routed_down
+        hy4k::k_gemv_f32<<<dim3((unsigned) ((E + 7) / 8), T), 256, 0, s1>>>(l.router, xn, logits_r, N, E, 1.f);
         if (E <= 1024 && Kk <= 32)
-            hy4k::k_route_w<<<(unsigned) ((T + 7) / 8), 256, 0, st>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale, T, ids,
+            hy4k::k_route_w<<<(unsigned) ((T + 7) / 8), 256, 0, s1>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale, T, ids,
                                                                      wts);
         else
-            hy4k::k_route<<<T, std::max(32, ((E + 31) / 32) * 32), 0, st>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale,
+            hy4k::k_route<<<T, std::max(32, ((E + 31) / 32) * 32), 0, s1>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale,
                                                                            ids, wts);
         mmvq(l.r_down, xq, rin, T);
+        if (br) join(sb1);
         CK(cudaMemcpyAsync(h_rin, rin, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * Kk * 4, cudaMemcpyDeviceToHost, st));
         // a graph's node the host waits on; launched (no graphs, the MTP block's event) a plain record
