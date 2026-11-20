@@ -31,8 +31,9 @@ std::string gpu_unusable(int device);
 
 /// Whether the GPU at PCI bus id `bus_id` (nvidia-smi's "00000000:02:00.0") is in the desktop's use, as NVML sees it: a
 /// display active there, or a process's graphics context on it (dwm.exe and the desktop's apps on Windows: the display
-/// flag alone reads off while the monitor sleeps).  False where NVML cannot say.
+/// flag alone reads off while the monitor sleeps).  False where NVML cannot say (`known` false then).
 bool gpu_in_desktop_use(const std::string& bus_id);
+bool gpu_in_desktop_use(const std::string& bus_id, bool& known);
 
 /// The ordinal `spec` names: an ordinal ("2"), a UUID or a prefix of it that only one card has ("GPU-f26e9ba6"), a PCI
 /// bus id ("10:00.0", "0000:10:00.0", nvidia-smi's "00000000:10:00.0"), or a name or a part of one that only one card

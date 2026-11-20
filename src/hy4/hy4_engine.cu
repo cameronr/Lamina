@@ -1286,7 +1286,10 @@ struct Engine {
     bool elastic = true;
     bool kv_q8 = false;   // --kv q8_0: the sparse layers' cells in q8_0 rows (Layer::kv_q8)
     static constexpr int64_t kKvStep = 16384;
-    static constexpr size_t kReserve = (size_t) 1536 << 20;
+    // the main GPU's VRAM left free (the slots and the K/V's growth stop there): 1.5 GiB on a GPU a display or a
+    // graphics program uses (NVML; also when it cannot say), 700 MiB on one without (a session's requests left 40 MiB
+    // of the 1.5 GiB used: graphs, the prompt path's first run)
+    size_t kReserve = (size_t) 1536 << 20;
     int64_t kv_mapped = 0;
     std::vector<lamina::core::VmmChunk> spare;
     std::vector<std::reference_wrapper<Layer>> cl;   // the layers with caches: the trunk, then the MTP block
@@ -2461,7 +2464,14 @@ struct Engine {
         g0.dev = main_dev;
         g0.st = st;
         g0.ev = ev;
-        g0.S = slots_for(main_gib, (size_t) 1536 << 20);
+        {
+            char bus[32] = {};
+            bool known = false;
+            if (cudaDeviceGetPCIBusId(bus, sizeof bus, main_dev) == cudaSuccess &&
+                !lamina::core::gpu_in_desktop_use(bus, known) && known)
+                kReserve = (size_t) 700 << 20;
+        }
+        g0.S = slots_for(main_gib, kReserve);
         cudaDeviceProp pr{};
         CK(cudaGetDeviceProperties(&pr, main_dev));
         g0.name = pr.name;
@@ -2806,6 +2816,19 @@ struct Engine {
             for (size_t gi = 0; gi < gpus.size(); ++gi)
                 if (dirty[li][gi]) upload_table(m->layers[li], (int) gi);
         return n;
+    }
+    /// Each GPU's free VRAM, for the log ("GPU 1 812, GPU 0 1210, ..." MiB)
+    std::string vram_free() {
+        std::string out;
+        for (const Gpu& gp : gpus) {
+            lamina::core::DeviceScope ds(gp.dev, main_dev, gp.dev != main_dev);
+            size_t fr = 0, tot = 0;
+            if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) continue;
+            char b[48];
+            std::snprintf(b, sizeof b, "%sGPU %d %zu", out.empty() ? "" : ", ", gp.dev, fr >> 20);
+            out += b;
+        }
+        return out;
     }
     /// Slot copies queued or in flight
     size_t moves_pending() const {
@@ -3936,7 +3959,7 @@ struct Serve {
         const int queued = E.plan_moves(512, true);
         E.save_profile(false);
         std::fprintf(stderr, "lamina: expert copies: %d planned at the answer's start, %lld landed during it, %d planned "
-                     "after it\n", moved_at_start, landed, queued);
+                     "after it; MiB of VRAM free: %s\n", moved_at_start, landed, queued, E.vram_free().c_str());
         std::fprintf(stderr, "lamina: %zu prompt tokens (%zu reused) in %.1f ms, %lld generated in %.1f ms (%.2f tok/s), "
                      "%s%s\n", ids.size(), reuse, prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, finish,
@@ -4210,6 +4233,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     for (const Engine::Gpu& gp : E.gpus)
         std::fprintf(stderr, "lamina: GPU %d, %s: %.1f%% of the routed entries\n", gp.dev, gp.name.c_str(),
                      E.lookups ? 100.0 * (double) gp.hits / (double) E.lookups : 0.0);
+    std::fprintf(stderr, "lamina: MiB of VRAM free: %s\n", E.vram_free().c_str());
     if (windows > 0)
         std::fprintf(stderr, "lamina: %lld windows, %lld drafts offered, %lld kept (%.1f%%), %.2f tokens a window\n",
                      (long long) windows, (long long) offered, (long long) kept,
