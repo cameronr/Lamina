@@ -13,6 +13,7 @@
 //     scratch/q36/logits_to_parity.py).
 #include "hy4_kernels.cuh"
 #include "hy4_dfly_file.hpp"
+#include "hy4_load.hpp"
 #include "hy4_prompt.cuh"
 
 #include "lamina/artifact/gguf_reader.hpp"
@@ -55,6 +56,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -262,6 +264,33 @@ const float* f32_dev(const std::vector<float>& h) {
 struct Loader {
     const lamina::GgufModel& gm;
     std::string err;
+    std::map<const lamina::TensorInfo*, const uint8_t*> pre;   // tensors read ahead (read_ahead), else the mapping's
+    std::unique_ptr<uint8_t[]> pre_buf;
+    /// Every tensor `want` takes, read in large pieces into host memory: a copy out of the mapping faults its pages in a
+    /// few at a time
+    bool read_ahead(const std::function<bool(const std::string&)>& want, int threads, bool uncached, std::string& e) {
+        std::vector<lamina::hy4::SliceRun> runs;
+        std::vector<std::pair<const lamina::TensorInfo*, uint64_t>> at;
+        uint64_t total = 0;
+        for (size_t s = 0; s < gm.size(); ++s)
+            for (const lamina::TensorInfo& t : gm.shard(s).tensors()) {
+                const uint64_t n = lamina::tensor_payload_bytes(t);
+                if (n == 0 || !gm.in_bounds(t, s) || !want(t.name)) continue;
+                runs.push_back({gm.shard(s).path(), gm.shard(s).data_start() + t.offset, n, total, n, 1, 0});
+                at.emplace_back(&t, total);
+                total += (n + 63) / 64 * 64;
+            }
+        pre_buf.reset(new (std::nothrow) uint8_t[std::max<uint64_t>(total, 64)]);
+        if (!pre_buf) return true;   // the mapping's, then
+        uint8_t* b = pre_buf.get();
+        if (!lamina::hy4::read_slices(runs, threads, uncached, (uint64_t) 32 << 20, [b](int) { return b; }, e)) return false;
+        for (const auto& [t, o] : at) pre[t] = b + o;
+        return true;
+    }
+    void drop_ahead() {
+        pre.clear();
+        pre_buf.reset();
+    }
     const lamina::TensorInfo* find(const std::string& name, size_t* s) {
         const lamina::TensorInfo* t = gm.find(name, s);
         if (!t) {
@@ -274,6 +303,7 @@ struct Loader {
         size_t s = 0;
         const lamina::TensorInfo* t = find(name, &s);
         if (ti) *ti = t;
+        if (const auto it = pre.find(t); it != pre.end()) return it->second;
         return gm.shard(s).tensor_data(*t);
     }
     /// the tensor's GGUF bytes on the device
@@ -340,7 +370,7 @@ void bf16_rows_q8_0(const uint8_t* bf16, uint8_t* dst, int64_t rows, int64_t col
     ggml_quantize_chunk(GGML_TYPE_Q8_0, x.data(), dst, 0, rows, cols, nullptr);
 }
 
-bool load(const std::string& path, Model& m, int threads, double pin_gib, bool want_mtp, std::string& err) {
+bool load(const std::string& path, Model& m, int threads, double pin_gib, bool want_mtp, bool file_cache, std::string& err) {
     const auto t0 = Clock::now();
     const lamina::GgufModel gm = lamina::GgufModel::open(path);
     if (std::string e = lamina::hy4::read_geometry(gm.meta(), m.g); !e.empty()) { err = e; return false; }
@@ -349,7 +379,16 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         m.eos = (int32_t) v->u;
     m.image_pad = (int32_t) gm.meta().find_string("tokenizer.ggml.tokens", "<\xEF\xBD\x9Chy_image\xE2\x96\x81pad");
     const auto& g = m.g;
-    Loader L{gm, {}};
+    Loader L{gm, {}, {}, {}};
+    {   // the dense tensors: all but the routed experts, the Engram table and the MTP block when it is not loaded
+        const std::string mtp = "blk." + std::to_string(g.n_layers) + ".";
+        const bool keep_mtp = want_mtp && g.n_mtp > 0;
+        if (!L.read_ahead([&](const std::string& n) {
+                return n.find("_exps.") == std::string::npos && n != "per_layer_token_embd.weight" &&
+                       (keep_mtp || n.rfind(mtp, 0) != 0);
+            }, threads, !file_cache, err))
+            return false;
+    }
     {
         size_t s = 0;
         const lamina::TensorInfo* t = gm.find("per_layer_token_embd.weight", &s);
@@ -446,19 +485,31 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         }
     }
     CK(cudaDeviceSynchronize());
+    L.drop_ahead();
     const double dense_s = ms_since(t0) / 1000.0;
-    // the routed experts: native blobs [gate rows | up rows | down rows] in host memory, copied by `threads` threads
+    // the routed experts: native blobs [gate rows | up rows | down rows] in host memory, read from the file in large
+    // pieces by `threads` threads (a copy out of the mapping faults its pages in a few at a time; through the OS file
+    // cache, which reads ahead, or past it), each layer's block allocated on a thread of its own as the reads come to
+    // it; BF16 experts made Q8_0 from the mapping after
     struct Src {
         Layer* y;
         const uint8_t *g, *u, *d;
         size_t gsz, dsz;
         bool bf16 = false;   // BF16 experts (the MTP block's): each matrix quantized to Q8_0 into the blob
+        std::string gp, up, dp;   // the shards that hold the three tensors, and their places in them
+        uint64_t go = 0, uo = 0, dof = 0;
     };
     std::vector<Src> src;
     size_t total = 0;
     std::vector<Layer*> moe;
     for (Layer& y : m.layers) moe.push_back(&y);
     if (m.has_mtp) moe.push_back(&m.mtp);
+    auto file_at = [&](const std::string& name, std::string& path) {
+        size_t s = 0;
+        const lamina::TensorInfo* t = L.find(name, &s);
+        path = gm.shard(s).path();
+        return gm.shard(s).data_start() + t->offset;
+    };
     for (Layer* yp : moe) {
         Layer& y = *yp;
         if (y.dense) continue;
@@ -466,6 +517,9 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         const lamina::TensorInfo *tg = nullptr, *tu = nullptr, *td = nullptr;
         Src s{&y, L.host(p + "ffn_gate_exps.weight", &tg), L.host(p + "ffn_up_exps.weight", &tu),
               L.host(p + "ffn_down_exps.weight", &td), 0, 0, false};
+        s.go = file_at(p + "ffn_gate_exps.weight", s.gp);
+        s.uo = file_at(p + "ffn_up_exps.weight", s.up);
+        s.dof = file_at(p + "ffn_down_exps.weight", s.dp);
         if (tg->type != tu->type) { err = p + "ffn_gate_exps and ffn_up_exps differ in type"; return false; }
         s.bf16 = tg->type == 30 && td->type == 30;   // quantized here, to Q8_0
         const int gt = s.bf16 ? 8 : (int) tg->type, dt = s.bf16 ? 8 : (int) td->type;
@@ -484,50 +538,102 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
             const size_t unit = std::lcm(std::lcm((size_t) 64, (size_t) bg), (size_t) bd);
             y.stride = (y.fmt.bytes + unit - 1) / unit * unit;
         }
-        // pinned while the limit allows (the GPUs copy from it at their links' full rate, the host not waiting), else
-        // pageable
-        const size_t bytes = y.stride * (size_t) g.n_expert;
-        if ((double) (m.pinned + bytes) <= pin_gib * (double) (1ull << 30)) {
-            void* h = nullptr;
-            if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) == cudaSuccess) {
-                own(&Owned::pinned, h);
-                y.arena = (uint8_t*) h;
-                m.pinned += bytes;
-            } else {
-                (void) cudaGetLastError();
-            }
-        }
-        if (!y.arena) y.arena = (uint8_t*) heap_new(bytes);
-        if (!y.arena) { err = "out of host memory for the routed experts"; return false; }
-        total += bytes;
+        total += y.stride * (size_t) g.n_expert;
         src.push_back(s);
     }
     m.arena_gib = (double) total / (double) (1ull << 30);
+    // each layer's block, in order, on a thread of its own: pinned while the limit allows (the GPUs copy from it at
+    // their links' full rate, the host not waiting; whole layers until the next would pass it), else pageable
+    std::vector<uint8_t*> bases(src.size(), nullptr);
+    std::mutex mu;
+    std::condition_variable cv;
+    size_t made = 0;
+    bool alloc_end = false;
+    double alloc_s = 0;
+    int dev = 0;
+    CK(cudaGetDevice(&dev));
+    std::thread alloc([&] {
+        const auto ta = Clock::now();
+        (void) cudaSetDevice(dev);   // no context made on another GPU for this thread
+        size_t pinned = 0;
+        for (size_t i = 0; i < src.size(); ++i) {
+            const size_t bytes = src[i].y->stride * (size_t) g.n_expert;
+            void* h = nullptr;
+            if ((double) (pinned + bytes) <= pin_gib * (double) (1ull << 30)) {
+                if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) == cudaSuccess) {
+                    own(&Owned::pinned, h);
+                    pinned += bytes;
+                } else {
+                    h = nullptr;
+                    (void) cudaGetLastError();
+                }
+            }
+            if (h == nullptr) h = heap_new(bytes);
+            std::lock_guard<std::mutex> lk(mu);
+            bases[i] = (uint8_t*) h;
+            made = i + 1;
+            if (h == nullptr) break;
+            if (i + 1 == src.size()) m.pinned = pinned;
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        alloc_end = true;
+        alloc_s = ms_since(ta) / 1000.0;
+        cv.notify_all();
+    });
+    auto base = [&](int i) -> uint8_t* {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return made > (size_t) i || alloc_end; });
+        return made > (size_t) i ? bases[(size_t) i] : nullptr;
+    };
+    std::vector<lamina::hy4::SliceRun> runs;
+    uint64_t read_bytes = 0;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const Src& s = src[i];
+        if (s.bf16) continue;
+        const uint64_t st = s.y->stride;
+        runs.push_back({s.gp, s.go, s.gsz, 0, st, g.n_expert, (int) i});
+        runs.push_back({s.up, s.uo, s.gsz, s.gsz, st, g.n_expert, (int) i});
+        runs.push_back({s.dp, s.dof, s.dsz, 2 * s.gsz, st, g.n_expert, (int) i});
+        read_bytes += (uint64_t) (2 * s.gsz + s.dsz) * (uint64_t) g.n_expert;
+    }
+    double read_s = 0;
+    const bool read_ok = lamina::hy4::read_slices(runs, std::max(1, threads), !file_cache, (uint64_t) 32 << 20, base,
+                                                  err, &read_s);
+    for (size_t i = 0; i < src.size(); ++i) base((int) i);   // every block made (or the allocation's end)
+    alloc.join();
+    if (!read_ok) return false;
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (bases[i] == nullptr) { err = "out of host memory for the routed experts"; return false; }
+        src[i].y->arena = bases[i];
+    }
+    // BF16 experts (the MTP block's): each matrix through float into Q8_0 rows, gate, up (n_ff rows of n_latent), down
     std::atomic<size_t> next{0};
-    const size_t jobs = src.size() * (size_t) g.n_expert;
-    auto copy = [&] {
+    std::vector<size_t> bf;
+    for (size_t i = 0; i < src.size(); ++i)
+        if (src[i].bf16) bf.push_back(i);
+    const size_t jobs = bf.size() * (size_t) g.n_expert;
+    auto convert = [&] {
         for (size_t j; (j = next.fetch_add(1)) < jobs;) {
-            const Src& s = src[j / (size_t) g.n_expert];
+            const Src& s = src[bf[j / (size_t) g.n_expert]];
             const size_t e = j % (size_t) g.n_expert;
             uint8_t* dst = s.y->arena + e * s.y->stride;
-            if (s.bf16) {   // each matrix through float into Q8_0 rows: gate, up (n_ff rows of n_latent), down
-                bf16_rows_q8_0(s.g + e * s.gsz, dst, g.n_ff_exp, g.n_latent);
-                bf16_rows_q8_0(s.u + e * s.gsz, dst + s.y->fmt.up_off, g.n_ff_exp, g.n_latent);
-                bf16_rows_q8_0(s.d + e * s.dsz, dst + s.y->fmt.down_off, g.n_latent, g.n_ff_exp);
-                continue;
-            }
-            std::memcpy(dst, s.g + e * s.gsz, s.gsz);
-            std::memcpy(dst + s.gsz, s.u + e * s.gsz, s.gsz);
-            std::memcpy(dst + 2 * s.gsz, s.d + e * s.dsz, s.dsz);
+            bf16_rows_q8_0(s.g + e * s.gsz, dst, g.n_ff_exp, g.n_latent);
+            bf16_rows_q8_0(s.u + e * s.gsz, dst + s.y->fmt.up_off, g.n_ff_exp, g.n_latent);
+            bf16_rows_q8_0(s.d + e * s.dsz, dst + s.y->fmt.down_off, g.n_latent, g.n_ff_exp);
         }
     };
-    std::vector<std::thread> th;
-    for (int i = 0; i < std::max(1, threads); ++i) th.emplace_back(copy);
-    for (auto& t : th) t.join();
+    if (jobs > 0) {
+        std::vector<std::thread> th;
+        for (int i = 0; i < std::max(1, threads); ++i) th.emplace_back(convert);
+        for (auto& t : th) t.join();
+    }
     std::fprintf(stderr, "lamina: Hy4-flash: %lld layers%s, dense weights on the GPU in %.1f s, the routed experts "
-                 "(%.1f GiB, %.1f of it pinned) in host memory in %.1f s\n", (long long) g.n_layers,
-                 m.has_mtp ? " and the MTP block" : "", dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30),
-                 ms_since(t0) / 1000.0 - dense_s);
+                 "(%.1f GiB, %.1f of it pinned) in host memory in %.1f s (read %s the file cache at %.1f GiB/s; the "
+                 "blocks made in %.1f s beside)\n", (long long) g.n_layers, m.has_mtp ? " and the MTP block" : "",
+                 dense_s, m.arena_gib, (double) m.pinned / (double) (1ull << 30), ms_since(t0) / 1000.0 - dense_s,
+                 file_cache ? "through" : "past", read_s > 0 ? (double) read_bytes / read_s / (double) (1ull << 30) : 0.0,
+                 alloc_s);
     return true;
 }
 
@@ -3568,6 +3674,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     double arena_pin = 72;
     double park_mib = 16384, reserve_mib = 6144;
     bool kv_grow = true;
+    bool file_cache = true;   // the model file read through the OS file cache (--no-file-cache: past it)
     std::string kv = "fp16";
     bool use_mtp = true;
     std::string dfly_path;
@@ -3610,6 +3717,8 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--park-mib" || a == "--conversation-cache-mib") park_mib = std::atof(next());
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
         else if (a == "--no-kv-grow") kv_grow = false;
+        else if (a == "--file-cache") file_cache = true;
+        else if (a == "--no-file-cache") file_cache = false;
         else if (a == "--kv") kv = next();   // the sparse layers' K / V: fp16 or q8_0
         else if (a == "--no-mtp") use_mtp = false;   // the MTP block not loaded (no drafts)
         else if (a == "--dfly") dfly_path = next();   // DFly2's drafts (the checkpoint's last shard); no MTP block
@@ -3640,7 +3749,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     }
     if (check_only) return 0;
     Model m;
-    if (!load(model, m, 8, arena_pin, use_mtp && dfly_path.empty(), err) ||
+    if (!load(model, m, 8, arena_pin, use_mtp && dfly_path.empty(), file_cache, err) ||
         (!dfly_path.empty() && !load_dfly(dfly_path, m, err))) {
         std::fprintf(stderr, "lamina: %s\n", err.c_str());
         return 1;
