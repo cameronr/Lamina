@@ -813,7 +813,7 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
   endif()
   add_library(lamina_text STATIC src/server/json.cpp src/server/log.cpp src/server/tokenizer.cpp src/server/dialect.cpp
                                  src/server/frontend.cpp)
-  target_include_directories(lamina_text PUBLIC src/server ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision)
+  target_include_directories(lamina_text PUBLIC src/server)
   target_link_libraries(lamina_text PUBLIC lamina_jinja lamina_unicode nlohmann ggml-base lamina_warnings)
   add_executable(lamina-check src/server/check.cpp)
   target_link_libraries(lamina-check PRIVATE lamina_text)
@@ -919,7 +919,7 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
       endif()
     endforeach()
 
-    # The image encoder (tools/vision: llama.cpp's mtmd), a CMake project of its own, as its ggml differs from the
+    # The image encoder (tools/vision: src/vision on ggml), a CMake project of its own, as its ggml differs from the
     # engine's: with ggml-cuda, its CPU code for any AVX2 CPU (arm64: Armv8.2 with dotprod and fp16; a native build
     # on an AVX-512 CPU runs without flash attention, about half as fast). Built for the same GPUs, after the engine's
     # programs so that their CUDA compiles and its do not run at once, into this folder: the server starts the

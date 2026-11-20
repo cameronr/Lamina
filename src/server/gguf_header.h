@@ -1,7 +1,8 @@
-// tools/vision/gguf_header.h - a GGUF's key/value header in a gguf_context without tensors, whatever its weight tensors are.
+// src/server/gguf_header.h - a GGUF's key/value header in a gguf_context without tensors, whatever its weight tensors
+// are.
 //
-// ggml's reader goes through the tensor directory too and refuses a tensor type it does not know, as a Gyro quantization's
-// trellis types are.  The picture reader and the server's tokenizer need the header alone.  The split keys are dropped.
+// ggml's reader goes through the tensor directory too and refuses a tensor type it does not know, as a Gyro
+// quantization's trellis types are.  The server's tokenizer needs the header alone.  The split keys are dropped.
 #pragma once
 
 #include "gguf.h"

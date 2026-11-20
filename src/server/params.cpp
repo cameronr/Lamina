@@ -25,8 +25,8 @@ const std::vector<Param> kParams = {
     {"--mmproj", "", "vision.mmproj", K::Path, "FILE",
      "pictures: the image projector (with -m by default the mmproj*.gguf made for the model beside it)"},
     {"--no-mmproj", "", "vision", K::Off, "", "no pictures"},
-    {"--vision-model", "", "vision.model", K::Path, "GGUF", "the model file the image encoder reads the vocabulary of "
-     "(default: the model)"},
+    {"--vision-model", "", "vision.model", K::Path, "GGUF", "taken and not read: the image encoder needs no model file "
+     "(earlier versions read its vocabulary)"},
     {"--vision-gpu", "", "vision.gpu", K::Bool, "", "the image encoder on a GPU, not the CPU"},
     {"--vision-cuda-device", "", "vision.cuda_device", K::Str, "UUID", "that GPU (nvidia-smi -L lists the UUIDs)"},
     {"--vision-threads", "", "vision.threads", K::Int, "N", "the encoder's CPU threads (with -m: the logical cores)"},

@@ -367,37 +367,35 @@ bool network_path(const std::string& path) {
     return starts_with(p, "\\\\") || starts_with(p, "\\??\\");
 }
 
-bool hy4_projector(const std::string& mmproj) {
-    if (mmproj.empty()) return false;
+std::string projector_type(const std::string& mmproj) {
     try {
         const lamina::GgufFile g(mmproj);
-        const lamina::MetaValue* v = g.get("clip.projector_type");
-        return v != nullptr && v->type == lamina::MetaType::STRING && (v->s == "hy_v4_flash" || v->s == "hy_v4_vl");
-    } catch (const std::exception&) {
-        return false;   // not a GGUF it reads: the encoder says so
+        for (const char* key : {"clip.projector_type", "clip.vision.projector_type"}) {
+            const lamina::MetaValue* v = g.get(key);
+            if (v != nullptr && v->type == lamina::MetaType::STRING && !v->s.empty()) return v->s;
+        }
+    } catch (const std::exception&) {   // not a GGUF it reads: the encoder says so
     }
+    return "";
 }
 
-std::string vision_exe_path(const std::string& mmproj) {
-    const std::string name = hy4_projector(mmproj) ? "lamina-vision-hy4" : "lamina-vision";
+bool projector_type_read(const std::string& type) { return type == "qwen3vl_merger" || type == "hy_v4_flash"; }
+
+std::string vision_exe_path() {
 #ifdef _WIN32
-    return u8_str(u8_path(self_dir()) / (name + ".exe"));
+    return u8_str(u8_path(self_dir()) / "lamina-vision.exe");
 #else
-    return u8_str(u8_path(self_dir()) / name);
+    return u8_str(u8_path(self_dir()) / "lamina-vision");
 #endif
 }
 
-std::string vision_exe(const std::string& mmproj) {
-    const fs::path exe = u8_path(vision_exe_path(mmproj));
+std::string vision_exe() {
+    const fs::path exe = u8_path(vision_exe_path());
     std::error_code ec;
     if (!fs::is_regular_file(exe, ec))
         throw std::runtime_error("the config has a \"vision\" section, and the image encoder is not there: " + u8_str(exe) +
-                                 (hy4_projector(mmproj)
-                                      ? " (Hy4-flash's projector: lamina-vision built from llama.cpp's PR #32517, beside "
-                                        "lamina-server under that name; without pictures, take the section and --vision "
-                                        "out of the config)"
-                                      : " (lamina-vision belongs in lamina-server's folder; without pictures, take the "
-                                        "section and --vision out of the config)"));
+                                 " (lamina-vision belongs in lamina-server's folder; without pictures, take the "
+                                 "section and --vision out of the config)");
     return u8_str(exe);
 }
 
@@ -408,7 +406,8 @@ std::vector<std::string> vision_reader_args(const json& cfg) {
         return x.has_parent_path() ? u8_str(fs::absolute(x)) : p;
     };
     const std::string mmproj = absolute(jstr(cfg, "mmproj"));
-    std::vector<std::string> args = {vision_exe(mmproj), "--mmproj", mmproj, "--model", absolute(jstr(cfg, "model"))};
+    // --model: the encoder reads no text model; named for a lamina-vision of an earlier build beside this server
+    std::vector<std::string> args = {vision_exe(), "--mmproj", mmproj, "--model", absolute(jstr(cfg, "model"))};
     auto num = [](const json& v) { return v.is_number_integer() ? std::to_string(v.get<int64_t>()) : py_dumps(v); };
     if (truthy(jget(cfg, "gpu"))) args.push_back("--gpu");
     if (truthy(jget(cfg, "threads"))) args.insert(args.end(), {"--threads", num(cfg["threads"])});

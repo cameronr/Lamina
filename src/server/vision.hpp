@@ -1,8 +1,8 @@
 // src/server/vision.hpp - the resident image encoder (serve/server.py's Vision).
 //
-// lamina-vision (llama.cpp's mtmd and the model's mmproj file) reads "ENC <image> <out>" lines and writes each
-// picture's embeddings; the results are cached by the picture's hash, so a conversation that sends the same picture
-// every turn (most clients do) encodes it once.
+// lamina-vision (the engine's encoder, include/lamina/vision, on the model's mmproj file) reads "ENC <image> <out>"
+// lines and writes each picture's embeddings; the results are cached by the picture's hash, so a conversation that
+// sends the same picture every turn (most clients do) encodes it once.
 #pragma once
 
 #include "json.hpp"
@@ -70,15 +70,15 @@ private:
     std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> cache_;   ///< key -> (file, tokens), oldest first
 };
 
-/// where the image encoder of the projector `mmproj` belongs: lamina-vision in this program's folder, where a release and
-/// every build put it (no config names another), or for Hy4-flash's projector (hy4_projector) lamina-vision-hy4 there
-std::string vision_exe_path(const std::string& mmproj = "");
+/// where the image encoder belongs: lamina-vision in this program's folder, where a release and every build put it (no
+/// config names another)
+std::string vision_exe_path();
 /// that encoder; std::runtime_error when it is not there
-std::string vision_exe(const std::string& mmproj = "");
-/// a projector of Hy4-flash's (clip.projector_type hy_v4_flash or hy_v4_vl): its mtmd and its text model's vocabulary
-/// are llama.cpp's PR #32517's, which the vendored llama.cpp has not taken, so lamina-vision built from that tree reads
-/// it (its mtmd encodes the other models' pictures differently from the vendored one's)
-bool hy4_projector(const std::string& mmproj);
+std::string vision_exe();
+/// a projector file's type (clip.projector_type; "" for a file that names none or cannot be read)
+std::string projector_type(const std::string& mmproj);
+/// the types the encoder reads: qwen3vl_merger (Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3.8-27B) and hy_v4_flash
+bool projector_type_read(const std::string& type);
 /// the encoder's command line from the config's vision section: it runs in its own directory, so the section's paths
 /// are made absolute
 std::vector<std::string> vision_reader_args(const json& cfg);

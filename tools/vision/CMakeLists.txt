@@ -1,5 +1,6 @@
-# tools/vision - lamina-vision, the image encoder for Lamina's multimodal path. Uses llama.cpp's mtmd library at the
-# same pinned commit as the engine's ggml (cmake/lamina_llama.cmake).
+# tools/vision - lamina-vision, the image encoder of Lamina's multimodal path as a program: the engine's own encoder
+# (src/vision, include/lamina/vision) on ggml, from the llama.cpp checkout the engine's ggml comes from
+# (cmake/lamina_llama.cmake), configured as that checkout's own build configures it.
 #
 # The engine's build (../../CMakeLists.txt) builds it as an external project, with CUDA for the engine's GPUs, into its
 # build folder beside lamina-server, which starts the lamina-vision in its own folder and no other. A CUDA build runs
@@ -38,6 +39,8 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "the folder cmake --install fills (--prefix names another)" FORCE)
 endif()
 
+# ggml through the checkout's own top level, for the settings it gives ggml there (its CPU products' kernels, the CUDA
+# graphs); of its targets only ggml's libraries are built
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -45,7 +48,7 @@ set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_MTMD ON CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_MTMD OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)   # no launcher of ggml's choosing: CMAKE_<LANG>_COMPILER_LAUNCHER names one
@@ -74,12 +77,22 @@ set(CMAKE_SKIP_INSTALL_RULES ON)
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 set(CMAKE_SKIP_INSTALL_RULES OFF)
 
-add_executable(lamina-vision lamina_vision.cpp)
+set(_lamina_src ${CMAKE_CURRENT_SOURCE_DIR}/../../src/vision)
+add_executable(lamina-vision lamina_vision.cpp ${_lamina_src}/image.cpp ${_lamina_src}/ggml_encoder.cpp)
 if(MSVC)   # UTF-8 as its code page: image and model paths outside the ANSI code page (../../cmake/utf8.manifest)
   target_sources(lamina-vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/utf8.manifest)
 endif()
-target_link_libraries(lamina-vision PRIVATE mtmd llama)
+# stb_image from the checkout's vendor folder ("stb/stb_image.h")
+target_include_directories(lamina-vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include ${LLAMA_DIR}/vendor)
+target_link_libraries(lamina-vision PRIVATE ggml)
 target_compile_features(lamina-vision PRIVATE cxx_std_17)
+# the engine's warning level: these sources are its own
+if(MSVC)
+  target_compile_options(lamina-vision PRIVATE /W4 /utf-8)
+  target_compile_definitions(lamina-vision PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+  target_compile_options(lamina-vision PRIVATE -Wall -Wextra)
+endif()
 # a build without CUDA refuses --gpu (lamina_vision.cpp)
 target_compile_definitions(lamina-vision PRIVATE LAMINA_VISION_CUDA=$<BOOL:${LAMINA_VISION_CUDA}>)
 # the version --version prints: the engine's build passes its own; this folder built alone reads the engine's
@@ -99,9 +112,3 @@ if(UNIX AND NOT APPLE)
   set_target_properties(lamina-vision PROPERTIES INSTALL_RPATH "$ORIGIN")
   target_link_options(lamina-vision PRIVATE -Wl,--enable-new-dtags)
 endif()
-
-# opens a GGUF that has tensor types llama.cpp does not know (a Gyro quantization's TQK6 / TQK7) for its vocabulary only
-add_executable(lamina-vision-gguf-test EXCLUDE_FROM_ALL gguf_meta_test.cpp)
-target_link_libraries(lamina-vision-gguf-test PRIVATE llama)
-target_compile_features(lamina-vision-gguf-test PRIVATE cxx_std_17)
-set_target_properties(lamina-vision-gguf-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

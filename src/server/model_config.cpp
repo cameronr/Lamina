@@ -156,6 +156,9 @@ std::string projector_problem(const std::string& path, const ModelFacts& m) {
         const MetaValue* enc = g.get("clip.has_vision_encoder");
         if (meta_str(g, "general.architecture") != "clip" || enc == nullptr || enc->u == 0)
             return "not an image projector (a GGUF of the architecture clip with a vision encoder)";
+        if (const std::string type = projector_type(path); !projector_type_read(type))
+            return "a projector of the type " + (type.empty() ? std::string("it does not name") : type) +
+                   ", which the image encoder does not read (it reads qwen3vl_merger and hy_v4_flash)";
         const int64_t dim = meta_int(g, "clip.vision.projection_dim");
         if (m.n_embd > 0 && dim != m.n_embd)
             return "the projector of a model " + std::to_string(dim) + " wide, and this one is " +
@@ -212,20 +215,20 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
 
     // pictures: the projector (named, else the one beside the model) and lamina-vision beside the server
     std::string mmproj, why_not;
-    const auto encoder = [](const std::string& proj) { return fs::is_regular_file(u8_path(vision_exe_path(proj))); };
+    const auto encoder = [] { return fs::is_regular_file(u8_path(vision_exe_path())); };
     if (o.no_mmproj) {
         why_not = "--no-mmproj";
     } else if (!o.mmproj.empty()) {
         mmproj = absolute_path(o.mmproj);
         if (const std::string why = projector_problem(mmproj, m); !why.empty())
             throw ConfigError("--mmproj " + o.mmproj + ": " + why);
-        if (!encoder(mmproj))
-            throw ConfigError("--mmproj " + o.mmproj + ": the image encoder is not there: " + vision_exe_path(mmproj) +
+        if (!encoder())
+            throw ConfigError("--mmproj " + o.mmproj + ": the image encoder is not there: " + vision_exe_path() +
                               " (lamina-vision belongs in lamina-server's folder)");
     } else if (const std::vector<std::string> found = projectors_beside(m); found.empty()) {
         why_not = "no image projector made for it (mmproj*.gguf) beside the model; --mmproj names one";
-    } else if (!encoder(found.front())) {
-        why_not = "the image encoder is not there: " + vision_exe_path(found.front()) + " (lamina-vision belongs in "
+    } else if (!encoder()) {
+        why_not = "the image encoder is not there: " + vision_exe_path() + " (lamina-vision belongs in "
                   "lamina-server's folder)";
     } else {
         mmproj = found.front();
@@ -462,9 +465,9 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
                 const std::string mmproj = jstr(v, "mmproj");
                 const std::string why = projector_problem(mmproj, m);
                 if (!why.empty()) stops.push_back("the vision section's projector " + mmproj + ": " + why);
-                if (!fs::is_regular_file(u8_path(vision_exe_path(mmproj))))
+                if (!fs::is_regular_file(u8_path(vision_exe_path())))
                     stops.push_back("the config has a \"vision\" section, and the image encoder is not there: " +
-                                    vision_exe_path(mmproj));
+                                    vision_exe_path());
                 say("  pictures: " + mmproj + ", encoded " +
                     (truthy(jget(v, "gpu")) ? "on " + (jget(v, "cuda_device").is_null() ? std::string("a GPU")
                                                                                          : str_of(v["cuda_device"]))

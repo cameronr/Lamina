@@ -1,5 +1,6 @@
 # The llama.cpp the engine and the image encoder build against: ggml for the CPU experts and the prompt path's MMQ
-# kernels, libllama's pre-tokenizer, mtmd for pictures, and the libraries it vendors (cpp-httplib, nlohmann/json).
+# kernels, the image encoder's backends, libllama's pre-tokenizer, and the libraries it vendors (cpp-httplib,
+# nlohmann/json, stb_image).
 #
 #   lamina_llama_cpp(<var>)  ->  <var>: third_party/llama.cpp of this checkout, at the pinned commit
 #

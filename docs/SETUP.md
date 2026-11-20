@@ -65,8 +65,8 @@ downloads extract: the programs, `download-draft-layer.bat` (`.sh` on Linux) and
 `lamina`), and the CUDA runtime and cuBLAS the programs load, with NVIDIA's license (`cudart`; `--component` installs
 one). Installed on Linux, the programs load the libraries in their own folder.
 
-**A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 5 MB instead of the CUDA build's
-~92 MB, in seconds instead of minutes, as fast on the CPU. From the clone (on Windows in a Visual Studio developer
+**A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 2 MB instead of the CUDA build's
+~89 MB, in seconds instead of minutes, as fast on the CPU. From the clone (on Windows in a Visual Studio developer
 prompt or after a portable MSVC's `setup_x64.bat`; it downloads llama.cpp as the engine's build does when
 `third_party/llama.cpp` is not there):
 
@@ -79,10 +79,9 @@ Copy `build-vision/bin/lamina-vision` (`.exe`) beside `lamina-server`, over the 
 the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. The engine's
 build with `-DLAMINA_BUILD_VISION=OFF` leaves it there; a build with the encoder writes its CUDA one over it.
 
-Hy4-flash's projector (`mmproj-Hy4-flash-bf16.gguf`) is read by llama.cpp's pull request #32517 alone, which the
-pinned llama.cpp has not taken: the server starts `lamina-vision-hy4` for it, the same tool built against a checkout
-of that pull request (`-DLLAMA_DIR=<the checkout>`, its own build folder) and copied beside `lamina-server` under that
-name. Its mtmd encodes the other models' pictures differently from the pinned one's, so `lamina-vision` stays.
+The encoder reads the projectors of the engine's models: the type `qwen3vl_merger` (Qwen3.8-Flash-Next,
+Qwen3.6-35B-A3B, Qwen3.8-27B) and Hy4-flash's `hy_v4_flash` (`mmproj-Hy4-flash-bf16.gguf`). The server refuses a
+projector of another type by its name.
 
 ## A model file
 
@@ -221,7 +220,7 @@ preset ([above](#a-model-file)). Its keys:
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder's files and settings: the projector, the model (by default the config's), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does). The encoder itself is the `lamina-vision` in the server's folder |
+| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does). The encoder itself is the `lamina-vision` in the server's folder |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):

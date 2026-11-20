@@ -68,9 +68,9 @@ struct Header {
     }
 };
 
-void projector(const fs::path& path, uint32_t dim, size_t size = 0) {
+void projector(const fs::path& path, uint32_t dim, size_t size = 0, const char* type = "qwen3vl_merger") {
     Header h;
-    h.strs = {{"general.architecture", "clip"}};
+    h.strs = {{"general.architecture", "clip"}, {"clip.projector_type", type}};
     h.bools = {{"clip.has_vision_encoder", true}};
     h.u32s = {{"clip.vision.projection_dim", dim}};
     h.write(path, size);
@@ -181,9 +181,11 @@ int main() {
     projector(dir / "mmproj-Q8_0.gguf", 2560, 2048);
     projector(dir / "MMPROJ-other.gguf", 2048);
     projector(dir / "vision.gguf", 2560);   // not named as a projector: not looked at
+    projector(dir / "mmproj-other-type.gguf", 2560, 1024, "llava_mlp");   // a type the encoder does not read
     std::ofstream(dir / "mmproj-broken.gguf") << "not a GGUF";
     CHECK(lamina::projector_problem(lamina::u8_str(dir / "mmproj-Q8_0.gguf"), m).empty());
     CHECK(!lamina::projector_problem(lamina::u8_str(dir / "MMPROJ-other.gguf"), m).empty());
+    CHECK(lamina::projector_problem(lamina::u8_str(dir / "mmproj-other-type.gguf"), m).find("llava_mlp") != std::string::npos);
     CHECK(!lamina::projector_problem(lamina::u8_str(dir / "model.gguf"), m).empty());
     CHECK(!lamina::projector_problem(lamina::u8_str(dir / "mmproj-broken.gguf"), m).empty());
     const std::vector<std::string> found = lamina::projectors_beside(m);

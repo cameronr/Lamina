@@ -104,7 +104,8 @@ cpp-httplib, nlohmann/json, stb_image: MIT). It builds on:
   Strata took from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen).
 - [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp) (MIT): the CPU and CUDA kernels it shares, the prompt
-  path's matrix products, the image encoder, the GGUF tools. The build downloads it at a pinned commit.
+  path's matrix products, the image encoder's tensor library and the arithmetic it follows (llama.cpp's multimodal
+  library), the GGUF tools. The build downloads it at a pinned commit.
 - The models: [Qwen](https://huggingface.co/Qwen)'s, under their licenses, in the quantizations of
   [ISTA-DASLab](https://huggingface.co/ISTA-DASLab) and [unsloth](https://huggingface.co/unsloth).
 - The draft layer, [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP):
