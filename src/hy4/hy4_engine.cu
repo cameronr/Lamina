@@ -556,9 +556,10 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     double alloc_s = 0;
     int dev = 0;
     CK(cudaGetDevice(&dev));
-    std::thread alloc([&] {
+    const bool serial = std::getenv("LAMINA_HY4_LOAD_SERIAL") != nullptr;
+    auto make_blocks = [&] {
         const auto ta = Clock::now();
-        (void) cudaSetDevice(dev);   // no context made on another GPU for this thread
+        if (!serial) (void) cudaSetDevice(dev);   // no context made on another GPU for this thread
         size_t pinned = 0;
         for (size_t i = 0; i < src.size(); ++i) {
             const size_t bytes = src[i].y->stride * (size_t) g.n_expert;
@@ -585,7 +586,10 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
         alloc_end = true;
         alloc_s = ms_since(ta) / 1000.0;
         cv.notify_all();
-    });
+    };
+    std::thread alloc;
+    if (serial) make_blocks();
+    else alloc = std::thread(make_blocks);
     auto base = [&](int i) -> uint8_t* {
         std::unique_lock<std::mutex> lk(mu);
         cv.wait(lk, [&] { return made > (size_t) i || alloc_end; });
@@ -606,7 +610,7 @@ bool load(const std::string& path, Model& m, int threads, double pin_gib, bool w
     const bool read_ok = lamina::hy4::read_slices(runs, std::max(1, threads), !file_cache, (uint64_t) 32 << 20, base,
                                                   err, &read_s);
     for (size_t i = 0; i < src.size(); ++i) base((int) i);   // every block made (or the allocation's end)
-    alloc.join();
+    if (alloc.joinable()) alloc.join();
     if (!read_ok) return false;
     for (size_t i = 0; i < src.size(); ++i) {
         if (bases[i] == nullptr) { err = "out of host memory for the routed experts"; return false; }
@@ -953,7 +957,8 @@ struct Engine {
     std::vector<int32_t> seq;   // the tokens in the state, in order
 
     // buffers (kMaxT rows)
-    float *X = nullptr, *xh = nullptr, *xn = nullptr, *y = nullptr, *sy = nullptr, *emb = nullptr, *post = nullptr;
+    float *X = nullptr, *xh = nullptr, *xn = nullptr, *y = nullptr, *sy = nullptr, *emb = nullptr, *post = nullptr,
+          *hc_part = nullptr;
     uint8_t *xq = nullptr, *qrq = nullptr, *qnq = nullptr, *attq = nullptr, *oq = nullptr, *hq = nullptr,
             *moeq = nullptr, *erq = nullptr, *ikq = nullptr;
     float *qa = nullptr, *q = nullptr, *qnope = nullptr, *qabs = nullptr, *kva = nullptr, *gt = nullptr,
@@ -1127,6 +1132,7 @@ struct Engine {
         sy = dalloc<float>(T * N);
         emb = dalloc<float>(T * N);
         post = dalloc<float>(T * hc);
+        hc_part = dalloc<float>(T * hy4k::kHcSlices * 9);
         xq = dalloc<uint8_t>(T * widest / 32 * q81);
         qa = dalloc<float>(T * (size_t) g.q_lora);
         qrq = dalloc<uint8_t>(T * (size_t) g.q_lora / 32 * q81);
@@ -1228,6 +1234,10 @@ struct Engine {
             if (l.has_idx) l.tail = dalloc<float>((size_t) kTail * 2 * idd);
         }
         if (elastic) ensure(std::min<int64_t>(ctx, kKvStep));
+        CK(cudaFuncSetAttribute(hy4p::k_attn_dec<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) sizeof(hy4p::AttnSmem)));
+        CK(cudaFuncSetAttribute(hy4p::k_attn_dec<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                (int) sizeof(hy4p::AttnSmem)));
         if (m->dfly.on) {
             const size_t nl = m->dfly.layers.size(), W = (size_t) m->dfly.width;
             snap_cells = dalloc<int32_t>(nl * T * (size_t) g.idx_top_k);
@@ -1859,8 +1869,7 @@ struct Engine {
             ph(12);
         }
         // the head: the streams reduced, output_norm, the BF16 head
-        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, m->ohc_fn, m->ohc_scale, m->ohc_base, hc, N, hc, g.eps, g.hc_eps, 0.f,
-                                          nullptr, xh, m->out_norm, xn, g.eps);
+        hc_pre(m->ohc_fn, m->ohc_scale, m->ohc_base, hc, 0.f, nullptr, m->out_norm, T);
         K::bf16_gemv_fp32_mmvf_multi(xn, m->head, logits, N, g.n_vocab, T, st);
         if (hring) hy4k::k_ring_store<<<T, 256, 0, st>>>(xn, hring, pos_d, kHRing, N);
     }
@@ -1879,13 +1888,11 @@ struct Engine {
                                                   kEngramEps);
             ph(1);
         }
-        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hca_fn, l.hca_scale, l.hca_base, hc, N, 2 * hc, g.eps, g.hc_eps,
-                                          g.hc_mag, post, xh, l.attn_norm, xn, g.eps);
+        hc_pre(l.hca_fn, l.hca_scale, l.hca_base, 2 * hc, g.hc_mag, post, l.attn_norm, T);
         ph(2);
         attend(l, T);
-        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
-        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hcf_fn, l.hcf_scale, l.hcf_base, hc, N, 2 * hc, g.eps, g.hc_eps,
-                                          g.hc_mag, post, xh, l.ffn_norm, xn, g.eps);
+        hc_post(T);
+        hc_pre(l.hcf_fn, l.hcf_scale, l.hcf_base, 2 * hc, g.hc_mag, post, l.ffn_norm, T);
         quant(xn, T, N, xq);
         ph(2);
     }
@@ -1906,8 +1913,8 @@ struct Engine {
         hy4k::k_rope_norm<<<dim3(H, T), 32, 0, st>>>(qabs, H, hy4k::kKvRow, hy4k::kLatent, (int) g.n_rot, pos_d, 0,
                                                      l.theta);
         quant(qnope, (int64_t) T * H, g.nope(), qnq);
-        hy4k::k_head_q8_0<<<dim3((unsigned) ((H * hy4k::kLatent + 127) / 128), T), 128, 0, st>>>(
-            l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow);
+        hy4k::k_head_q8_0_w2<<<(unsigned) ((H * hy4k::kLatent + 15) / 16), 256, 0, st>>>(
+            l.k_b.d, qnq, qabs, H, (int) g.nope(), hy4k::kLatent, H * hy4k::kKvRow, hy4k::kKvRow, T);
         (l.kv_q8 ? hy4k::k_kv_store<true> : hy4k::k_kv_store<false>)<<<T, hy4k::kThreads, 0, st>>>(
             kva, l.kv_a_norm, l.kv, pos_d, l.swa ? (int) ring : 0, 0, l.theta, g.eps);
         ph(4);
@@ -1930,15 +1937,23 @@ struct Engine {
             }
             ph(5);
         }
-        const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
-        const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
-        (l.kv_q8 ? hy4k::k_mla_chunk<true> : hy4k::k_mla_chunk<false>)<<<dim3(n_chunks, T), 256, smem, st>>>(
-            qabs, l.kv, cells, counts, ld, H, 1.0f / sqrtf((float) g.k_head), part, n_chunks);
-        hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_chunks);
+        if (H % hy4p::kQRows == 0) {   // on the tensor cores, the cells in splits of `per`
+            const int per = std::max(64, (ld / 16 + 31) / 32 * 32), n_split = (ld + per - 1) / per;
+            (l.kv_q8 ? hy4p::k_attn_dec<true> : hy4p::k_attn_dec<false>)<<<dim3(n_split, H / hy4p::kQRows, T), 256,
+                                                                          sizeof(hy4p::AttnSmem), st>>>(
+                qabs, l.kv, cells, counts, ld, H, per, 1.0f / sqrtf((float) g.k_head), part, n_split);
+            hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_split);
+        } else {
+            const int n_chunks = (ld + hy4k::kAttnChunk - 1) / hy4k::kAttnChunk;
+            const size_t smem = (size_t) hy4k::kAttnChunk * hy4k::kKvRowPad * sizeof(__half);
+            (l.kv_q8 ? hy4k::k_mla_chunk<true> : hy4k::k_mla_chunk<false>)<<<dim3(n_chunks, T), 256, smem, st>>>(
+                qabs, l.kv, cells, counts, ld, H, 1.0f / sqrtf((float) g.k_head), part, n_chunks);
+            hy4k::k_mla_merge<<<dim3(H, T), 128, 0, st>>>(part, l.sinks, att, H, n_chunks);
+        }
         ph(6);
         quant(att, (int64_t) T * H, hy4k::kLatent, attq);
-        hy4k::k_head_q8_0<<<dim3((unsigned) ((H * g.v_head + 127) / 128), T), 128, 0, st>>>(
-            l.v_b.d, attq, o, H, hy4k::kLatent, (int) g.v_head, H * (int) g.v_head, (int) g.v_head);
+        hy4k::k_head_q8_0_w2<<<(unsigned) ((H * g.v_head + 15) / 16), 256, 0, st>>>(
+            l.v_b.d, attq, o, H, hy4k::kLatent, (int) g.v_head, H * (int) g.v_head, (int) g.v_head, T);
         hy4k::k_gate_mul<<<blocks((int64_t) T * H * g.v_head), hy4k::kThreads, 0, st>>>(o, gt, (int64_t) T * H * g.v_head);
         quant(o, T, (int64_t) H * g.v_head, oq);
         mmvq(l.wo, oq, y, T);
@@ -1980,7 +1995,7 @@ struct Engine {
         quant(fh, T, g.n_ff, hq);
         mmvq(l.f_down, hq, y, T);
         hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
-        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
+        hc_post(T);
     }
 
     /// The MoE layer's GPU work before the CPU's: the routing, the routed input to the host (an event when it is there),
@@ -1990,8 +2005,12 @@ struct Engine {
         const int N = (int) g.n_embd, E = (int) g.n_expert, Kk = (int) g.top_k, Ld = (int) g.n_latent,
                   F = (int) g.n_ff_exp;
         hy4k::k_gemv_f32<<<dim3((unsigned) ((E + 7) / 8), T), 256, 0, st>>>(l.router, xn, logits_r, N, E, 1.f);
-        hy4k::k_route<<<T, std::max(32, ((E + 31) / 32) * 32), 0, st>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale,
-                                                                       ids, wts);
+        if (E <= 1024 && Kk <= 32)
+            hy4k::k_route_w<<<(unsigned) ((T + 7) / 8), 256, 0, st>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale, T, ids,
+                                                                     wts);
+        else
+            hy4k::k_route<<<T, std::max(32, ((E + 31) / 32) * 32), 0, st>>>(logits_r, l.bias, E, Kk, g.w_norm, g.w_scale,
+                                                                           ids, wts);
         mmvq(l.r_down, xq, rin, T);
         CK(cudaMemcpyAsync(h_rin, rin, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * Kk * 4, cudaMemcpyDeviceToHost, st));
@@ -2001,8 +2020,8 @@ struct Engine {
         ph(8);
         if (!l.held.empty() && l.held[0].n > 0) {
             quant(rin, T, Ld, rinq);
-            hy4k::k_group_slots<<<1, 512, 0, st>>>(ids, T * Kk, Kk, E, l.held[0].slot_of_d, l.held[0].slots, l.stride,
-                                                  grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+            group_slots(ids, T * Kk, Kk, E, l.held[0].slot_of_d, l.held[0].slots, l.stride, grp_ptr, grp_start,
+                        n_groups, ent_dst, ent_tok, st);
             K::native_expert_grouped(l.gl, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                      std::min<int64_t>((int64_t) T * Kk, E), (int64_t) T * Kk, rinq,
                                      (int64_t) (Ld / 32) * 36, escr, parts, st);
@@ -2108,14 +2127,40 @@ struct Engine {
     /// expert added, the FFN's norm, iHC's post.
     void moe_end(Layer& l, int T) {
         moe_out(l, T);
-        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, (int) m->g.hc, (int) m->g.n_embd);
+        hc_post(T);
+    }
+    /// iHC's pre-mix of the decode's T rows from X into xh (and xn with `wn`), `m_mix` mixes (2 hc for a layer: post
+    /// weights into `post_out`; hc for the head), over many blocks
+    void hc_pre(const float* fn, const float* scale, const float* base, int m_mix, float mag, float* post_out,
+                const float* wn, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc;
+        hy4k::k_hc_pre1<<<dim3(hy4k::kHcSlices, T), 256, 0, st>>>(X, fn, hc * N, m_mix, hc_part);
+        hy4k::k_hc_pre2<<<T, 256, 0, st>>>(X, hc_part, scale, base, hc, N, m_mix, g.eps, g.hc_eps, mag, post_out, xh, wn,
+                                           xn, g.eps);
+    }
+    /// The entries the slots hold grouped by expert (k_group_slots_p, or the one-thread form for more experts)
+    static void group_slots(const int32_t* ids_, int n_ent, int K_, int E_, const int32_t* slot_of, const uint8_t* slots,
+                            size_t stride, unsigned long long* gptr, int32_t* gstart, int32_t* ngroups, int32_t* edst,
+                            int32_t* etok, cudaStream_t s_) {
+        if (E_ <= 512 && n_ent <= 128)
+            hy4k::k_group_slots_p<<<1, 512, 0, s_>>>(ids_, n_ent, K_, E_, slot_of, slots, stride, gptr, gstart, ngroups,
+                                                     edst, etok);
+        else
+            hy4k::k_group_slots<<<1, 512, 0, s_>>>(ids_, n_ent, K_, E_, slot_of, slots, stride, gptr, gstart, ngroups,
+                                                   edst, etok);
+    }
+    /// iHC's post of the decode's T rows: X += y * post, a thread a column of every stream
+    void hc_post(int T) {
+        const int N = (int) m->g.n_embd;
+        hy4k::k_hc_post_c<<<dim3((unsigned) ((N + 255) / 256), T), 256, 0, st>>>(X, y, post, (int) m->g.hc, N);
     }
     /// The MoE layer's output in y: the CPU's rows merged, the weighted sum, routed_up, the shared expert added, the norm
     void moe_out(Layer& l, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kk = (int) g.top_k, Ld = (int) g.n_latent;
         hy4k::k_merge_cpu<<<T * Kk, hy4k::kThreads, 0, st>>>(parts, h_out_d, h_miss_d, Ld);
-        hy4k::k_moe_sum<<<T, hy4k::kThreads, 0, st>>>(parts, wts, moe, Kk, Ld);
+        hy4k::k_moe_sum_c<<<dim3((unsigned) ((Ld + 255) / 256), T), 256, 0, st>>>(parts, wts, moe, Kk, Ld);
         quant(moe, T, Ld, moeq);
         mmvq(l.r_up, moeq, y, T);
         hy4k::k_add<<<blocks((int64_t) T * N), hy4k::kThreads, 0, st>>>(y, sy, (int64_t) T * N);
@@ -2845,8 +2890,8 @@ struct Engine {
         CK(cudaMemcpyAsync(gp.ids_d, h_ids, (size_t) T * Kk * 4, cudaMemcpyHostToDevice, gp.st));
         CK(cudaMemcpyAsync(gp.rin_d, h_rin, (size_t) T * Ld * 4, cudaMemcpyHostToDevice, gp.st));
         K::quantize_q8_1_rows(gp.rin_d, T, Ld, gp.rinq_d, gp.st);
-        hy4k::k_group_slots<<<1, 512, 0, gp.st>>>(gp.ids_d, T * Kk, Kk, E, s.slot_of_d, s.slots, l.stride, gp.grp_ptr,
-                                                 gp.grp_start, gp.n_groups, gp.ent_dst, gp.ent_tok);
+        group_slots(gp.ids_d, T * Kk, Kk, E, s.slot_of_d, s.slots, l.stride, gp.grp_ptr, gp.grp_start, gp.n_groups,
+                    gp.ent_dst, gp.ent_tok, gp.st);
         K::native_expert_grouped(l.gl, gp.grp_ptr, gp.grp_start, gp.n_groups, gp.ent_dst, gp.ent_tok,
                                  std::min<int64_t>((int64_t) T * Kk, E), (int64_t) T * Kk, gp.rinq_d,
                                  (int64_t) (Ld / 32) * 36, gp.escr, gp.rows_d, gp.st);
