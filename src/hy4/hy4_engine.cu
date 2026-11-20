@@ -5122,7 +5122,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         std::fprintf(stderr, "lamina: GPU %d, %s: %.1f%% of the routed entries\n", gp.dev, gp.name.c_str(),
                      E.lookups ? 100.0 * (double) gp.hits / (double) E.lookups : 0.0);
     std::fprintf(stderr, "lamina: MiB of VRAM free: %s\n", E.vram_free().c_str());
-    if (windows > 0)    if (windows > 0)
+    if (windows > 0)
         std::fprintf(stderr, "lamina: %lld windows (%lld looked up), %lld drafts offered, %lld kept (%.1f%%), %.2f tokens "
                      "a window\n", (long long) windows, (long long) E.looked_windows, (long long) offered, (long long) kept,
                      offered ? 100.0 * (double) kept / (double) offered : 0.0, (double) gen.size() / (double) windows);
