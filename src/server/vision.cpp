@@ -378,6 +378,7 @@ struct Vision::Loaded {
     int device = -1;                 // a resident GPU encoder's CUDA device, kept from the engine's resets
     std::function<void()> unlend;    // a lease in the engine's memory: given back after the encoder
     std::string where;               // a lease: what it runs in
+    double waited = 0;               // a lease: how long the engine took to lend (it waits for a prompt it reads)
     std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     int pictures = 0;
     ~Loaded() {
@@ -529,9 +530,11 @@ void* Vision::encoder_now(std::string& err) {
     const bool ask = lender_ != nullptr && std::getenv("LAMINA_VISION_NO_LOAN") == nullptr;
     if (!ask && lender_ != nullptr) why = "LAMINA_VISION_NO_LOAN";
     if (ask) {
+        const auto asked = std::chrono::steady_clock::now();
         if (void* at = lender_(p.device, plan_->need, why)) {
             lease->unlend = unlender_;
             lease->where = why;   // what the engine lent
+            lease->waited = seconds_since(asked);
             p.gpu_arena = at;
             p.gpu_arena_bytes = plan_->need;
             lease->encoder = vision::open_encoder(p, err);
@@ -589,10 +592,13 @@ void Vision::lease_end() {
     const std::string where = loaded_->where;
     const int pictures = loaded_->pictures;
     const auto since = loaded_->since;
-    const double used = seconds_since(since);
+    const double used = seconds_since(since), waited = loaded_->waited;
     loaded_.reset();   // the encoder, then the loan (the engine's slots refilled)
-    std::fprintf(stderr, "lamina: the image encoder borrowed %s for %d picture%s: %.2f s, and %.2f s to give it back\n",
-                 where.c_str(), pictures, pictures == 1 ? "" : "s", used, seconds_since(since) - used);
+    // (an engine with batch slots lends once the prompt a request is reading is read: said when it took a while)
+    char wait[96] = "";
+    if (waited >= 1.0) std::snprintf(wait, sizeof wait, " (%.2f s of them waiting for the engine to lend)", waited);
+    std::fprintf(stderr, "lamina: the image encoder borrowed %s for %d picture%s: %.2f s%s, and %.2f s to give it back\n",
+                 where.c_str(), pictures, pictures == 1 ? "" : "s", used, wait, seconds_since(since) - used);
 #endif
 }
 

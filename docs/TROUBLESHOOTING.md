@@ -184,11 +184,13 @@ window said why at the start.
 **Pictures take seconds.** A new picture is encoded once, in about half a second on the engine's GPU, which lends
 the encoder the VRAM for it. Seconds a picture (about 9 for ~1,000 image tokens on an 8-core CPU) mean the CPU
 encodes it: a config whose `vision` section has `"gpu": false` or no `gpu` (`--vision-gpu --vision-lend` on the
-command line, or `"gpu": true, "lend": true` there), `--no-vision-gpu`, a server with batch slots (`--parallel`) or
-replicas, where the engine cannot lend (the window says so at the start; `--no-vision-lend` puts the encoder on a GPU
+command line, or `"gpu": true, "lend": true` there), `--no-vision-gpu`, a server with replicas, whose engines cannot
+lend (the window says so at the start; `--no-vision-lend` puts the encoder on a GPU
 with VRAM of its own), or a loan that found no memory, which the engine's log says once ("the image encoder ... found no VRAM for a picture (...): the CPU
-encodes", with what the engine answered). The config's `vision.max_tokens` caps a picture's tokens (1,024 in the
-configs).
+encodes", with what the engine answered). With batch slots (`--parallel`) a picture that arrives while another
+request's long prompt is being read is encoded when that prompt is read: the engine's log then says how long the
+encoder waited ("... waiting for the engine to lend"). The config's `vision.max_tokens` caps a picture's tokens
+(1,024 in the configs).
 
 **Two runs of one greedy request differ.** Where an expert is computed changes its rounding a little, and the GPUs'
 expert caches change as their copies land, so runs can part at a near-tie

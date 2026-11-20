@@ -171,7 +171,9 @@ engine hands it memory on that card. Flash-Next lends its expert cache's last sl
 buffers borrow too, and copies the experts that were in them back afterwards; Hy4-flash lends chunks of its main
 GPU's expert slots; the qwen35 path, which has no such cache, lends the two buffers a long prompt's experts are
 streamed through (it runs so where the experts do not all fit the GPU; the buffers hold nothing between prompts),
-else VRAM it leaves free, which its layer split keeps on the encoder's card. The server
+else VRAM it leaves free, which its layer split keeps on the encoder's card. With batch slots, where requests run at
+once, that engine lends beside the requests that are generating, which leave those buffers alone, and holds a prompt
+that arrives meanwhile until the loan is back. The server
 encodes each picture once and passes its
 embeddings to the engine, which places them in the prompt with their positions in the picture's grid (Hy4-flash's file:
 at consecutive positions, as text, which is how llama.cpp's support for it reads them).

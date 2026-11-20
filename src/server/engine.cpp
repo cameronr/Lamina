@@ -81,6 +81,7 @@ LaminaEngine::~LaminaEngine() {
 void LaminaEngine::start() {
     std::lock_guard<std::mutex> lk(start_mu_);
     unloaded_ = false;
+    loan_unanswered_ = false;   // (a loan was its predecessor's)
     max_context_ = 0;   // before this start is visible: never its predecessor's
     {
         const std::lock_guard<std::mutex> g(cache_mu_);
@@ -308,28 +309,33 @@ void LaminaEngine::load() {
     }
 }
 
-std::string LaminaEngine::ask(const std::string& line, std::initializer_list<const char*> answers, double timeout_s) {
-    out_->clear();   // nothing of an earlier request is left to read
+std::string LaminaEngine::ask(const std::string& line, const char* answer, double timeout_s) {
+    // with batch slots the pump has the engine's lines, and a loan's answers come beside the requests' own
+    const std::shared_ptr<LineChannel> from = batch_ ? loan_lines_ : out_;
+    if (from == nullptr) return "";
+    from->clear();   // nothing of an earlier request is left to read
     send(line);
+    const bool lend = starts_with(line, "LEND ");
     const auto t0 = Clock::now();
     for (;;) {
         const double left = timeout_s - std::chrono::duration<double>(Clock::now() - t0).count();
+        if (left <= 0) return "";
         std::string l;
-        if (left <= 0 || out_->pop(l, left) != 1) return "";
-        if (starts_with(l, "ERR")) return l;
-        for (const char* a : answers)
-            if (starts_with(l, a)) return l;
+        const int got = from->pop(l, std::min(left, 1.0));
+        if (got < 0 || (got == 0 && ended_.load())) return "";
+        if (got == 0) continue;
+        if (starts_with(l, answer)) return l;
+        // an ERR answers too - but a LEND's refusal is not the answer to an UNLEND sent after it
+        if (starts_with(l, "ERR") && (lend || !starts_with(l, "ERR no loan"))) return l;
     }
 }
 
 void* LaminaEngine::lend(int device, uint64_t bytes, std::string& why) {
-    // the loan is memory of the engine's process, handed over between two requests
+    // the loan is memory of the engine's process.  Without batch slots it is handed over between two requests (the
+    // caller holds the service's turn); with them the engine picks the moment: at once beside the requests that
+    // decode, after the prompt one of them is reading, and a request sent meanwhile waits in the engine for UNLEND
     if (!process_.exe.empty()) {
         why = "the engine runs in a process of its own";
-        return nullptr;
-    }
-    if (batch_) {
-        why = "the engine's batch slots run requests at once";
         return nullptr;
     }
     if (!alive()) {
@@ -338,7 +344,18 @@ void* LaminaEngine::lend(int device, uint64_t bytes, std::string& why) {
     }
     std::string l;
     try {
-        l = ask("LEND " + std::to_string(device) + " " + std::to_string(bytes), {"LENT "}, 120.0);
+        // an earlier LEND that got no answer in time: its answer, and the UNLEND's sent after it, are read first, so
+        // that this loan's answer is its own
+        if (loan_unanswered_ && !unlend_now()) {
+            why = "the engine has not answered an earlier loan";
+            return nullptr;
+        }
+        // (with batch slots the answer comes after the prompt a request is reading: as long as a read can take)
+        l = ask("LEND " + std::to_string(device) + " " + std::to_string(bytes), "LENT ", batch_ ? 1800.0 : 120.0);
+        if (l.empty()) {   // a loan made after all comes straight back
+            loan_unanswered_ = true;
+            (void) unlend_now();
+        }
     } catch (const EngineDied& e) {
         why = e.what();
         return nullptr;
@@ -362,9 +379,20 @@ void* LaminaEngine::lend(int device, uint64_t bytes, std::string& why) {
     return (void*) (uintptr_t) at;
 }
 
+bool LaminaEngine::unlend_now() {
+    // UNLEND's answer is the last line of every loan asked for so far: once it is read none is out or to come
+    if (in_ == nullptr || ended_.load()) return false;
+    if (ask("UNLEND", "UNLENT", 300.0).empty()) {
+        loan_unanswered_ = !ended_.load();   // (an engine that ended has no loan)
+        return false;
+    }
+    loan_unanswered_ = false;
+    return true;
+}
+
 void LaminaEngine::unlend() {
     try {
-        if (in_ != nullptr && !ended_.load()) (void) ask("UNLEND", {"UNLENT"}, 300.0);
+        (void) unlend_now();
     } catch (const EngineDied&) {   // (its memory went with it)
     }
 }

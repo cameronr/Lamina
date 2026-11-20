@@ -111,12 +111,14 @@ void LaminaEngine::start_batch() {
     ctl_erred_ = false;
     yielded_.reset();
     ctl_lines_ = std::make_shared<LineChannel>();
+    loan_lines_ = std::make_shared<LineChannel>();
     pump_ = std::thread([this] { pump(); });
 }
 
 void LaminaEngine::pump() {
-    // the engine's lines: a slot's own (BT, BDONE) to its queue, the rest to the control lines
-    std::shared_ptr<LineChannel> out = out_, ctl = ctl_lines_;
+    // the engine's lines: a slot's own (BT, BDONE) to its queue, the answers to the image encoder's LEND / UNLEND
+    // (which the engine gives beside a request's lines) to theirs, the rest to the control lines
+    std::shared_ptr<LineChannel> out = out_, ctl = ctl_lines_, loan = loan_lines_;
     std::vector<std::shared_ptr<LineChannel>> qs = slot_q_;
     std::string line;
     while (out->pop(line, -1) == 1) {
@@ -127,9 +129,14 @@ void LaminaEngine::pump() {
                 continue;
             }
         }
+        if (starts_with(line, "LENT ") || line == "UNLENT" || starts_with(line, "ERR no loan:")) {
+            loan->push(line);
+            continue;
+        }
         ctl->push(line);
     }
     ctl->close();
+    loan->close();
     for (auto& q : qs) q->close();
 }
 

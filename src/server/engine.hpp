@@ -2,7 +2,8 @@
 //
 // LaminaEngine runs the engine (lamina::program::run) on a thread of this process and speaks its --serve line
 // protocol through in-process channels: GEN / GENI requests (sampling keys between max_new and the ids), STOP, QUIT,
-// and between requests LEND / UNLEND (VRAM of its expert cache for the image encoder: LENT, UNLENT);
+// and LEND / UNLEND (VRAM of the engine's for the image encoder: LENT, UNLENT; between requests, and with batch
+// slots beside the requests that decode);
 // T tokens, PP prompt progress, LP / TIERS notes, DONE figures, ERR, READY and INFO. A request runs through generate(),
 // whose callbacks take each token and the heartbeats; a callback that returns false ends the request (STOP, then
 // the rest of it is read to its DONE).
@@ -97,8 +98,10 @@ public:
     virtual void close() {}
     /// `bytes` of the VRAM the engine holds on its CUDA device `device`, lent until unlend(): the address, with
     /// what it is in `why` (its expert cache's last slots, its prompt path's staging buffers, VRAM it leaves free),
-    /// or null with why not (an engine in another process, batch slots, a cache or a card that cannot spare it).
-    /// Between two requests only: the caller holds the service's turn.
+    /// or null with why not (an engine in another process, a cache or a card that cannot spare it).  One loan at a
+    /// time: the caller holds the service's turn, which without batch slots also keeps requests away; with them
+    /// the engine lends beside the requests that decode, once no prompt is being read, and holds a request sent
+    /// meanwhile until unlend().
     virtual void* lend(int device, uint64_t bytes, std::string& why) {
         (void) device, (void) bytes;
         why = "this engine lends no VRAM";
@@ -217,9 +220,11 @@ public:
 private:
     void start();
     void send(const std::string& line);
-    /// `line` to the idle engine and its answer, the first line that starts with one of `answers` or with ERR ("":
-    /// none within `timeout_s`, or the engine ended)
-    std::string ask(const std::string& line, std::initializer_list<const char*> answers, double timeout_s);
+    /// a loan's `line` (LEND, UNLEND) to the engine and its answer, the first line that starts with `answer` or is
+    /// its ERR ("": none within `timeout_s`, or the engine ended); with batch slots from the pump's loan_lines_
+    std::string ask(const std::string& line, const char* answer, double timeout_s);
+    /// UNLEND and its answer: false when none came (the next lend() asks again before it borrows)
+    bool unlend_now();
     bool note_line(const std::string& line);
     /// a CACHE line: the prompt cache's state at READY and after each request (the Conversation cache card)
     void cache_line(const std::string& line);
@@ -272,6 +277,8 @@ private:
     int64_t ctl_epoch_ = 0;
     std::timed_mutex ctl_;                 ///< one admission or solo request on the control lines at a time
     std::shared_ptr<LineChannel> ctl_lines_;
+    std::shared_ptr<LineChannel> loan_lines_;   ///< the engine's answers to LEND / UNLEND (LENT, UNLENT, ERR no loan)
+    std::atomic<bool> loan_unanswered_{false};  ///< a LEND or UNLEND got no answer in time: it may still come
     std::thread pump_;
     std::atomic<int> bg_{0};               ///< the slots' background waits still running (close() waits for them)
     bool ctl_erred_ = false;

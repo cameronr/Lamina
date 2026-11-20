@@ -272,16 +272,14 @@ void settle_vision(json& cfg) {
 }
 
 /// Why the image encoder cannot borrow the engine's VRAM for its pictures (the vision section's "lend"), "" when it
-/// can: the loan is memory of an engine in this process that runs one request at a time, on a card the engine works
-/// on (Flash-Next lends a card's expert cache, the main GPU's or a tier's; Hy4-flash its main GPU's slots; the
-/// qwen35 path its prompt path's staging buffers, or VRAM it leaves free).  `arch`: the model's ("": not read).
+/// can: the loan is memory of an engine in this process, on a card the engine works on (Flash-Next lends a card's
+/// expert cache, the main GPU's or a tier's; Hy4-flash its main GPU's slots; the qwen35 path its prompt path's
+/// staging buffers, or VRAM it leaves free - with batch slots too, beside the requests that decode).  `arch`: the
+/// model's ("": not read).
 std::string no_lending(const json& cfg, const std::string& arch, bool replicas, std::vector<GpuInfo>& gpus) {
     const json& v = jget(cfg, "vision");
     if (!truthy(jget(v, "gpu"))) return "the encoder runs on the CPU";
     if (replicas) return "the replicas' engines are processes of their own";
-    const std::vector<std::string> args = engine_args(cfg);
-    if (std::find(args.begin(), args.end(), "--batch") != args.end() || std::find(args.begin(), args.end(), "--slots") != args.end())
-        return "the engine's batch slots run requests at once";   // ("parallel" is --batch there)
     const json& dev = jget(v, "cuda_device");
     if (dev.is_null()) return "";
     if (gpus.empty()) gpus = nvidia_gpus();
@@ -297,10 +295,10 @@ std::string no_lending(const json& cfg, const std::string& arch, bool replicas, 
 /// window (the encoder would otherwise take CUDA's first); one that names its card by nvidia-smi's number: that
 /// card's UUID (the encoder finds its card among this process's CUDA devices, whose order is another).  With
 /// "lend", `lend_no` is why the engine cannot lend (no_lending; "": it can), which decides what a section that names
-/// no card gets: the engine's main GPU for a loan; where there is none to be had (batch slots, replicas), the CPU -
-/// "lend" asks for an encoder that keeps no VRAM, and one kept on the engine's card would take the model's (beside
-/// replicas, engines in processes of their own, unseen by them when they size their caches).  A section that names
-/// its card keeps the encoder there, with its VRAM.
+/// no card gets: the engine's main GPU for a loan; where there is none to be had (replicas), the CPU - "lend" asks
+/// for an encoder that keeps no VRAM, and one kept on an engine's card would take the model's (replicas are
+/// engines in processes of their own, which do not see this process's VRAM when they size their caches).  A section
+/// that names its card keeps the encoder there, with its VRAM.
 void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus, const std::string& arch, bool replicas, std::string& lend_no) {
     lend_no.clear();
     // "gpu" naming a card (a name, a UUID's start, a PCI bus id, a number): the encoder on it, by its UUID

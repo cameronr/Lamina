@@ -1989,6 +1989,14 @@ struct Engine {
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};   // a streamed prompt's staging buffers: one block (stage_bytes), the second half way in
     size_t stage_bytes = 0;
+    /// A batch of T rows streams its hybrid layers' experts through the staging buffers for MMQ: a prompt chunk past
+    /// hybrid_t rows.  Every other batch - a decode step, a verify window, the batch slots' window (kVerify rows at
+    /// most) - runs them from the VRAM slots and the CPU pool and leaves the staging buffers alone, which is what
+    /// lets them be lent while requests decode (Serve::lend).
+    bool streamed(int T) const {
+        static_assert(kVerify <= kGemmT, "a decode window's rows never stream");
+        return main_hybrid && use_mmq && T > hybrid_t && T > kGemmT;
+    }
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -2974,7 +2982,7 @@ struct Engine {
         // the hybrid rows path: every batch of a hybrid layer but a prompt chunk past hybrid_t that MMQ streams (main
         // layers: when only the MTP block is hybrid it has no staging buffers); the all-resident path below would read
         // its slot-indexed blobs by expert id (--hybrid-rows under 8)
-        const bool hy_rows = lhy(li) && !(main_hybrid && T > hybrid_t && T > kGemmT && use_mmq);
+        const bool hy_rows = lhy(li) && !streamed(T);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
@@ -3081,7 +3089,7 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && T > hybrid_t && use_mmq) {
+        if (streamed(T)) {   // (not a window of more rows than a small --hybrid-rows: its layers take no stream)
             std::vector<int> seq;
             for (size_t l = l0; l < l1; ++l)
                 if (lhy(l)) seq.push_back((int) l);
@@ -3187,7 +3195,7 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
+        if (streamed(T) && lhy(m->layers.size())) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd_mtp, m->embd_row, m->embd_rows, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
@@ -4009,7 +4017,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.main_hybrid = !mtp_only;
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
-    E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
+    // (MMQ takes a batch of more than kGemmT rows: a --hybrid-rows under that streams from there too)
+    E.hybrid_t = std::max(Engine::kGemmT, std::min(hybrid_t, E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     // the streamed prompt path's two staging buffers, a layer's experts each, in one block: idle between prompts, so
     // the block is what the image encoder borrows, as large as its loan where two layers are less
@@ -4526,9 +4535,15 @@ struct Serve {
     // between prompts (place_experts makes them one block, as large as the loan the server announced); else VRAM
     // allocated of what the card has free, which the planner left that large where the model let it (kVramReserve).
     // LEND <device> <bytes> -> LENT <address> <bytes> 0 0 <what it is> or ERR; UNLEND -> UNLENT.
+    // Only a prompt's chunks use the staging buffers (Engine::streamed), so a loan is made wherever none is read:
+    // between requests, between the batch slots' decode windows (run), and between the decode steps of the request
+    // on the control lines (poll_loan) - the encoder works beside the requests that decode.  A request that comes
+    // while a loan is out waits for it (await_unlend): its prompt is read once the buffers are back.
     void* enc_at = nullptr;      // the loan that is out
     Engine* enc_on = nullptr;    // the stage whose GPU it is on
     bool enc_staging = false;    // that stage's staging buffers; else an allocation of its own
+    bool in_process = false;     // the server and the engine in one process (run): the only loan there is
+    static constexpr double kLoanWaitMs = 300000.0;   // how long a request waits for a loan to come back
     void enc_back() {
         if (enc_at == nullptr) return;
         enc_on->on();
@@ -4546,7 +4561,7 @@ struct Serve {
         enc_staging = false;
         E.on();
     }
-    void lend(const std::string& line, bool in_process) {
+    void lend(const std::string& line) {
         long long dev = -1;
         unsigned long long bytes = 0;
         std::string why, what;
@@ -4556,8 +4571,6 @@ struct Serve {
             why = "a loan is memory of the engine's own process";
         } else if (enc_at != nullptr) {
             why = "a loan is out already";
-        } else if (E.n_sess > 1) {
-            why = "the engine's batch slots run requests at once";
         } else {
             Engine* S = nullptr;
             for (Engine* e = &E; e != nullptr && S == nullptr; e = e->nxt)
@@ -4598,12 +4611,66 @@ struct Serve {
         else
             serve_print("ERR no loan: %s\n", why.c_str());
     }
+    void loan_line(const std::string& line) {   // LEND <device> <bytes>, or UNLEND
+        if (line == "UNLEND") {
+            enc_back();
+            serve_print("UNLENT\n");
+        } else {
+            lend(line);
+        }
+    }
+    /// The encoder's lines that are next among the queued ones (a slot's BSTOP / BYIELD apart), answered now: called
+    /// between a request's decode steps, where no prompt is being read.
+    void poll_loan() {
+        for (;;) {
+            std::string l;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                auto it = lines.begin();
+                while (it != lines.end() && (it->rfind("BSTOP ", 0) == 0 || it->rfind("BYIELD", 0) == 0)) ++it;
+                if (it == lines.end() || !(*it == "UNLEND" || it->rfind("LEND ", 0) == 0)) return;
+                l = std::move(*it);
+                lines.erase(it);
+            }
+            loan_line(l);
+        }
+    }
+    /// A request's line with a loan out: the loan comes back first (its UNLEND is a picture's encoding away), the
+    /// slots decoding meanwhile.  One that does not come in kLoanWaitMs is taken back.
+    void await_unlend() {
+        if (enc_at == nullptr) return;
+        const auto t0 = Clock::now();
+        bool taken = false;
+        while (enc_at != nullptr) {
+            bool got = false, give_up = false;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                const auto it = std::find(lines.begin(), lines.end(), std::string("UNLEND"));
+                if (it != lines.end()) {
+                    lines.erase(it);
+                    got = true;
+                } else if (eof || ms_since(t0) > kLoanWaitMs) {
+                    give_up = true;
+                } else if (n_active == 0) {
+                    cv.wait_for(lk, std::chrono::milliseconds(20));
+                }
+            }
+            if (got) {
+                loan_line("UNLEND");
+            } else if (give_up) {
+                enc_back();
+                taken = true;
+            } else if (n_active > 0) {
+                window();
+            }
+        }
+        std::fprintf(stderr, "lamina serve: a request waited %.0f ms for the image encoder's loan%s\n", ms_since(t0),
+                     taken ? ", which did not come back: taken back" : "");
+    }
 
     void request(const std::string& line) {
-        if (enc_at != nullptr) {   // a request while a loan is out: it comes back first
-            std::fprintf(stderr, "lamina serve: a request came while the image encoder's loan was out: taken back\n");
-            enc_back();
-        }
+        stop.store(false);   // a STOP that came between requests is stale; one from here on is this request's
+        await_unlend();      // (a loan that is out: the prompt is read once the staging buffers are back)
         const bool adm = line[0] == 'B';
         const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
         if (!adm && !geni && line.rfind("GEN ", 0) != 0) {
@@ -4703,7 +4770,6 @@ struct Serve {
             const std::string ve = build_images(emb, ids, E.m->g.n_embd, img_keys, ir);
             if (!ve.empty()) { serve_print("ERR %s\n", ve.c_str()); return; }
         }
-        stop.store(false);
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
         const int s = adm ? slot : pick_session(ids, ir.imgs, lsc);
         if (s < 0) {   // every session decodes in a slot: a request alone has none to run in
@@ -4822,6 +4888,7 @@ struct Serve {
             return;
         }
         for (;;) {
+            poll_loan();   // (the encoder's loan beside this request's decoding: its prompt is read)
             if (smp.needs_logits()) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
@@ -4890,6 +4957,7 @@ struct Serve {
         }
         serve_print("READY %d stop\n", E.ctx);
         const lamina::program::ServeIo& io = lamina::program::serve_io();
+        in_process = io.in_process;
         std::thread reader([&] {
             std::string l;
             while (io.read_line(l)) {
@@ -4927,11 +4995,8 @@ struct Serve {
                 // (a read that has ended)
             } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
                 request(line);
-            } else if (line.rfind("LEND ", 0) == 0) {
-                lend(line, io.in_process);
-            } else if (line == "UNLEND") {
-                enc_back();
-                serve_print("UNLENT\n");
+            } else if (line.rfind("LEND ", 0) == 0 || line == "UNLEND") {
+                loan_line(line);
             } else if (line == "QUIT") {   // as the input's end: the running requests finish (STOP ends them first)
                 std::lock_guard<std::mutex> lk(mu);
                 eof = true;

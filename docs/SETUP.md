@@ -104,8 +104,9 @@ The server builds a config for the file and says in its window what it took:
   prompt's buffers take them (their experts are copied back after, ~0.1 s); Hy4-flash a part of its main GPU's expert
   slots; Qwen3.6-35B-A3B and Qwen3.8-27B the buffers a prompt's experts are streamed through where the experts do not
   all fit the GPUs, else VRAM they leave free (a layer split keeps the encoder's ~1 GB free on the main GPU). A picture
-  whose loan finds no memory is encoded on the CPU, on its logical cores (the log says so once). The engine does not
-  lend with batch slots (`--parallel`) or to a server with replicas: the CPU encodes there, as the window says,
+  whose loan finds no memory is encoded on the CPU, on its logical cores (the log says so once). With batch slots
+  (`--parallel`) the engine lends beside the requests that are generating, and after a prompt one of them is still
+  reading. The engine does not lend to a server with replicas: the CPU encodes there, as the window says,
   unless `--vision-cuda-device` names a card for the encoder to keep its VRAM on. `--no-vision-lend`: the encoder keeps its VRAM (the
   projector's size and 0.1-0.3 GB of buffers: 0.7 GB with Lamina's Q8_0 projector, 1.0 GB with an F16 one, 1.2 GB
   with Hy4-flash's) and encodes such a picture in 0.2 s, on a card besides the main one: the one with the least VRAM
