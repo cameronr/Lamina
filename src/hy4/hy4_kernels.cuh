@@ -647,6 +647,17 @@ __global__ void __launch_bounds__(256) k_rms_post(const float* y, const float* a
     }
 }
 
+/// A card kept running for `ns` (one block of one warp, spinning on the global timer): its driver sees it busy and
+/// brings its clocks up
+__global__ void k_keep(unsigned long long ns) {
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        __nanosleep(200);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < ns);
+}
+
 /// A slot table's entries written by a kernel, the values in its parameters: no copy engine, which the slots' copies
 /// from the arena keep busy (a small copy behind them waits for them)
 struct SlotTable {
@@ -1366,6 +1377,23 @@ __global__ void k_dfly_cells(const int32_t* picks, const int32_t* n_picks, int a
     for (int i = threadIdx.x; i < n; i += blockDim.x) row[i] = picks[i];
     for (int i = threadIdx.x; i <= r; i += blockDim.x) row[n + i] = anchor + i;
     if (threadIdx.x == 0) n_out[r] = n + r + 1;
+}
+/// k_dfly_cells with the window's values on the device: prm[0] the trunk's source row of its picks (DFly layer i's
+/// slot of snap_cells / snap_n, kmax rows a slot), prm[1] the anchor
+__global__ void k_dfly_cells_d(const int32_t* snap_cells, const int32_t* snap_n, const int32_t* prm, int i, int kmax,
+                               int top_k, int32_t* cells, int32_t* n_out, int ld) {
+    const int src = prm[0], anchor = prm[1], r = blockIdx.x;
+    const int32_t* picks = snap_cells + ((size_t) i * kmax + src) * top_k;
+    const int n = snap_n[(size_t) i * kmax + src];
+    int32_t* row = cells + (size_t) r * ld;
+    for (int k = threadIdx.x; k < n; k += blockDim.x) row[k] = picks[k];
+    for (int k = threadIdx.x; k <= r; k += blockDim.x) row[n + k] = anchor + k;
+    if (threadIdx.x == 0) n_out[r] = n + r + 1;
+}
+/// The ring's row prm[2] (n floats) into dst
+__global__ void k_ring_row(const float* ring, const int32_t* prm, float* dst, int n) {
+    const float* s = ring + (size_t) prm[2] * n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = s[i];
 }
 /// x += g * f over n values (DFly's fusion gate)
 __global__ void k_gated_add(float* x, const float* g, const float* f, int n) {

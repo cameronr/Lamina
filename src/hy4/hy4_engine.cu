@@ -1345,6 +1345,9 @@ struct Engine {
             dfly_catq = dalloc<uint8_t>(2 * N / 32 * q81);
             dfly_d = dalloc<float>(N);
             dfly_lg = dalloc<float>((size_t) g.n_vocab);
+            dfly_prm_d = dalloc<int32_t>(4);
+            h_dfly_prm = halloc<int32_t>(4);
+            dfly_ring = dalloc<float>(N);
             for (size_t i = 0; i < nl; ++i) {   // the K/V of its trunk layer; its cells from the block's pass
                 Layer& d = m->dfly.layers[i];
                 d.kv = m->layers[(size_t) m->dfly.target[i]].kv;
@@ -2545,37 +2548,35 @@ struct Engine {
     /// state); then draft k from row k + 1's state corrected with the embedding of draft k - 1 (the bonus token's for
     /// the first), through the trunk's head.  None when the last pass did not end at anchor - 1 (a restored state),
     /// fewer than n past --spec-min-p.
-    std::vector<int32_t> dfly_draft(int32_t bonus, int64_t anchor, int n) {
+    // the block pass's window values on the device ([0] the source row, [1] the anchor, [2] the ring's row), the
+    // trunk's state row copied out of the ring, the pass's graphs by block size (LAMINA_HY4_DFLY_GRAPH=0: none)
+    int32_t *dfly_prm_d = nullptr, *h_dfly_prm = nullptr;
+    float* dfly_ring = nullptr;
+    std::map<int, cudaGraphExec_t> dfly_graphs;
+    bool dfly_graph_on = [] {
+        const char* v = std::getenv("LAMINA_HY4_DFLY_GRAPH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    /// The block's W rows through DFly's layers into dfly_out: the cells, the embeddings fused with the trunk's state
+    /// (row 0), the layers, the final norm; the window's values from dfly_prm_d.  `dump`: the embeddings to the host
+    /// (not under capture)
+    void dfly_block(int W, bool dump) {
         const auto& g = m->g;
         const auto& d = m->dfly;
         const int N = (int) g.n_embd;
-        std::vector<int32_t> out;
-        n = std::min(n, d.width - 1);
-        const int W = n + 1;   // the block's rows needed (causal: row k + 1 sees rows 0 .. k + 1 alone)
-        const int64_t src = anchor - 1 - snap_base;
-        if (n < 1 || snap_base < 0 || src < 0 || src >= snap_rows || anchor + W > ctx) return out;
-        ensure(anchor + W);
-        for (int t = 0; t < W; ++t) {
-            h_tok[t] = t == 0 ? bonus : d.mask;
-            h_pos[t] = (int32_t) (anchor + t);
-        }
-        CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) W * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) W * 4, cudaMemcpyHostToDevice, st));
         for (size_t i = 0; i < d.layers.size(); ++i)
-            hy4k::k_dfly_cells<<<W, 256, 0, st>>>(snap_cells + (i * kMaxT + (size_t) src) * g.idx_top_k,
-                                                  snap_n + i * kMaxT + src, (int) anchor,
-                                                  dfly_cells + i * d.width * (size_t) dfly_ld, dfly_n + i * d.width,
-                                                  dfly_ld);
+            hy4k::k_dfly_cells_d<<<W, 256, 0, st>>>(snap_cells, snap_n, dfly_prm_d, (int) i, kMaxT, (int) g.idx_top_k,
+                                                    dfly_cells + i * d.width * (size_t) dfly_ld, dfly_n + i * d.width,
+                                                    dfly_ld);
         // the block's rows; row 0 += gate * eh_proj([enorm(row 0) | hnorm(the trunk's state of anchor - 1)])
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, W, N, dfly_h, st);
-        const bool dump = dfly_dump_path != nullptr;
         if (dump) {
             dfly_dump_emb.resize((size_t) W * N);
             CK(cudaMemcpyAsync(dfly_dump_emb.data(), dfly_h, dfly_dump_emb.size() * 4, cudaMemcpyDeviceToHost, st));
         }
         hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(dfly_h, N, d.enorm, dfly_cat, 2 * N, N, g.eps);
-        hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(hring + (size_t) ((anchor - 1) % kHRing) * N, N, d.hnorm,
-                                                  dfly_cat + N, 2 * N, N, g.eps);
+        hy4k::k_ring_row<<<(N + 255) / 256, 256, 0, st>>>(hring, dfly_prm_d, dfly_ring, N);
+        hy4k::k_rms<<<1, hy4k::kThreads, 0, st>>>(dfly_ring, N, d.hnorm, dfly_cat + N, 2 * N, N, g.eps);
         quant(dfly_cat, 1, 2 * N, dfly_catq);
         mmvq(d.eh_proj, dfly_catq, dfly_d, 1);
         hy4k::k_gated_add<<<blocks(N), hy4k::kThreads, 0, st>>>(dfly_h, d.fgate, dfly_d, N);
@@ -2599,6 +2600,46 @@ struct Engine {
         }
         hy4k::k_add<<<blocks(WN), hy4k::kThreads, 0, st>>>(dfly_h, dfly_res, WN);
         hy4k::k_rms<<<W, hy4k::kThreads, 0, st>>>(dfly_h, N, d.norm, dfly_out, N, N, g.eps);
+    }
+
+    std::vector<int32_t> dfly_draft(int32_t bonus, int64_t anchor, int n) {
+        const auto& g = m->g;
+        const auto& d = m->dfly;
+        const int N = (int) g.n_embd;
+        std::vector<int32_t> out;
+        n = std::min(n, d.width - 1);
+        const int W = n + 1;   // the block's rows needed (causal: row k + 1 sees rows 0 .. k + 1 alone)
+        const int64_t src = anchor - 1 - snap_base;
+        if (n < 1 || snap_base < 0 || src < 0 || src >= snap_rows || anchor + W > ctx) return out;
+        ensure(anchor + W);
+        for (int t = 0; t < W; ++t) {
+            h_tok[t] = t == 0 ? bonus : d.mask;
+            h_pos[t] = (int32_t) (anchor + t);
+        }
+        CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) W * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) W * 4, cudaMemcpyHostToDevice, st));
+        h_dfly_prm[0] = (int32_t) src;
+        h_dfly_prm[1] = (int32_t) anchor;
+        h_dfly_prm[2] = (int32_t) ((anchor - 1) % kHRing);
+        CK(cudaMemcpyAsync(dfly_prm_d, h_dfly_prm, 3 * 4, cudaMemcpyHostToDevice, st));
+        const bool dump = dfly_dump_path != nullptr;
+        if (use_graphs && dfly_graph_on && !dump && trace < 3) {   // the block pass's graph for W rows
+            auto it = dfly_graphs.find(W);
+            if (it == dfly_graphs.end()) {
+                CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                dfly_block(W, false);
+                cudaGraph_t gr = nullptr;
+                CK(cudaStreamEndCapture(st, &gr));
+                cudaGraphExec_t ex = nullptr;
+                CK(cudaGraphInstantiate(&ex, gr, 0));
+                cudaGraphDestroy(gr);
+                own(&Owned::graphs, ex);
+                it = dfly_graphs.emplace(W, ex).first;
+            }
+            CK(cudaGraphLaunch(it->second, st));
+        } else {
+            dfly_block(W, dump);
+        }
         // the drafts: row k + 1's state + down(silu(gate) * up([hidden_norm(it) | embed_norm(the last token)]))
         double joint = 1.0;
         for (int k = 0; k < n; ++k) {
@@ -3456,6 +3497,34 @@ struct Engine {
         }
     }
 
+    // --warm-ms: a request after a pause keeps every GPU running that long from its start (warm_up), on a stream a GPU
+    int warm_ms = 500;
+    std::vector<cudaStream_t> warm_st;
+    Clock::time_point last_end{};
+    bool served = false;
+    int64_t warmed = 0;
+    /// The warm-up's streams (the lowest priority, a GPU), made at the start: a request does not pay for them
+    void warm_streams() {
+        if (warm_ms <= 0) return;
+        warm_st.assign(gpus.size(), nullptr);
+        for (size_t gi = 0; gi < gpus.size(); ++gi) {
+            lamina::core::DeviceScope ds(gpus[gi].dev, main_dev, gi > 0);
+            int lo = 0, hi = 0;
+            CK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+            CK(cudaStreamCreateWithPriority(&warm_st[gi], cudaStreamNonBlocking, lo));
+            own(&Owned::streams, warm_st[gi]);
+            hy4k::k_keep<<<1, 32, 0, warm_st[gi]>>>(1000ull);   // its first launch's setup now too
+        }
+    }
+    void warm_up() {
+        if (warm_ms <= 0 || warm_st.size() < gpus.size()) return;
+        if (served && ms_since(last_end) < 1000.0) return;   // back to back: at speed already
+        for (size_t gi = 0; gi < gpus.size(); ++gi) {
+            lamina::core::DeviceScope ds(gpus[gi].dev, main_dev, gi > 0);
+            hy4k::k_keep<<<1, 32, 0, warm_st[gi]>>>((unsigned long long) warm_ms * 1000000ull);
+        }
+        ++warmed;
+    }
     /// row r's logits on the host
     void host_logits(int r, std::vector<float>& out) {
         const auto& g = m->g;
@@ -4648,6 +4717,14 @@ struct Serve {
 
     void request(const std::string& line) {
         const auto& g = E.m->g;
+        E.warm_up();   // a request after a pause: the cards brought up beside its first work
+        struct Ended {   // the request's end, for the next one's pause
+            Engine& e;
+            ~Ended() {
+                e.last_end = Clock::now();
+                e.served = true;
+            }
+        } ended{E};
         const bool geni = line.rfind("GENI ", 0) == 0;
         const char* p = line.c_str() + (geni ? 5 : 4);
         char* e = nullptr;
@@ -4906,6 +4983,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     int drafts = 0;
     float spec_min_p = 0.f;
     int lookup = 16;
+    int warm_ms = 500;
     std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4954,6 +5032,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--drafts-per-step") drafts = std::max(0, std::min(kMaxT - 1, std::atoi(next())));
         else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next());
         else if (a == "--spec-lookup") lookup = std::max(0, std::atoi(next()));   // prompt lookup's match (0: none)
+        else if (a == "--warm-ms") warm_ms = std::max(0, std::atoi(next()));   // a request after a pause: the cards kept running
         else if (a == "--kv-grow") kv_grow = true;
         else if (a == "--vision") vision = true;    // pictures: GENI requests, --emb (the rows lamina-vision's)
         else if (a == "--emb") emb_file = next();   // generate mode: --tokens' pictures, a lamina-vision file
@@ -4994,6 +5073,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.drafts_on = (m.has_mtp || m.dfly.on) && drafts > 0;
     E.spec_min_p = spec_min_p;
     E.lookup_min = lookup;
+    E.warm_ms = warm_ms;
     if (lookup > 0)
         E.sfx = std::make_unique<lamina::spec::SuffixDrafter>(lookup, 32, (size_t) std::max<int64_t>(4096, max_ctx));
     E.vision = vision || !emb_file.empty();
@@ -5019,6 +5099,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         E.chunk_min = std::max(1, prefill_min);
     }
     E.place_slots(expert_vram, tier_devs);
+    E.warm_streams();
     if (arena_place) {
         const char* dry = std::getenv("LAMINA_ARENA_PLACE_DRY");
         E.place_arena(dry != nullptr && std::atoi(dry) != 0);
