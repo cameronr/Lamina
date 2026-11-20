@@ -1591,13 +1591,17 @@ struct Engine {
     int64_t chunk_cap = 0, chunk_min = 0;
     /// n tokens into the state; `on(done)` after each piece (false: stop there).  Returns the logits row of the last
     /// token (host_logits), -1 when stopped first.
+    int64_t chunk_snap = -1;   // a multiple of kSnapEvery inside the next chunk: its snapshot taken there (Prompt::run)
     int feed(const int32_t* toks, int64_t n, const std::function<bool(int64_t)>& on) {
         int64_t done = 0;
         int last = 0;
         while (done < n) {
-            // a segment up to the next multiple of kSnapEvery (a snapshot there) or the end, in even pieces
-            const int64_t p = pos(), seg = std::min<int64_t>(n - done, (p / kSnapEvery + 1) * kSnapEvery - p);
-            const bool chunks = chunk_fn && seg >= chunk_min;
+            // the prompt path: the rest in pieces as even as chunk_cap allows, a piece that crosses a multiple of
+            // kSnapEvery taking its snapshot there; the decode's forwards: a segment up to the next multiple (a snapshot
+            // there) or the end
+            const int64_t p = pos();
+            const bool chunks = chunk_fn && n - done >= chunk_min;
+            const int64_t seg = chunks ? n - done : std::min<int64_t>(n - done, (p / kSnapEvery + 1) * kSnapEvery - p);
             const int64_t step = chunks ? chunk_cap : kMaxT, pieces = (seg + step - 1) / step,
                           size = (seg + pieces - 1) / pieces;
             for (int64_t sd = 0; sd < seg;) {
@@ -1608,7 +1612,15 @@ struct Engine {
                     pump();
                 }
                 if (chunks) {
+                    const int64_t p0 = pos(), mark = (p0 / kSnapEvery + 1) * kSnapEvery;
+                    chunk_snap = mark < p0 + T ? mark : -1;
                     chunk_fn(toks + done + sd, T);
+                    chunk_snap = -1;
+                    if (pos() % kSnapEvery == 0 && done + sd + T < n) {   // the piece ends at a multiple
+                        std::vector<float> lg;
+                        host_logits(0, lg);
+                        snapshot(lg, true);
+                    }
                 } else {
                     const int64_t p0 = pos();
                     forward(toks + done + sd, T);
@@ -1619,13 +1631,22 @@ struct Engine {
                 if (on && !on(done + sd) && done + sd < n) return -1;
             }
             done += seg;
-            if (pos() % kSnapEvery == 0 && done < n) {
+            if (!chunks && pos() % kSnapEvery == 0 && done < n) {
                 std::vector<float> lg;
                 host_logits(last, lg);
                 snapshot(lg, true);
             }
         }
         return last;
+    }
+    /// A snapshot taken inside a chunk at `p` (Prompt::run): its bytes as snapshot() lays them out, no logits
+    void add_snapshot(int64_t p, std::vector<uint8_t>&& bytes) {
+        if (snap_at(p) != nullptr) return;
+        Snap sn;
+        sn.pos = p;
+        sn.mark = true;
+        sn.bytes = std::move(bytes);
+        snaps.push_back(std::move(sn));
     }
 
 
@@ -3177,6 +3198,12 @@ struct Prompt {
     uint8_t *tq_h = nullptr, *h_raw = nullptr;
     uint32_t* h_rows = nullptr;
     std::vector<MoeDev> devs;   // [0] the main GPU, then the tiers in Engine::gpus' order
+    // a snapshot inside a chunk (Engine::chunk_snap): its bytes on the main GPU as snapshot() lays them out, each window
+    // layer's ring at ring_off[il], each indexer layer's tail at tail_off[il] (of the cache layers, the MTP block's at
+    // [n_layers]), the drafters' ring at hring_off
+    uint8_t* snap_dev = nullptr;
+    std::vector<size_t> ring_off, tail_off;
+    size_t hring_off = 0, snap_size = 0;
     size_t stage_bytes = 0;
     bool ok = false;
     double ms_moe = 0, ms_copy = 0;
@@ -3306,6 +3333,30 @@ struct Prompt {
         h_raw = halloc<uint8_t>(n_mod * T * eh * ed);
         tq_h = halloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
         for (const Layer& l : m->layers) stage_bytes = std::max(stage_bytes, l.stride);
+        {
+            ring_off.assign((size_t) g.n_layers + 1, 0);
+            tail_off.assign((size_t) g.n_layers + 1, 0);
+            size_t at = 0;
+            for (const Layer& l : E.cl) {
+                const size_t li = l.mtp ? (size_t) g.n_layers : (size_t) l.il;
+                if (l.swa) {
+                    ring_off[li] = at;
+                    at += (size_t) l.kv_cells * l.kv_row();
+                }
+                if (l.has_idx) {
+                    tail_off[li] = at;
+                    at += (size_t) kTail * 2 * (size_t) g.idx_dim * 4;
+                }
+            }
+            hring_off = at;
+            if (E.hring) at += (size_t) Engine::kHRing * (size_t) g.n_embd * 4;
+            snap_size = at;
+            if (snap_size != E.snap_bytes()) {
+                std::fprintf(stderr, "lamina: the snapshot's layout differs from the engine's\n");
+                return false;
+            }
+            snap_dev = dalloc<uint8_t>(snap_size);
+        }
         // the GPUs' shares: the main GPU, then the tiers
         std::vector<int> all{main_dev};
         all.insert(all.end(), tier_devs.begin(), tier_devs.end());
@@ -3460,6 +3511,21 @@ struct Prompt {
                 E.snap_rows = 1;
             }
         }
+        if (const int64_t S = E.chunk_snap; S > p0 && S < p0 + T) {   // the snapshot inside the chunk
+            for (const Layer& l : E.cl) {   // tails as they are (a snapshot at a multiple of the pool reads none)
+                if (!l.has_idx) continue;
+                const size_t li = l.mtp ? (size_t) g.n_layers : (size_t) l.il;
+                CK(cudaMemcpyAsync(snap_dev + tail_off[li], l.tail, (size_t) kTail * 2 * (size_t) g.idx_dim * 4,
+                                   cudaMemcpyDeviceToDevice, st));
+            }
+            if (E.hring)   // the drafters re-anchor after a restore (DFly) or catch up from it (the MTP block)
+                CK(cudaMemcpyAsync(snap_dev + hring_off, E.hring, (size_t) Engine::kHRing * N * 4, cudaMemcpyDeviceToDevice,
+                                   st));
+            std::vector<uint8_t> bytes(snap_size);
+            CK(cudaMemcpyAsync(bytes.data(), snap_dev, snap_size, cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            E.add_snapshot(S, std::move(bytes));
+        }
         ++E.forwards;
         if (trace) {
             mark(5);
@@ -3535,6 +3601,14 @@ struct Prompt {
             __half* rh = reinterpret_cast<__half*>(l.kv);   // a ring's rows are halves
             if (p0 > lin0) hy4p::k_copy_cells<<<(unsigned) (p0 - lin0), 64, 0, st>>>(rh, ring, lin, 0, lin0, lin0);
             hy4k::k_kv_store<false><<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, lin, pos_d, 0, lin0, l.theta, g.eps);
+            if (const int64_t S = E.chunk_snap; S > p0 && S < p_end && !l.mtp) {   // the ring as of position S
+                __half* dst = reinterpret_cast<__half*>(snap_dev + ring_off[(size_t) l.il]);
+                const int64_t a = std::max<int64_t>(0, S - ring);
+                if (a < lin0)   // the oldest from the ring (still the chunk's predecessor's)
+                    hy4p::k_copy_cells<<<(unsigned) (lin0 - a), 64, 0, st>>>(rh, ring, dst, ring, (int) a, 0);
+                const int64_t b = std::max<int64_t>(a, lin0);
+                hy4p::k_copy_cells<<<(unsigned) (S - b), 64, 0, st>>>(lin, 0, dst, ring, (int) b, lin0);
+            }
             const int64_t pa = std::max<int64_t>(p0, p_end - ring);
             hy4p::k_copy_cells<<<(unsigned) (p_end - pa), 64, 0, st>>>(lin, 0, rh, ring, (int) pa, lin0);
         } else {
