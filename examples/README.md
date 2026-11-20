@@ -19,7 +19,10 @@ which takes the model file, the GPU, the draft layer, the projector and the file
 `lamina-server -m MODEL.gguf --write-config FILE` writes one with the PC's own files and GPUs. `run-<model>.bat.example`
 is a launcher for each: copied to `run-<model>.bat`, it starts the example from the clone's folder, the model's files
 where its paths say (`../Lamina-data`). Each names its model (`"model"`), its GPUs (`"gpu"`: the main one, then
-`auto`) and in `"args"` the engine's options that differ from its defaults. Their engine options:
+`auto`) and in `"args"` the engine's options that differ from its defaults. Their `"vision"` section has the image
+encoder on the engine's main GPU, in VRAM it borrows from the engine for each new picture (`"gpu": true, "lend":
+true`, no card named: [SETUP.md](../docs/SETUP.md#a-model-file)); the development PC's configs keep it on a card with
+VRAM to spare instead. Their engine options:
 [SETUP.md](../docs/SETUP.md#engine-options); the GPUs' cards: [SETUP.md](../docs/SETUP.md#the-gpus); the server's keys:
 [USING.md](../docs/USING.md#the-config).
 

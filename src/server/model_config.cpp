@@ -316,10 +316,13 @@ ModelConfig config_from_model(const ModelOptions& o, const std::vector<GpuInfo>&
         } else if (k == "vision") {
             if (mmproj.empty()) continue;
             json v = json::object();
+            // the preset's encoder ("gpu", "lend": on the engine's main GPU, its VRAM borrowed from the engine for
+            // each new picture) on this PC's cards (no "cuda_device"), its CPU threads this PC's for the pictures
+            // that find no VRAM there
             for (auto vt = it->begin(); vt != it->end(); ++vt) {
                 const std::string& vk = vt.key();
                 if (vk == "exe" || vk == "cuda_device") continue;
-                v[vk] = vk == "mmproj" ? json(mmproj) : vk == "model" ? json(m.path) : vk == "gpu" ? json(false)
+                v[vk] = vk == "mmproj" ? json(mmproj) : vk == "model" ? json(m.path)
                       : vk == "threads" ? json((int) std::max(1u, std::thread::hardware_concurrency())) : *vt;
             }
             for (const char* need : {"mmproj", "model"})
@@ -465,7 +468,9 @@ bool check_report(const json* cfg, const std::vector<GpuInfo>& gpus, const std::
                     stops.push_back(std::string("the config has a \"vision\" section, and ") + vision_not_built());
                 say("  pictures: " + mmproj + ", encoded " +
                     (truthy(jget(v, "gpu")) ? "on " + (jget(v, "cuda_device").is_null() ? std::string("a GPU")
-                                                                                         : str_of(v["cuda_device"]))
+                                                                                         : str_of(v["cuda_device"])) +
+                                                  (truthy(jget(v, "lend")) ? ", in VRAM borrowed from the engine for each "
+                                                                             "new picture where it can lend" : "")
                                             : "on the CPU (" + (jget(v, "threads").is_null() ? std::string("its default")
                                                                                               : str_of(v["threads"])) +
                                                   " threads)"));

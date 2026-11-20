@@ -20,7 +20,8 @@
   "log": "./lamina-hy4-flash-q4_k_m.log",
   "vision": {
     "mmproj": "../Lamina-data/models/hy4-flash-Q4_K_M/mmproj-Hy4-flash-bf16.gguf",
-    "gpu": false,
+    "gpu": true,
+    "lend": true,
     "threads": 16
   },
   "lib_dirs": [],

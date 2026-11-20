@@ -251,6 +251,22 @@ void gpu_reset_unused(int device) {
     (void) cudaGetLastError();
 }
 
+namespace {
+std::vector<uint64_t> g_loan;   // a device's asked loan, by its ordinal (g_keep_mu)
+}  // namespace
+
+void gpu_loan_ask(int device, uint64_t bytes) {
+    if (device < 0) return;
+    const std::lock_guard<std::mutex> lk(g_keep_mu);
+    if (g_loan.size() <= (size_t) device) g_loan.resize((size_t) device + 1, 0);
+    g_loan[(size_t) device] = bytes;
+}
+
+uint64_t gpu_loan_asked(int device) {
+    const std::lock_guard<std::mutex> lk(g_keep_mu);
+    return device >= 0 && (size_t) device < g_loan.size() ? g_loan[(size_t) device] : 0;
+}
+
 std::vector<GpuProbe> probe_gpus(const std::vector<int>& devices, int main_device) {
     struct Dev {
         void* buf = nullptr;

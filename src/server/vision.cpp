@@ -473,6 +473,8 @@ void Vision::start() {
         if (plan->need == 0) throw std::runtime_error("the vision encoder did not start: " + p.mmproj + " (" + err + ")");
         std::fprintf(stderr, "lamina: the image encoder %s borrows %llu MiB of VRAM for a picture: %s\n", plan->where.c_str(),
                      (unsigned long long) (plan->need >> 20), p.mmproj.c_str());
+        // said before the engine loads: one without a cache to lend from then sizes itself so that it has the bytes
+        core::gpu_loan_ask(p.device, plan->need);
         const std::lock_guard<std::mutex> lk(mu_);
         plan_ = std::move(plan);
         lend_ = true;
@@ -529,7 +531,7 @@ void* Vision::encoder_now(std::string& err) {
     if (ask) {
         if (void* at = lender_(p.device, plan_->need, why)) {
             lease->unlend = unlender_;
-            lease->where = "the engine's cache (" + why + ")";
+            lease->where = why;   // what the engine lent
             p.gpu_arena = at;
             p.gpu_arena_bytes = plan_->need;
             lease->encoder = vision::open_encoder(p, err);
@@ -630,6 +632,9 @@ void Vision::close() {
     alive_ = false;
     loaded_.reset();
     cpu_.reset();
+#if LAMINA_VISION
+    if (lend_ && plan_ != nullptr) core::gpu_loan_ask(plan_->params.device, 0);   // (the next start says it again)
+#endif
 }
 
 std::string Vision::load(const std::string& source) {

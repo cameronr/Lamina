@@ -256,17 +256,17 @@ With pictures on (an image projector beside the model, or a config's `vision` se
 Anthropic `image` blocks (base64 data, http(s) URLs or local file paths) go through the server's image encoder and
 reach the model as up to 1,024 tokens each
 (the `vision` section's `max_tokens`; a 640x480 photo is ~300). JPEG, PNG, BMP and GIF are read as they are; WebP, TIFF,
-AVIF and others are converted to PNG first. The encoder runs on the CPU (the `vision` section's `threads`), so the GPUs
-keep their VRAM for experts: on the development PC's 8-core Ryzen 7 9700X a picture of ~1,000 tokens takes ~9 s, once
-per picture (a picture sent again, as chat apps do every turn, is not encoded again). With `--vision-gpu` it runs on a
-GPU instead (the section's `gpu` and `cuda_device`; [SETUP.md](SETUP.md#a-model-file) says which card): on the
-development PC, on the RTX 3090 of its last expert tier, the first question about a picture of ~1,000 tokens takes
-0.9-1.1 s instead of 8.4-8.9 s with the encoder on the CPU (the picture's encoding 0.2 s instead of 7.5 s). There it
-keeps the projector's weights and its buffers in VRAM (0.7-1.2 GB); with `--vision-lend` (the section's `lend`) it
-keeps none and borrows the engine's expert cache on its card for each new picture, 0.4-0.6 s a picture of ~1,000
-tokens in all: with the engine and the encoder on one RTX 3090 a new picture's first question takes 4.4-4.5 s where
-the CPU encoder's takes 11.7-12.2 s, and the cache keeps the 0.7 GB a resident encoder takes of it
-([SETUP.md](SETUP.md#a-model-file)). `--offline` refuses URLs.
+AVIF and others are converted to PNG first. A picture is encoded once (one sent again, as chat apps do every turn, is
+not encoded again), by default on the engine's main GPU in VRAM the encoder borrows from the engine for it (the
+`vision` section's `gpu` and `lend`, which `-m`'s presets set: [SETUP.md](SETUP.md#a-model-file) says what each engine
+lends), so the GPUs keep their VRAM for the model: 0.3-0.6 s a picture of ~1,000 tokens. On the development PC the
+first question about such a picture takes 1.3 s with Qwen3.8-Flash-Next's IQ3_S (1.6 s with UD-Q4_K_XL) where the
+CPU's encoder (`--no-vision-gpu`; the section's `threads`) takes 8.3-8.5 s on its 8-core Ryzen 7 9700X; with the engine and the
+encoder on one RTX 3090, 4.4-4.5 s against 11.7-12.2 s (Qwen3.6-35B-A3B there: 2.2-2.3 s against 9.6-9.9 s, with the
+same experts in VRAM and the same text speed as without pictures). An encoder that keeps its weights in VRAM
+(`--no-vision-lend`; 0.7-1.2 GB of the card `cuda_device` names) encodes such a picture in 0.2 s: for a card with
+VRAM to spare, as the development PC's last expert tier, where the first question takes 0.9-1.1 s. `--offline`
+refuses URLs.
 Qwen3.6-35B-A3B and Qwen3.8-27B read pictures with their repositories' own projectors.
 
 ## Image generation

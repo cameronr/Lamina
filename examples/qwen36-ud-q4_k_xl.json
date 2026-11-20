@@ -22,7 +22,8 @@
   "lib_dirs": [],
   "vision": {
     "mmproj": "../Lamina-data/models/qwen36-UD-Q4_K_XL/mmproj-F16.gguf",
-    "gpu": false,
+    "gpu": true,
+    "lend": true,
     "threads": 16,
     "max_tokens": 1024
   }

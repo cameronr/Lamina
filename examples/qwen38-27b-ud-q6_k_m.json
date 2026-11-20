@@ -26,7 +26,8 @@
   "lib_dirs": [],
   "vision": {
     "mmproj": "../Lamina-data/models/qwen38-27b-UD-Q6_K_M/mmproj-F16.gguf",
-    "gpu": false,
+    "gpu": true,
+    "lend": true,
     "threads": 16,
     "max_tokens": 1024
   }

@@ -27,11 +27,14 @@ const std::vector<Param> kParams = {
     {"--no-mmproj", "", "vision", K::Off, "", "no pictures"},
     {"--vision-model", "", "vision.model", K::Path, "GGUF", "taken and not read: the image encoder needs no model file "
      "(earlier versions read its vocabulary)"},
-    {"--vision-gpu", "", "vision.gpu", K::Bool, "", "the image encoder on a GPU, not the CPU"},
+    {"--vision-gpu", "", "vision.gpu", K::Bool, "",
+     "the image encoder on a GPU, not the CPU (with -m: on, with --vision-lend; --no-vision-gpu: the CPU)"},
     {"--vision-cuda-device", "", "vision.cuda_device", K::Str, "UUID", "that GPU (nvidia-smi -L lists the UUIDs)"},
     {"--vision-lend", "", "vision.lend", K::Bool, "",
-     "the image encoder on a GPU holds no VRAM between pictures: for a new picture it borrows the engine's expert "
-     "cache on its card (Qwen3.8-Flash-Next: any card the engine uses; Hy4-flash: the main one), as a prompt does"},
+     "the image encoder on a GPU holds no VRAM between pictures: for a new picture it borrows the engine's on its "
+     "card (Qwen3.8-Flash-Next: a card's expert cache, as a prompt does; Hy4-flash: the main GPU's; Qwen3.6-35B-A3B "
+     "and Qwen3.8-27B: the prompt path's staging buffers, or VRAM the engine leaves free); --no-vision-lend: it "
+     "keeps its VRAM"},
     {"--vision-q8", "", "vision.q8", K::Str, "mmq|fp16",
      "a Q8_0 projector on a GPU: its blocks multiplied as llama.cpp multiplies them (mmq, the default: the inputs "
      "rounded to 8 bits), or its values multiplied as FP16 (fp16: nearer the unquantized projector's rows)"},

@@ -346,6 +346,7 @@ void* LaminaEngine::lend(int device, uint64_t bytes, std::string& why) {
     const std::vector<std::string> f = split_ws(l);
     if (f.size() < 3 || f[0] != "LENT") {
         why = l.empty() ? "the engine did not answer" : std::string(strip(l.substr(std::min<size_t>(l.size(), 3))));
+        if (starts_with(why, "no loan: ")) why.erase(0, 9);   // (the caller says that it is none)
         return nullptr;
     }
     const unsigned long long at = std::strtoull(f[1].c_str(), nullptr, 10), got = std::strtoull(f[2].c_str(), nullptr, 10);
@@ -354,7 +355,10 @@ void* LaminaEngine::lend(int device, uint64_t bytes, std::string& why) {
         why = "the engine lent " + f[2] + " bytes";
         return nullptr;
     }
-    why = f.size() >= 5 ? f[3] + " slots, " + f[4] + " experts out" : "";
+    // what it is: the engine's words after the counts, else its expert cache's slots
+    why.clear();
+    for (size_t i = 5; i < f.size(); ++i) why += (i > 5 ? " " : "") + f[i];
+    if (why.empty()) why = f.size() >= 5 ? "the engine's cache (" + f[3] + " slots, " + f[4] + " experts out)" : "the engine's memory";
     return (void*) (uintptr_t) at;
 }
 

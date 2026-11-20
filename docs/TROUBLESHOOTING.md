@@ -181,11 +181,13 @@ that on a slow PC: raise `engine_silence_s` in the config (default 300).
 beside the model (`--mmproj FILE` names one), `--no-mmproj`, or a config without a `vision` section. The server's
 window said why at the start.
 
-**Pictures take seconds.** The image encoder runs on the CPU: about 9 s for a picture of ~1,000 image tokens on an
-8-core CPU. The config's `vision.max_tokens` caps a picture's tokens (1,024 in the configs). With a GPU that has
-~1 GB to spare, `--vision-gpu` runs the encoder there (about 0.2 s for such a picture on an RTX 3090); with
-`--vision-lend` beside it the encoder borrows that VRAM from the engine's expert cache for each new picture
-(0.4-0.6 s) and no GPU needs room to spare.
+**Pictures take seconds.** A new picture is encoded once, in about half a second on the engine's GPU, which lends
+the encoder the VRAM for it. Seconds a picture (about 9 for ~1,000 image tokens on an 8-core CPU) mean the CPU
+encodes it: a config whose `vision` section has `"gpu": false` or no `gpu` (`--vision-gpu --vision-lend` on the
+command line, or `"gpu": true, "lend": true` there), `--no-vision-gpu`, a server with replicas, or a loan that found
+no memory, which the engine's log says once ("the image encoder ... found no VRAM for a picture (...): the CPU
+encodes", with what the engine answered). The config's `vision.max_tokens` caps a picture's tokens (1,024 in the
+configs).
 
 **Two runs of one greedy request differ.** Where an expert is computed changes its rounding a little, and the GPUs'
 expert caches change as their copies land, so runs can part at a near-tie

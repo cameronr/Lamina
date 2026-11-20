@@ -95,9 +95,10 @@ public:
     virtual void unload() {}
     virtual void load() {}
     virtual void close() {}
-    /// `bytes` of the VRAM the engine's expert cache holds on its CUDA device `device`, lent until unlend(): the
-    /// address, or null with `why` (an engine in another process, batch slots, a model whose engine lends none, a
-    /// cache that cannot spare it).  Between two requests only: the caller holds the service's turn.
+    /// `bytes` of the VRAM the engine holds on its CUDA device `device`, lent until unlend(): the address, with
+    /// what it is in `why` (its expert cache's last slots, its prompt path's staging buffers, VRAM it leaves free),
+    /// or null with why not (an engine in another process, batch slots, a cache or a card that cannot spare it).
+    /// Between two requests only: the caller holds the service's turn.
     virtual void* lend(int device, uint64_t bytes, std::string& why) {
         (void) device, (void) bytes;
         why = "this engine lends no VRAM";

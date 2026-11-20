@@ -164,11 +164,14 @@ The image encoder is the engine's own code, a part of `lamina-server` (`src/visi
 as the model's reference processor does it, one vision transformer for every model's projector, each model's adapter;
 its arithmetic is that of llama.cpp's multimodal library). On the CPU it is a graph on ggml, llama.cpp's tensor
 library, that library's operation for operation; on a GPU the engine's own kernels: cuBLAS products, llama.cpp's
-quantized products for a Q8_0 projector, and an attention kernel on the tensor cores. It runs on the CPU unless a
-config puts it on a GPU: the GPUs keep their VRAM for experts. On a GPU it either keeps its weights there, or
-(`lend`) borrows VRAM for each new picture from the engine, which runs in the same process: between two requests
-the engine hands it its expert cache's last slots on that card (Hy4-flash: chunks of the main GPU's slots), the
-memory a prompt's buffers borrow too, and the experts that were in them are copied back afterwards. The server
+quantized products for a Q8_0 projector, and an attention kernel on the tensor cores. On a GPU it either keeps its
+weights there or, as the presets have it (`lend`), holds nothing between pictures and borrows VRAM for each new one
+from the engine, which runs in the same process, so the GPUs keep their VRAM for the model: between two requests the
+engine hands it memory on that card. Flash-Next lends its expert cache's last slots there, the memory a prompt's
+buffers borrow too, and copies the experts that were in them back afterwards; Hy4-flash lends chunks of its main
+GPU's expert slots; the qwen35 path, which has no such cache, lends the two buffers a long prompt's experts are
+streamed through (it runs so where the experts do not all fit the GPU; the buffers hold nothing between prompts),
+else VRAM it leaves free, which its layer split keeps on the encoder's card. The server
 encodes each picture once and passes its
 embeddings to the engine, which places them in the prompt with their positions in the picture's grid (Hy4-flash's file:
 at consecutive positions, as text, which is how llama.cpp's support for it reads them).

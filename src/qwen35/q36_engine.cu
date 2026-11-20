@@ -173,6 +173,22 @@ constexpr int kThreads = 256;
 constexpr int kChunkCells = 256;   // attention split-K chunk
 constexpr int kConvTile = 16;     // tokens per block of the prompt conv (k_conv_seq tile mode)
 
+// The VRAM a card keeps free once its experts are placed, and a loan.  The server's image encoder, which runs in this
+// process, may hold no VRAM of its own between pictures and borrow for each new one (the serve protocol's LEND); it
+// says so before the engine loads (lamina::core::gpu_loan_ask).  This engine has no cache to lend from.  In the
+// hybrid mode the loan is the prompt path's two staging buffers, idle between prompts (place_experts).  Else it is of
+// the VRAM left free, and where the placement has a choice (a layer split's layers, the prompt chunk's size) the
+// card keeps the loan and kLoanFree (what the encoder takes beside it: cuBLAS's handle, its kernels' images) free
+// past the reserve: the reserve itself is not the loan's, as the engine's later allocations come out of it (the
+// 27B's split: 100 MiB in its first request).
+constexpr size_t kVramReserve = (size_t) 768 << 20;
+constexpr size_t kLoanFree = (size_t) 64 << 20;
+/// What `dev` keeps free for the loan asked of it (0: none asked).
+size_t loan_keep(int dev) {
+    const size_t asked = (size_t) lamina::core::gpu_loan_asked(dev);
+    return asked == 0 ? 0 : asked + kLoanFree;
+}
+
 // ------------------------------------------------------------------------------------------------ small kernels
 __device__ __forceinline__ float silu(float v) { return v / (1.0f + expf(-v)); }
 __device__ __forceinline__ float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
@@ -1259,12 +1275,18 @@ bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& 
     for (size_t l = 0; l < lora.size() && l <= nl + 1; ++l) (l <= nl ? cost[l] : tail) += lora[l];
     tail += cost[nl];
     const uint64_t overhead = ((uint64_t) 3 << 29) + (uint64_t) chunk * buffer_bytes_per_row(m);
-    std::vector<uint64_t> room(devs.size());
+    // a loan asked of a card (kVramReserve): it stays free there past the 1.5 GiB, where the same number of GPUs
+    // still holds the model (room_loan; else the split is the one without the loan)
+    std::vector<uint64_t> room_plain(devs.size()), room_loan(devs.size());
+    bool any_loan = false;
     for (size_t i = 0; i < devs.size(); ++i) {
         size_t fr = 0, tot = 0;
         CK(cudaSetDevice(devs[i]));
         CK(cudaMemGetInfo(&fr, &tot));
-        room[i] = fr > overhead ? fr - overhead : 0;
+        const uint64_t keep = overhead + loan_keep(devs[i]);
+        room_plain[i] = fr > overhead ? fr - overhead : 0;
+        room_loan[i] = fr > keep ? fr - keep : 0;
+        any_loan = any_loan || keep != overhead;
     }
     CK(cudaSetDevice(devs[0]));
     const auto take = [&](size_t n, const std::vector<size_t>& ends) {
@@ -1274,7 +1296,10 @@ bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& 
         for (size_t i = n; i < devs.size(); ++i) lamina::core::gpu_reset_unused(devs[i]);
         CK(cudaSetDevice(devs[0]));
     };
-    for (size_t n = 1; n <= devs.size(); ++n) {
+    for (size_t n = 1; n <= devs.size(); ++n)
+    for (const bool with_loan : {true, false}) {
+        if (with_loan && !any_loan) continue;
+        const std::vector<uint64_t>& room = with_loan ? room_loan : room_plain;
         std::vector<size_t> ends;
         size_t l = 0;
         bool stuck = false;   // a GPU before the last holds no layer: more GPUs do not help
@@ -1305,7 +1330,7 @@ bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& 
             if (n == 1) std::fprintf(stderr, "lamina: GPU %d holds the model: no layer split\n", devs[0]);
             return true;
         }
-        if (stuck) break;
+        if (stuck && !with_loan) n = devs.size();   // (more GPUs do not help: the outer loop ends)
     }
     if (m.moe) {   // the split needs every expert in VRAM; one GPU runs the rest of them on the CPU
         take(1, {nl});
@@ -1962,7 +1987,8 @@ struct Engine {
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     cudaEvent_t ev_route = nullptr;
-    uint8_t* stage[2] = {};
+    uint8_t* stage[2] = {};   // a streamed prompt's staging buffers: one block (stage_bytes), the second half way in
+    size_t stage_bytes = 0;
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
@@ -3922,7 +3948,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
+    const size_t reserve = kVramReserve;
+    // A loan asked of this card (kVramReserve, above) never changes where the experts go: an engine pushed into the
+    // hybrid mode by the encoder's memory would write all its text slower for the pictures' sake.  With every
+    // expert in VRAM the loan is of the VRAM left free, as much as that is.  In the hybrid mode it is the streamed
+    // prompt path's staging buffers, or, without that path, VRAM the slots leave free past the reserve (loan_room).
+    const size_t loan = (size_t) lamina::core::gpu_loan_asked(E.dev);
+    const size_t loan_room = vram_gib >= 0 ? 0 : loan_keep(E.dev);
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
     size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
@@ -3966,6 +3998,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     (void) threads;
     (void) hybrid_t;
     (void) serve;
+    (void) loan;
+    (void) loan_room;
     err = "the routed experts (" + std::to_string(total >> 20) + " MiB) do not fit in VRAM, and this build has no CPU "
           "expert pool (LAMINA_NATIVE_EXPERTS=OFF)";
     return false;
@@ -3977,7 +4011,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    // the streamed prompt path's two staging buffers, a layer's experts each, in one block: idle between prompts, so
+    // the block is what the image encoder borrows, as large as its loan where two layers are less
+    const size_t stage_one = (max_layer + kMmqTail + 255) & ~(size_t) 255;
+    size_t staging = E.use_mmq && E.main_hybrid ? 2 * stage_one : 0;
+    if (loan > 0 && E.main_hybrid) {
+        if (staging > 0) staging = std::max(staging, (loan + 255) & ~(size_t) 255);
+        else if (budget2 > loan_room) budget2 -= loan_room;
+    }
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -4086,9 +4127,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(event_new(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(stream_new(&E.cst, cudaStreamNonBlocking));
+        CK(dmalloc(&E.stage[0], staging));
+        CK(cudaMemset(E.stage[0], 0, staging));
+        E.stage[1] = E.stage[0] + stage_one;
+        E.stage_bytes = staging;
         for (int b = 0; b < 2; ++b) {
-            CK(dmalloc(&E.stage[b], max_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
             CK(event_new(&E.ev_copy[b], cudaEventDisableTiming));
             CK(event_new(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
@@ -4476,7 +4519,91 @@ struct Serve {
         return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
     }
 
+    // The server's image encoder, which runs in this process, holds no VRAM of its own between pictures where the
+    // server has it borrow (its "vision" section's "lend"): for a new picture it asks for memory on its card, loads
+    // its weights there, encodes and gives it back, all between two requests.  This engine has no expert cache to
+    // lend from.  In the hybrid mode it lends the streamed prompt path's staging buffers, which hold nothing
+    // between prompts (place_experts makes them one block, as large as the loan the server announced); else VRAM
+    // allocated of what the card has free, which the planner left that large where the model let it (kVramReserve).
+    // LEND <device> <bytes> -> LENT <address> <bytes> 0 0 <what it is> or ERR; UNLEND -> UNLENT.
+    void* enc_at = nullptr;      // the loan that is out
+    Engine* enc_on = nullptr;    // the stage whose GPU it is on
+    bool enc_staging = false;    // that stage's staging buffers; else an allocation of its own
+    void enc_back() {
+        if (enc_at == nullptr) return;
+        enc_on->on();
+        CK(cudaDeviceSynchronize());   // the encoder's last kernels
+        if (enc_staging) {
+            // as the start left them: a stream writes a layer's experts and no more, and MMQ reads a little past
+            // them, where the bytes must be quants' (a float's bytes read as a block's scale can be a NaN)
+            CK(cudaMemset(enc_on->stage[0], 0, enc_on->stage_bytes));
+            CK(cudaDeviceSynchronize());
+        } else {
+            CK(dfree(enc_at));
+        }
+        enc_at = nullptr;
+        enc_on = nullptr;
+        enc_staging = false;
+        E.on();
+    }
+    void lend(const std::string& line, bool in_process) {
+        long long dev = -1;
+        unsigned long long bytes = 0;
+        std::string why, what;
+        if (std::sscanf(line.c_str() + 5, "%lld %llu", &dev, &bytes) != 2 || bytes == 0) {
+            why = "expected LEND <device> <bytes>";
+        } else if (!in_process) {
+            why = "a loan is memory of the engine's own process";
+        } else if (enc_at != nullptr) {
+            why = "a loan is out already";
+        } else if (E.n_sess > 1) {
+            why = "the engine's batch slots run requests at once";
+        } else {
+            Engine* S = nullptr;
+            for (Engine* e = &E; e != nullptr && S == nullptr; e = e->nxt)
+                if (e->dev == (int) dev) S = e;
+            if (S == nullptr) {
+                why = "the engine has no layers on GPU " + std::to_string(dev);
+            } else {
+                S->on();
+                if (S->stage[0] != nullptr && S->stage_bytes >= bytes) {
+                    CK(cudaStreamSynchronize(S->cst));   // nothing of a prompt still copies into them, or reads them
+                    CK(cudaStreamSynchronize(S->st));
+                    enc_at = S->stage[0];
+                    enc_staging = true;
+                    what = "the engine's staging buffers for a prompt's experts";
+                } else {
+                    // asked of the driver first: an allocation past the free memory does not fail under WDDM, it pages
+                    size_t fr = 0, tot = 0;
+                    CK(cudaMemGetInfo(&fr, &tot));
+                    void* at = nullptr;
+                    if (fr < bytes + kLoanFree) {
+                        why = "GPU " + std::to_string(dev) + " has " + std::to_string(fr >> 20) + " MiB of VRAM free beside "
+                              "the model, " + std::to_string((bytes + kLoanFree) >> 20) + " needed";
+                    } else if (dmalloc(&at, (size_t) bytes) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        why = "GPU " + std::to_string(dev) + " gave no " + std::to_string(bytes >> 20) + " MiB";
+                    } else {
+                        enc_at = at;
+                        enc_staging = false;
+                        what = "VRAM the engine leaves free (" + std::to_string(fr >> 20) + " MiB now)";
+                    }
+                }
+                if (enc_at != nullptr) enc_on = S;
+                E.on();
+            }
+        }
+        if (why.empty())
+            serve_print("LENT %llu %llu 0 0 %s\n", (unsigned long long) (uintptr_t) enc_at, bytes, what.c_str());
+        else
+            serve_print("ERR no loan: %s\n", why.c_str());
+    }
+
     void request(const std::string& line) {
+        if (enc_at != nullptr) {   // a request while a loan is out: it comes back first
+            std::fprintf(stderr, "lamina serve: a request came while the image encoder's loan was out: taken back\n");
+            enc_back();
+        }
         const bool adm = line[0] == 'B';
         const bool geni = line.rfind(adm ? "BGENI " : "GENI ", 0) == 0;
         if (!adm && !geni && line.rfind("GEN ", 0) != 0) {
@@ -4800,6 +4927,11 @@ struct Serve {
                 // (a read that has ended)
             } else if (line.rfind("GEN", 0) == 0 || line.rfind("BGEN", 0) == 0) {
                 request(line);
+            } else if (line.rfind("LEND ", 0) == 0) {
+                lend(line, io.in_process);
+            } else if (line == "UNLEND") {
+                enc_back();
+                serve_print("UNLENT\n");
             } else if (line == "QUIT") {   // as the input's end: the running requests finish (STOP ends them first)
                 std::lock_guard<std::mutex> lk(mu);
                 eof = true;
@@ -5044,9 +5176,11 @@ static int run_engine(int argc, char** argv, bool check_only) {
             // With several slots a long prompt would hold the other slots' windows for a whole chunk: 1024 at most there.
             // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
             // every expert and the 0.77 GiB reserve, or place_experts goes hybrid)
+            // (a loan asked of the card, kVramReserve: the chunk leaves it free as well)
             const int cap = ns > 1 ? 1024 : 4096;
+            const double loan_room = (double) loan_keep(E.dev);
             for (int c : {4096, 2048, 1024})
-                if (c <= cap && (double) experts + 2.75 * GiB + (double) (c - 512) * 0.5 * 1048576.0 + sess_extra <= (double) fr) {
+                if (c <= cap && (double) experts + 2.75 * GiB + (double) (c - 512) * 0.5 * 1048576.0 + sess_extra + loan_room <= (double) fr) {
                     chunk = c;
                     break;
                 }
@@ -5073,6 +5207,21 @@ static int run_engine(int argc, char** argv, bool check_only) {
             return 1;
         }
     }
+    for (auto& S : stages)   // a loan the server's image encoder asked of a stage's card (kVramReserve): what it will be
+        if (const size_t loan = (size_t) lamina::core::gpu_loan_asked(S->dev); loan > 0) {
+            size_t fr = 0, tot = 0;
+            S->on();
+            CK(cudaMemGetInfo(&fr, &tot));
+            if (S->stage_bytes >= loan)
+                std::fprintf(stderr, "lamina: the image encoder borrows GPU %d's staging buffers for a picture (%.2f GiB; "
+                             "its %zu MiB fit)\n", S->dev, (double) S->stage_bytes / (1 << 30), loan >> 20);
+            else
+                std::fprintf(stderr, "lamina: the image encoder borrows %zu MiB of GPU %d's free VRAM for a picture: %zu "
+                             "MiB are free now%s\n", (loan + kLoanFree) >> 20, S->dev, fr >> 20,
+                             fr >= loan + kLoanFree ? "" : ", too little (the model's placement comes first): the server "
+                                                           "encodes elsewhere");
+        }
+    E.on();
     // every tensor is in VRAM or the pinned arena: the file's mapping goes (its pages stay in the OS's file cache, out
     // of the process's working set)
     m.mtp.src_g = m.mtp.src_u = m.mtp.src_d = nullptr;

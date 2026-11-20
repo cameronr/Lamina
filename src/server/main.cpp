@@ -271,10 +271,37 @@ void settle_vision(json& cfg) {
     cfg["args"] = std::move(args);
 }
 
+/// Why the image encoder cannot borrow the engine's VRAM for its pictures (the vision section's "lend"), "" when it
+/// can: the loan is memory of an engine in this process that runs one request at a time, on a card the engine works
+/// on (Flash-Next lends a card's expert cache, the main GPU's or a tier's; Hy4-flash its main GPU's slots; the
+/// qwen35 path its prompt path's staging buffers, or VRAM it leaves free).  `arch`: the model's ("": not read).
+std::string no_lending(const json& cfg, const std::string& arch, bool replicas, std::vector<GpuInfo>& gpus) {
+    const json& v = jget(cfg, "vision");
+    if (!truthy(jget(v, "gpu"))) return "the encoder runs on the CPU";
+    if (replicas) return "the replicas' engines are processes of their own";
+    const std::vector<std::string> args = engine_args(cfg);
+    if (std::find(args.begin(), args.end(), "--batch") != args.end() || std::find(args.begin(), args.end(), "--slots") != args.end())
+        return "the engine's batch slots run requests at once";   // ("parallel" is --batch there)
+    const json& dev = jget(v, "cuda_device");
+    if (dev.is_null()) return "";
+    if (gpus.empty()) gpus = nvidia_gpus();
+    const std::vector<int> on = engine_gpus(cfg, gpus);
+    const int card = find_gpu(dev.is_string() ? dev.get<std::string>() : py_dumps(dev), gpus);
+    if (card < 0 || on.empty()) return "";   // (nvidia-smi lists nothing: the engine answers when asked)
+    if (std::find(on.begin(), on.end(), card) == on.end()) return "the engine does not work on the encoder's card";
+    if (arch == "hy_v4_flash" && card != on.front()) return "Hy4-flash's engine lends on its main GPU alone";
+    return "";
+}
+
 /// a vision section that asks for a GPU and names none: the card pick_vision_gpu chooses, by its UUID, said in the
 /// window (the encoder would otherwise take CUDA's first); one that names its card by nvidia-smi's number: that
-/// card's UUID (the encoder finds its card among this process's CUDA devices, whose order is another)
-void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
+/// card's UUID (the encoder finds its card among this process's CUDA devices, whose order is another).  With
+/// "lend", `lend_no` is why the engine cannot lend (no_lending; "": it can), which decides the card a section that
+/// names none gets: the engine's main GPU for a loan, else the card an encoder that keeps its VRAM takes - and
+/// beside replicas the CPU, as an engine in a process of its own does not see this process's VRAM when it sizes
+/// its cache.
+void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus, const std::string& arch, bool replicas, std::string& lend_no) {
+    lend_no.clear();
     // "gpu" naming a card (a name, a UUID's start, a PCI bus id, a number): the encoder on it, by its UUID
     if (const json& g = jget(jget(cfg, "vision"), "gpu"); g.is_string() && !strip(g.get<std::string>()).empty()) {
         if (gpus.empty()) gpus = nvidia_gpus();
@@ -289,48 +316,36 @@ void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
     const json& dev = jget(v, "cuda_device");
     const bool named = !dev.is_null() && !(dev.is_string() && strip(dev.get<std::string>()).empty());
     if (!v.is_object() || !truthy(jget(v, "gpu"))) return;
+    const bool lend_asked = truthy(jget(v, "lend"));
     if (named) {
         const std::string spec(strip(dev.is_string() ? dev.get<std::string>() : py_dumps(dev)));
-        if (!std::all_of(spec.begin(), spec.end(), ::isdigit)) return;
-        if (gpus.empty()) gpus = nvidia_gpus();
-        for (const GpuInfo& g : gpus)
-            if (g.index == std::stoi(spec) && !g.uuid.empty()) cfg["vision"]["cuda_device"] = g.uuid;
+        if (std::all_of(spec.begin(), spec.end(), ::isdigit)) {
+            if (gpus.empty()) gpus = nvidia_gpus();
+            for (const GpuInfo& g : gpus)
+                if (g.index == std::stoi(spec) && !g.uuid.empty()) cfg["vision"]["cuda_device"] = g.uuid;
+        }
+        if (lend_asked) lend_no = no_lending(cfg, arch, replicas, gpus);
         return;
     }
     if (gpus.empty()) gpus = nvidia_gpus();
     const std::vector<int> engine = engine_gpus(cfg, gpus);
-    // "lend": the engine's main GPU, whose cache every engine that lends lends from; else a card beside it
-    const bool lend = truthy(jget(v, "lend")) && !engine.empty();
+    if (lend_asked) lend_no = no_lending(cfg, arch, replicas, gpus);
+    if (lend_asked && replicas) {
+        cfg["vision"]["gpu"] = false;
+        say("[lamina] the image encoder on the CPU: with replicas it has no engine in this process to borrow VRAM from, "
+            "and a replica does not see VRAM this process keeps on its card (--vision-cuda-device names a card for it)");
+        return;
+    }
+    // "lend": the engine's main GPU, where every engine lends; else a card beside it
+    const bool lend = lend_asked && lend_no.empty() && !engine.empty();
     const int pick = lend ? engine.front() : pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
     for (const GpuInfo& g : gpus)
         if (g.index == pick) {
             cfg["vision"]["cuda_device"] = g.uuid;
             say("[lamina] the image encoder on GPU " + std::to_string(g.index) + ", " + g.name +
-                (lend ? ", the engine's main one, whose cache lends it VRAM for a picture" : "") +
+                (lend ? ", the engine's main one, which lends it VRAM for a picture" : "") +
                 " (--vision-cuda-device names another)");
         }
-}
-
-/// Why the image encoder cannot borrow the engine's VRAM for its pictures (the vision section's "lend"), "" when it
-/// can: the loan is memory of an engine in this process that runs one request at a time, on a card where it keeps
-/// an expert cache it lends from (Flash-Next: each of its cards; Hy4-flash: its main one).
-std::string no_lending(const json& cfg, const std::string& arch, bool replicas, std::vector<GpuInfo>& gpus) {
-    const json& v = jget(cfg, "vision");
-    if (!truthy(jget(v, "gpu"))) return "the encoder runs on the CPU";
-    if (replicas) return "the replicas' engines are processes of their own";
-    const std::vector<std::string> args = engine_args(cfg);
-    if (std::find(args.begin(), args.end(), "--batch") != args.end() || std::find(args.begin(), args.end(), "--slots") != args.end())
-        return "the engine's batch slots run requests at once";
-    if (arch != "qwen4exp" && arch != "hy_v4_flash") return "this model's engine lends no VRAM";
-    const json& dev = jget(v, "cuda_device");
-    if (dev.is_null()) return "";
-    if (gpus.empty()) gpus = nvidia_gpus();
-    const std::vector<int> on = engine_gpus(cfg, gpus);
-    const int card = find_gpu(dev.is_string() ? dev.get<std::string>() : py_dumps(dev), gpus);
-    if (card < 0 || on.empty()) return "";   // (nvidia-smi lists nothing: the engine answers when asked)
-    if (std::find(on.begin(), on.end(), card) == on.end()) return "the engine keeps no expert cache on the encoder's card";
-    if (arch == "hy_v4_flash" && card != on.front()) return "Hy4-flash's engine lends on its main GPU alone";
-    return "";
 }
 
 int run(int argc, char** argv) {
@@ -469,7 +484,24 @@ int run(int argc, char** argv) {
         for (const std::string& n : notes) say(n);
         say_main_gpu(cfg, gpus);
     }
-    settle_vision_gpu(cfg, gpus);
+    // the pictures' card, and with "lend" whether this model's engine can lend (the model's architecture, replicas)
+    std::string lend_no;
+    {
+        const json& v = jget(cfg, "vision");
+        std::string arch = model_arch;
+        bool replicas = false;
+        if (!mock && v.is_object() && truthy(jget(v, "lend"))) {
+            try {
+                if (arch.empty()) arch = read_model(model_file(cfg)).arch;
+            } catch (const std::exception&) {   // (the start says what is wrong with the file)
+            }
+            try {
+                replicas = !gpu_groups(cfg).empty();
+            } catch (const std::exception&) {   // (as the start says)
+            }
+        }
+        settle_vision_gpu(cfg, gpus, arch, replicas, lend_no);
+    }
     if (!cl.write_config.empty()) {
         json out;
         try {   // the form a config is written in now: its cards, its options past the engine's defaults, an object
@@ -659,13 +691,13 @@ int run(int argc, char** argv) {
                 json vcfg = cfg["vision"];   // a relative path is the config's cwd's, as for the engine
                 if (const std::string f = jstr(vcfg, "mmproj"); !f.empty() && !u8_path(f).is_absolute())
                     vcfg["mmproj"] = u8_str(cfg_dir / u8_path(f));
-                // "lend": where the engine can lend VRAM on the encoder's card; else the encoder keeps its own
-                if (truthy(jget(vcfg, "lend"))) {
-                    if (const std::string why = no_lending(cfg, tok->architecture, !groups.empty(), gpus); !why.empty()) {
-                        say("[lamina] the vision section's \"lend\" is left out (" + why + "): the image encoder keeps "
-                            "its VRAM");
-                        vcfg["lend"] = false;
-                    }
+                // "lend": where the engine can lend VRAM on the encoder's card; else the encoder keeps its own (the
+                // CPU's borrows none: said where its card was settled)
+                if (truthy(jget(vcfg, "lend")) && !truthy(jget(vcfg, "gpu"))) vcfg["lend"] = false;
+                if (truthy(jget(vcfg, "lend")) && !lend_no.empty()) {
+                    say("[lamina] the vision section's \"lend\" is left out (" + lend_no + "): the image encoder keeps "
+                        "its VRAM");
+                    vcfg["lend"] = false;
                 }
                 vision_lends = truthy(jget(vcfg, "lend"));
                 vision = std::make_shared<Vision>(vcfg, lazy);

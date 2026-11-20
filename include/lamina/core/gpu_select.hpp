@@ -6,6 +6,7 @@
 // card, and so does a name while no other card has it: --main-gpu and --second-gpu take any of the four.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,14 @@ void gpu_keep(int device, bool keep);
 /// The context a query made on `device`, a GPU the engine then leaves out, goes with all it holds
 /// (cudaDeviceReset), unless the card is kept (gpu_keep): then nothing is done.  `device` is current after it.
 void gpu_reset_unused(int device);
+
+/// What another part of this process will borrow of `device` between requests (lamina-server's image encoder, where
+/// its section says "lend": the serve protocol's LEND), in bytes; 0 takes the word back.  Said before the engine
+/// loads: an engine that sizes itself by the card's free VRAM and has no cache to lend from (the qwen35 path) then
+/// has that much to lend - its prompt path's staging buffers made that large, or the VRAM left free past its reserve.
+void gpu_loan_ask(int device, uint64_t bytes);
+/// The bytes asked of `device` (0: none).
+uint64_t gpu_loan_asked(int device);
 
 /// A tier's GPU as a short probe saw it: the pinned host-to-device rate of 64 MiB copies (GB/s, the best of five
 /// after the link is woken, and of five more for as long as those were faster), and whether the desktop or another

@@ -96,20 +96,28 @@ The server builds a config for the file and says in its window what it took:
   ([the README](../README.md#the-draft-layer)).
 - **Pictures**: an image projector made for the model beside it (an `mmproj*.gguf` whose width is the model's; of
   several the smallest; Qwen3.6's and Qwen3.8-27B's repositories have theirs, `mmproj-F16.gguf`), read by the
-  server's image encoder on the CPU's logical cores, so that the GPUs keep their VRAM for experts. With `--vision-gpu`
-  it runs on a GPU (the projector's size and 0.1-0.3 GB of buffers of its VRAM: 0.7 GB with Lamina's Q8_0 projector,
-  1.0 GB with an F16 one, 1.2 GB with Hy4-flash's): of the cards besides the main one, the one with the least VRAM that
-  drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another (`nvidia-smi -L` lists
-  the UUIDs). With `--vision-lend` beside it the encoder keeps none of that VRAM: for each new picture it borrows the
-  engine's expert cache on its card, as a prompt does, and gives it back (Qwen3.8-Flash-Next on any card the engine
-  uses, Hy4-flash on its main one, which is then the card it takes; the other models' engines lend none, and the
-  encoder keeps its VRAM). On a PC with one GPU that is a new picture in about half a second in place of the CPU's
-  seconds, with the cache at its full size. `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
-  projector or the encoder the window says why there are none. For Qwen3.8-Flash-Next on the CPU, download Lamina's Q8_0
-  projector into the model's folder: `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
+  server's image encoder on the engine's main GPU, in VRAM it borrows from the engine for each new picture and gives
+  back (the presets' `"gpu": true` and `"lend": true`). The encoder keeps no VRAM between pictures, so the GPUs hold
+  what they hold without pictures, and a new picture of ~1,000 tokens takes about half a second (its weights read
+  from the projector, the picture encoded: 0.3-0.6 s on an RTX 3090; Hy4-flash's pictures of up to ~4,100 rows 1-3 s)
+  where the CPU takes 8-10 s. What the engine lends: Qwen3.8-Flash-Next the last slots of a card's expert cache, as a
+  prompt's buffers take them (their experts are copied back after, ~0.1 s); Hy4-flash a part of its main GPU's expert
+  slots; Qwen3.6-35B-A3B and Qwen3.8-27B the buffers a prompt's experts are streamed through where the experts do not
+  all fit the GPUs, else VRAM they leave free (a layer split keeps the encoder's ~1 GB free on the main GPU). A picture
+  whose loan finds no memory is encoded on the CPU, on its logical cores (the log says so once). The engine does not
+  lend with batch slots (`--parallel`: the encoder then keeps its VRAM) or to a server with replicas (the CPU
+  encodes, unless `--vision-cuda-device` names the encoder's card). `--no-vision-lend`: the encoder keeps its VRAM (the
+  projector's size and 0.1-0.3 GB of buffers: 0.7 GB with Lamina's Q8_0 projector, 1.0 GB with an F16 one, 1.2 GB
+  with Hy4-flash's) and encodes such a picture in 0.2 s, on a card besides the main one: the one with the least VRAM
+  that drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another (`nvidia-smi -L`
+  lists the UUIDs). On one RTX 3090 that kept VRAM costs Qwen3.6-35B-A3B 13 of the 212 experts a layer the card holds,
+  2-4% of its generation speed and 17% of its prompts'. `--no-vision-gpu`: the encoder on the CPU alone. `--mmproj
+  FILE` names a projector, `--no-mmproj` leaves pictures out; without a projector or the encoder the window says why
+  there are none. For Qwen3.8-Flash-Next, download Lamina's Q8_0 projector into the model's folder:
+  `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
   [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) beside the
-  draft layer. The CPU encodes a picture with it in ~20% less time than with the BF16 one and 280 MiB less RAM, with the
-  same answers.
+  draft layer. A loan for it is 0.7 GB where the BF16 one's is 1.0, and the CPU encodes a picture with it in ~20% less
+  time than with the BF16 one and 280 MiB less RAM, with the same answers.
 - **The expert profile**, Qwen3.8-Flash-Next's, built into the programs (`--expert-profile builtin`, the engine's
   default under `--serve`).
 - **What a run writes**, beside the server: the engine's log (`<model>.log`) and what the run learned about the
@@ -215,7 +223,7 @@ preset ([above](#a-model-file)). Its keys:
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does), `lend` (on a GPU: `true` has the encoder hold no VRAM between pictures and borrow the engine's expert cache on its card for each new one; without `cuda_device` that card is the engine's main one), `q8` (a Q8_0 projector on a GPU: `mmq`, the default, multiplies its blocks as llama.cpp does, `fp16` its values as FP16, nearer the unquantized projector's embeddings; the answers measured the same). The encoder is a part of the server |
+| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does), `lend` (on a GPU: `true` has the encoder hold no VRAM between pictures and borrow the engine's on its card for each new one ([above](#a-model-file) says what each engine lends; without `cuda_device` that card is the engine's main one; the examples set `gpu` and `lend`), `q8` (a Q8_0 projector on a GPU: `mmq`, the default, multiplies its blocks as llama.cpp does, `fp16` its values as FP16, nearer the unquantized projector's embeddings; the answers measured the same). The encoder is a part of the server |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):
