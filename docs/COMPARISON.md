@@ -33,6 +33,9 @@ predate: an RTX 5060 Ti in the Gyro-L section's runs, now a second RTX 3090, the
 - [Qwen3.6-35B-A3B](#qwen36-35b-a3b), its layers split over both GPUs: generation 1-9% faster than llama.cpp's with
   both GPUs, long prompts 2-8% slower. [Qwen3.8-27B](#qwen38-27b) (UD-Q6_K_M, the full context on both GPUs): Lamina writes code 29%
   faster than llama.cpp, thinks 48% faster, edits 23% faster and reads prompts 4-13% faster.
+- [Hy4-flash](#hy4-flash) (Tencent's model, its Q4_K_M with 83 GiB of experts over the three GPUs and the RAM):
+  Lamina writes 4.4-6x as fast as llama.cpp's PR #32517 and reads prompts 17-30x as fast (its 64K prompt in 35 s
+  against 18 minutes).
 
 ## The PC and the engines
 
@@ -334,6 +337,36 @@ along llama.cpp's own greedy text, the next-token distributions' mean KL against
 backend is 2.4e-4 / 2.4e-3 / 7.3e-6 from it; the argmax agrees at 100% / 98.75% / 100% of the positions (the CPU
 backend's 98.5% / 98.0% / 100%). With its drafts Lamina's greedy text is its text without them for 400 of 400 tokens on
 the thinking task and the edit, 348 on the code request (where a near-tie parts them).
+
+## Hy4-flash
+
+The engine's hy4 path (`src/hy4`) on AngelSlim's Q4_K_M (42 layers, 512 routed experts a layer, 83.4 GiB of them),
+measured on 2026-11-20. Lamina with its config (524,288 cells, K and V in q8_0, Tencent's DFly2 drafter up to 4 tokens
+a window, prompt lookup): the experts on the main RTX 3090 (68 a layer), the RTX 5070 Ti (79), the other RTX 3090 (130)
+and in RAM, a part of 8,192 tokens or more in chunks of 16,384 rows run in two overlapped halves. llama.cpp: PR #32517
+(build 12473, commit 0a054d0b0), 72,000 cells, the dense weights on the main 3090, the experts of layers 1-4 there too,
+5-14 on the other 3090, 15-20 on the 5070 Ti, the rest on the CPU (with every expert on the CPU it measured the same).
+The same requests through each server's API, greedy, Lamina's conversation cache off, a short request between the
+fill prompts (prefixes of one text) so that each is read whole (`scratch/hy4/compare.sh`).
+
+| | llama.cpp | Lamina |
+|---|---|---|
+| Generation: code, 38/41-token prompt (t/s) | 8.2 | 44.0 |
+| Generation: thinking (3,000 tokens) | 8.2 | 43.1 |
+| Edit: prompt / generation (t/s) | 67 / 8.2 | 1,132 / 49.7 |
+| 16K-token prompt / generation after it (t/s) | 71 / 8.2 | 1,716 / 45.6 |
+| 32K-token prompt / generation after it (t/s) | 68 / 8.0 | 1,954 / 41.7 |
+| 64K-token prompt / generation after it (t/s) | 60 / 7.6 | 1,835 / 36.0 |
+
+Lamina's drafts: 7.0 tokens a verify pass on the edit (lookup quotes the prompt), 2.1 on the thinking task, 3.1-3.6
+after the fill prompts. An agent's session replayed through the server (pi, 20 requests to 25K tokens of context):
+19.4-19.7 ms a token (50.8-51.5 tok/s), 9.3 J a token on the three cards and the CPU, its prompts 30 s. VRAM after the
+runs: the main 3090 23.0 GiB, the other 22.2, the 5070 Ti 14.7 (the desktop's 0.7 in it).
+
+Agreement with llama.cpp (`scratch/hy4/parity.sh`, K and V in q8_0 in both engines): Lamina forced along llama.cpp's
+own greedy text, the next-token distributions' mean KL 9.5e-4 / 3.1e-3 / 2.1e-6 / 6.0e-3 (a short coding request, the
+thinking task, the edit, after the 16K prompt; 200 / 400 / 400 / 200 positions), the argmax agreeing at 99.5% /
+97.75% / 100% / 97% of them.
 
 ## Features
 
