@@ -3345,6 +3345,7 @@ struct MoeDev {
     int32_t *ident = nullptr, *plan = nullptr, *plan_h = nullptr;
     int64_t ident_rows = 0;
     float* acc_h = nullptr;
+    __half* acc16 = nullptr;   // a tier's sums as halves (Prompt::sum_f16)
     uint8_t* stage[2] = {};
 };
 
@@ -3383,6 +3384,9 @@ struct Prompt {
     float *iq = nullptr, *ik = nullptr, *iv = nullptr, *ig = nullptr, *iw = nullptr, *scores = nullptr;
     float *erows = nullptr, *ekv = nullptr, *evalid = nullptr, *fg = nullptr, *fu = nullptr, *fh = nullptr;
     float *logits_r = nullptr, *wts = nullptr, *rin = nullptr, *sg = nullptr, *su = nullptr, *sh = nullptr, *tmp = nullptr;
+    // the tiers' sums cross the links as halves (LAMINA_HY4_SUM_F16=0: floats): half the bytes, an error well under
+    // the q8_1 rounding of routed_up's input
+    bool sum_f16 = true;
     int32_t *ids = nullptr, *cells = nullptr, *ncells = nullptr, *hids = nullptr, *hb = nullptr, *tok_d = nullptr,
             *pos_d = nullptr;
     int64_t hids_rows = 0;
@@ -3422,6 +3426,7 @@ struct Prompt {
     /// false (with a note) where MMQ cannot run one of the model's products.
     bool init(int rows, const std::vector<int>& tier_devs, int pass_rows = 0) {
         const auto& g = m->g;
+        if (const char* v = std::getenv("LAMINA_HY4_SUM_F16")) sum_f16 = std::atoi(v) != 0;
         cap = std::max(kMaxT + 1, rows);
         pass = std::max(cap, pass_rows);
         std::vector<const Layer*> checked;
@@ -3593,6 +3598,7 @@ struct Prompt {
             d.plan = dalloc<int32_t>(plan_n);
             d.plan_h = halloc<int32_t>(plan_n);
             if (i > 0) d.acc_h = halloc<float>(PR * Ld);
+            if (i > 0 && sum_f16) d.acc16 = dalloc<__half>(PR * Ld);
             devs.push_back(std::move(d));
         }
         // the experts no GPU holds go to the GPU whose link copies fastest (core::probe_gpus: the links woken first)
@@ -4171,8 +4177,13 @@ struct Prompt {
             for (int gi = bt.g0; gi < bt.g1; ++gi) run_group(d, l, T, dp.groups[(size_t) gi]);
             CK(cudaEventRecord(d.used[buf], d.st));
         }
-        if (d.gi > 0) {
-            CK(cudaMemcpyAsync(d.acc_h, d.acc, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, d.st));
+        if (d.gi > 0) {   // the sums out (as halves: sum_f16)
+            if (sum_f16) {
+                hy4p::k_to_half<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, d.st>>>(d.acc, d.acc16, (int64_t) T * Ld);
+                CK(cudaMemcpyAsync(d.acc_h, d.acc16, (size_t) T * Ld * 2, cudaMemcpyDeviceToHost, d.st));
+            } else {
+                CK(cudaMemcpyAsync(d.acc_h, d.acc, (size_t) T * Ld * 4, cudaMemcpyDeviceToHost, d.st));
+            }
             CK(cudaEventRecord(d.done, d.st));
         }
     }
@@ -4226,8 +4237,12 @@ struct Prompt {
         // the tiers' sums, in their order
         for (size_t d = 1; d < devs.size(); ++d) {
             CK(cudaStreamWaitEvent(st, devs[d].done, 0));
-            CK(cudaMemcpyAsync(tmp, devs[d].acc_h, (size_t) T * Ld * 4, cudaMemcpyHostToDevice, st));
-            hy4k::k_add<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(d0.acc, tmp, (int64_t) T * Ld);
+            CK(cudaMemcpyAsync(tmp, devs[d].acc_h, (size_t) T * Ld * (sum_f16 ? 2 : 4), cudaMemcpyHostToDevice, st));
+            if (sum_f16)
+                hy4p::k_add_half<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(
+                    d0.acc, reinterpret_cast<const __half*>(tmp), (int64_t) T * Ld);
+            else
+                hy4k::k_add<<<blocks((int64_t) T * Ld), hy4k::kThreads, 0, st>>>(d0.acc, tmp, (int64_t) T * Ld);
         }
         ms_moe += ms_since(t0);
         mark(3);

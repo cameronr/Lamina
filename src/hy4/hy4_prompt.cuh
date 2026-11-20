@@ -626,4 +626,15 @@ __global__ void k_head_bounds(int32_t* b, int G, int T) {
     if (h <= G) b[h] = h * T;
 }
 
+/// n floats as halves, saturating at the half's range (a tier's sums crossing the links)
+__global__ void k_to_half(const float* __restrict__ x, __half* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(fminf(fmaxf(x[i], -65504.f), 65504.f));
+}
+/// y[i] += b[i], b halves
+__global__ void k_add_half(float* __restrict__ y, const __half* __restrict__ b, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += __half2float(b[i]);
+}
+
 }  // namespace hy4p
