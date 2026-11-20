@@ -510,15 +510,16 @@ public:
         load(p);
         // ggml's CUDA flash attention has tensor-core kernels for heads of 64, 80, 96, 112 and 128 values; a head
         // of another size (this tower's 72) goes to its tile kernel, which at the pinned commit is slower and, the
-        // more patches a picture has, further from the FP32 attention (Hy4's 3,645-row screenshot: 3.05 s and rows
-        // 27% from the CPU's; padded to 80, 1.19 s and 6%).  Hy4's heads are padded on a GPU; Qwen's stay as mtmd
-        // has them.  LAMINA_VISION_HEAD_PAD=N pads either's to N values (0: none), for comparisons.
+        // more patches a picture has, further from the FP32 attention: Hy4's 3,645-row screenshot 3.05 s and rows
+        // 27% from the CPU's, padded to 80 1.19 s and 6%; Flash-Next's pictures of ~1,000 tokens 0.33-0.35 s and
+        // 5-13% from the CPU's FP32 attention, padded 0.19-0.21 s and 2.4-5.5%.  So on a GPU the heads are padded
+        // to the next of those sizes (mtmd leaves them: Qwen's rows on a GPU are no longer its bytes; on the CPU
+        // they are).  LAMINA_VISION_HEAD_PAD=N pads them to N values (0: none), for comparisons.
         if (backend_ != backend_cpu_) {
             const int d_head = m_.n_embd_head > 0 ? m_.n_embd_head : m_.n_embd / m_.n_head;
             int to = d_head;
-            if (m_.kind == Kind::hy4)
-                for (const int size : {64, 80, 96, 112, 128})
-                    if (to == d_head && size >= d_head) to = size;
+            for (const int size : {64, 80, 96, 112, 128})
+                if (to == d_head && size >= d_head) to = size;
             if (const char* s = std::getenv("LAMINA_VISION_HEAD_PAD")) to = std::max(d_head, std::atoi(s));
             head_pad_ = to - d_head;
         }

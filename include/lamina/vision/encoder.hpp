@@ -13,9 +13,10 @@
 // A picture is first sized as the projector's reference processor sizes it (image.hpp).
 //
 // The arithmetic is llama.cpp's mtmd's at the pinned commit, operation for operation on ggml (tools/mtmd, MIT; Hy4's
-// projector as its pull request 32517 has it), so the rows are the ones that library gives on the same backend: Qwen's
-// the same bytes.  One departure, on a GPU, for Hy4's projector: the attention's heads of 72 values are zero-padded
-// to 80, a size ggml's tensor-core flash attention kernel takes (ggml_encoder.cpp, GgmlEncoder::open).
+// projector as its pull request 32517 has it), so on the CPU the rows are the ones that library gives: Qwen's the
+// same bytes.  One departure, on a GPU: the attention's heads of 72 values are zero-padded to 80, a size ggml's
+// tensor-core flash attention kernel takes, which is faster and nearer the FP32 attention than the kernel it has for
+// 72 (ggml_encoder.cpp, GgmlEncoder::open; LAMINA_VISION_HEAD_PAD=0 gives mtmd's bytes there too).
 #pragma once
 
 #include "lamina/vision/image.hpp"
