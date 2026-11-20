@@ -296,10 +296,11 @@ std::string no_lending(const json& cfg, const std::string& arch, bool replicas, 
 /// a vision section that asks for a GPU and names none: the card pick_vision_gpu chooses, by its UUID, said in the
 /// window (the encoder would otherwise take CUDA's first); one that names its card by nvidia-smi's number: that
 /// card's UUID (the encoder finds its card among this process's CUDA devices, whose order is another).  With
-/// "lend", `lend_no` is why the engine cannot lend (no_lending; "": it can), which decides the card a section that
-/// names none gets: the engine's main GPU for a loan, else the card an encoder that keeps its VRAM takes - and
-/// beside replicas the CPU, as an engine in a process of its own does not see this process's VRAM when it sizes
-/// its cache.
+/// "lend", `lend_no` is why the engine cannot lend (no_lending; "": it can), which decides what a section that names
+/// no card gets: the engine's main GPU for a loan; where there is none to be had (batch slots, replicas), the CPU -
+/// "lend" asks for an encoder that keeps no VRAM, and one kept on the engine's card would take the model's (beside
+/// replicas, engines in processes of their own, unseen by them when they size their caches).  A section that names
+/// its card keeps the encoder there, with its VRAM.
 void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus, const std::string& arch, bool replicas, std::string& lend_no) {
     lend_no.clear();
     // "gpu" naming a card (a name, a UUID's start, a PCI bus id, a number): the encoder on it, by its UUID
@@ -330,14 +331,14 @@ void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus, const std::string&
     if (gpus.empty()) gpus = nvidia_gpus();
     const std::vector<int> engine = engine_gpus(cfg, gpus);
     if (lend_asked) lend_no = no_lending(cfg, arch, replicas, gpus);
-    if (lend_asked && replicas) {
+    if (lend_asked && !lend_no.empty()) {
         cfg["vision"]["gpu"] = false;
-        say("[lamina] the image encoder on the CPU: with replicas it has no engine in this process to borrow VRAM from, "
-            "and a replica does not see VRAM this process keeps on its card (--vision-cuda-device names a card for it)");
+        say("[lamina] the image encoder on the CPU: it has no VRAM to borrow (" + lend_no + "), and \"lend\" has it keep "
+            "none; --no-vision-lend puts it on a GPU with VRAM of its own, --vision-cuda-device names that card");
         return;
     }
-    // "lend": the engine's main GPU, where every engine lends; else a card beside it
-    const bool lend = lend_asked && lend_no.empty() && !engine.empty();
+    // "lend": the engine's main GPU, where every engine lends; without it a card beside that one
+    const bool lend = lend_asked && !engine.empty();
     const int pick = lend ? engine.front() : pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
     for (const GpuInfo& g : gpus)
         if (g.index == pick) {

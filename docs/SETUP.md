@@ -105,8 +105,8 @@ The server builds a config for the file and says in its window what it took:
   slots; Qwen3.6-35B-A3B and Qwen3.8-27B the buffers a prompt's experts are streamed through where the experts do not
   all fit the GPUs, else VRAM they leave free (a layer split keeps the encoder's ~1 GB free on the main GPU). A picture
   whose loan finds no memory is encoded on the CPU, on its logical cores (the log says so once). The engine does not
-  lend with batch slots (`--parallel`: the encoder then keeps its VRAM) or to a server with replicas (the CPU
-  encodes, unless `--vision-cuda-device` names the encoder's card). `--no-vision-lend`: the encoder keeps its VRAM (the
+  lend with batch slots (`--parallel`) or to a server with replicas: the CPU encodes there, as the window says,
+  unless `--vision-cuda-device` names a card for the encoder to keep its VRAM on. `--no-vision-lend`: the encoder keeps its VRAM (the
   projector's size and 0.1-0.3 GB of buffers: 0.7 GB with Lamina's Q8_0 projector, 1.0 GB with an F16 one, 1.2 GB
   with Hy4-flash's) and encodes such a picture in 0.2 s, on a card besides the main one: the one with the least VRAM
   that drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another (`nvidia-smi -L`
