@@ -14,6 +14,7 @@
 #include "hy4_kernels.cuh"
 #include "hy4_dfly_file.hpp"
 #include "hy4_load.hpp"
+#include "hy4_place.hpp"
 #include "hy4_prompt.cuh"
 
 #include "lamina/artifact/gguf_reader.hpp"
@@ -2857,6 +2858,90 @@ struct Engine {
                          (double) std::max(gpus[gi].S, 0) * (double) row / (double) (1ull << 30),
                          gi == 0 ? (profile_loaded ? ", ranked by " + profile_from : std::string(", in order (no profile)")).c_str() : "");
     }
+    /// --arena-place: the pinned places of each layer's experts timed (every core reading one at a time); within a layer
+    /// the experts the CPU reads (on no GPU), the most used first, take its fast places, swapped with the slow places'
+    /// experts (those on a GPU, then the CPU's least used).  `dry`: timed and reported only.
+    void place_arena(bool dry) {
+        const auto t0 = Clock::now();
+        std::vector<const uint8_t*> places;
+        std::vector<std::pair<int, int32_t>> owner;   // (layer, expert)
+        size_t bytes = SIZE_MAX, widest = 0;   // the places timed over the smallest blob; a swap's buffer the widest
+        for (size_t li = 0; li < m->layers.size(); ++li) {
+            const Layer& l = m->layers[li];
+            if (l.dense || l.blob.empty()) continue;
+            bytes = std::min(bytes, l.fmt.bytes);
+            widest = std::max(widest, l.fmt.bytes);
+            for (size_t e = 0; e < l.blob.size(); ++e)
+                if (l.blob_pinned[e]) {
+                    places.push_back(l.blob[e]);
+                    owner.emplace_back((int) li, (int32_t) e);
+                }
+        }
+        if (places.empty()) {
+            std::fprintf(stderr, "lamina: --arena-place: no pinned places\n");
+            return;
+        }
+        float cut = 0.f;
+        const std::vector<float> gbs = lamina::hy4::time_places(places, (uint64_t) bytes, &cut);
+        auto on_gpu = [&](const Layer& l, int32_t e) {
+            for (const SlotSet& s : l.held)
+                if (s.n > 0 && s.slot_of[(size_t) e] >= 0) return true;
+            return false;
+        };
+        size_t slow = 0, cpu = 0, cpu_slow = 0;
+        double sum_gbs = 0;
+        for (size_t pq = 0; pq < places.size(); ++pq) {
+            const Layer& l = m->layers[(size_t) owner[pq].first];
+            const bool s = gbs[pq] < cut, c = !on_gpu(l, owner[pq].second);
+            slow += s;
+            cpu += c;
+            cpu_slow += s && c;
+            sum_gbs += gbs[pq];
+        }
+        // the swaps: within a layer, its pinned places' experts by key (the CPU's, the most used first; then the GPUs'),
+        // the first as many as there are fast places into them
+        size_t swaps = 0;
+        if (!dry) {
+            std::vector<uint8_t> tmp(widest);
+            std::map<int, std::vector<size_t>> by_layer;
+            for (size_t pq = 0; pq < places.size(); ++pq) by_layer[owner[pq].first].push_back(pq);
+            for (auto& [li, qs] : by_layer) {
+                Layer& l = m->layers[(size_t) li];
+                std::vector<int32_t> rank_of(l.use.size(), 0);
+                {
+                    const std::vector<int32_t> order = ranking(l);
+                    for (size_t r = 0; r < order.size(); ++r) rank_of[(size_t) order[r]] = (int32_t) r;
+                }
+                auto key = [&](int32_t e) { return on_gpu(l, e) ? (int64_t) 1 << 40 | rank_of[(size_t) e] : rank_of[(size_t) e]; };
+                std::vector<size_t> by_key = qs;   // places by their expert's key
+                std::sort(by_key.begin(), by_key.end(),
+                          [&](size_t a, size_t b) { return key(owner[a].second) < key(owner[b].second); });
+                size_t nf = 0;
+                for (const size_t pq : qs) nf += gbs[pq] >= cut;
+                std::vector<size_t> out, in;   // the first nf experts in slow places, the others in fast places
+                for (size_t k = 0; k < by_key.size(); ++k) {
+                    if (k < nf && gbs[by_key[k]] < cut) out.push_back(by_key[k]);
+                    if (k >= nf && gbs[by_key[k]] >= cut) in.push_back(by_key[k]);
+                }
+                for (size_t k = 0; k < out.size() && k < in.size(); ++k) {
+                    const size_t a = out[k], b = in[k];
+                    const int32_t ea = owner[a].second, eb = owner[b].second;
+                    uint8_t* pa = l.blob[(size_t) ea];
+                    uint8_t* pb = l.blob[(size_t) eb];
+                    std::memcpy(tmp.data(), pa, l.fmt.bytes);
+                    std::memcpy(pa, pb, l.fmt.bytes);
+                    std::memcpy(pb, tmp.data(), l.fmt.bytes);
+                    std::swap(l.blob[(size_t) ea], l.blob[(size_t) eb]);
+                    std::swap(owner[a].second, owner[b].second);
+                    ++swaps;
+                }
+            }
+        }
+        std::fprintf(stderr, "lamina: --arena-place: %zu pinned places timed in %.1f s (mean %.1f GB/s, slow under %.1f): "
+                     "%zu slow (%.1f GiB), %zu of the CPU's %zu experts in them; %zu swapped%s\n", places.size(),
+                     ms_since(t0) / 1000.0, sum_gbs / (double) places.size(), cut, slow,
+                     (double) slow * (double) bytes / (double) (1ull << 30), cpu_slow, cpu, swaps, dry ? " (dry)" : "");
+    }
     /// A layer's experts, the most used first (ties by id)
     std::vector<int32_t> ranking(const Layer& l) const {
         std::vector<int32_t> order(l.use.size());
@@ -4368,6 +4453,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     double park_mib = 16384, reserve_mib = 6144;
     bool kv_grow = true;
     bool file_cache = true;   // the model file read through the OS file cache (--no-file-cache: past it)
+    bool arena_place = false;
     std::string kv = "fp16";
     bool use_mtp = true;
     std::string dfly_path;
@@ -4412,6 +4498,8 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
         else if (a == "--no-kv-grow") kv_grow = false;
         else if (a == "--file-cache") file_cache = true;
+        else if (a == "--arena-place") arena_place = true;   // the pinned places timed, the CPU's experts in the fast ones
+        else if (a == "--no-arena-place") arena_place = false;
         else if (a == "--no-file-cache") file_cache = false;
         else if (a == "--kv") kv = next();   // the sparse layers' K / V: fp16 or q8_0
         else if (a == "--no-mtp") use_mtp = false;   // the MTP block not loaded (no drafts)
@@ -4476,6 +4564,10 @@ int run_engine(int argc, char** argv, bool check_only) {
         E.chunk_min = std::max(1, prefill_min);
     }
     E.place_slots(expert_vram, tier_devs);
+    if (arena_place) {
+        const char* dry = std::getenv("LAMINA_ARENA_PLACE_DRY");
+        E.place_arena(dry != nullptr && std::atoi(dry) != 0);
+    }
     if (serve) {
         Serve sv(E, m.eos, drafts);
         const int rc = sv.run();
