@@ -793,6 +793,63 @@ __global__ void __launch_bounds__(256) k_route_w(const float* logits, const floa
     }
 }
 
+/// A draft's pick from one row of logits (n values): out[0] its argmax (the first of equal ones, as std::max_element),
+/// out[1] (a float's bits) sum exp(l - max), the probability's denominator.  One block of 1024; an online max and sum a
+/// thread, then the block's.
+__global__ void __launch_bounds__(1024) k_pick(const float* __restrict__ lg, int n, int32_t* __restrict__ out) {
+    __shared__ float sm_m[32], sm_s[32];
+    __shared__ int sm_i[32];
+    float m = -INFINITY, sum = 0.f;
+    int idx = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = lg[i];
+        if (v > m) {
+            sum = sum * expf(m - v) + 1.f;
+            m = v;
+            idx = i;
+        } else {
+            sum += expf(v - m);
+        }
+    }
+    auto merge = [](float& m1, float& s1, int& i1, float m2, float s2, int i2) {
+        if (m2 > m1 || (m2 == m1 && i2 < i1)) {
+            const float sc = m1 == -INFINITY ? 0.f : expf(m1 - m2);
+            s1 = s1 * sc + s2;
+            m1 = m2;
+            i1 = i2;
+        } else {
+            s1 += m2 == -INFINITY ? 0.f : s2 * expf(m2 - m1);
+        }
+    };
+    for (int d = 16; d > 0; d >>= 1) {
+        const float m2 = __shfl_xor_sync(0xffffffffu, m, d), s2 = __shfl_xor_sync(0xffffffffu, sum, d);
+        const int i2 = __shfl_xor_sync(0xffffffffu, idx, d);
+        merge(m, sum, idx, m2, s2, i2);
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        sm_m[warp] = m;
+        sm_s[warp] = sum;
+        sm_i[warp] = idx;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = blockDim.x >> 5;
+        m = lane < nw ? sm_m[lane] : -INFINITY;
+        sum = lane < nw ? sm_s[lane] : 0.f;
+        idx = lane < nw ? sm_i[lane] : 0x7fffffff;
+        for (int d = 16; d > 0; d >>= 1) {
+            const float m2 = __shfl_xor_sync(0xffffffffu, m, d), s2 = __shfl_xor_sync(0xffffffffu, sum, d);
+            const int i2 = __shfl_xor_sync(0xffffffffu, idx, d);
+            merge(m, sum, idx, m2, s2, i2);
+        }
+        if (lane == 0) {
+            out[0] = idx;
+            out[1] = __float_as_int(sum);
+        }
+    }
+}
+
 /// The CPU pool's rows into the entries' rows: parts[e] = cpu[e] where miss[e].  A block per entry.
 __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss, int n) {
     const int e = blockIdx.x;

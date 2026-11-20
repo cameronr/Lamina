@@ -1186,6 +1186,8 @@ struct Engine {
         h_valid = halloc<float>(T);
         h_ids = halloc<int32_t>(T * (size_t) g.top_k);
         h_tok = halloc<int32_t>(T);
+        pick_d = dalloc<int32_t>(2);
+        h_pick = halloc<int32_t>(2);
         h_pos = halloc<int32_t>(T);
         if (vision) {
             img_rows_d = dalloc<float>(T * N);
@@ -1988,7 +1990,7 @@ struct Engine {
 
     void dense_ffn(Layer& l, int T) {
         const auto& g = m->g;
-        const int N = (int) g.n_embd, hc = (int) g.hc;
+        const int N = (int) g.n_embd;
         mmvq(l.f_gate, xq, fg, T);
         mmvq(l.f_up, xq, fu, T);
         hy4k::k_swiglu<<<blocks((int64_t) T * g.n_ff), hy4k::kThreads, 0, st>>>(fg, fu, fh, (int64_t) T * g.n_ff);
@@ -2269,7 +2271,6 @@ struct Engine {
         hy4k::k_add<<<blocks(WN), hy4k::kThreads, 0, st>>>(dfly_h, dfly_res, WN);
         hy4k::k_rms<<<W, hy4k::kThreads, 0, st>>>(dfly_h, N, d.norm, dfly_out, N, N, g.eps);
         // the drafts: row k + 1's state + down(silu(gate) * up([hidden_norm(it) | embed_norm(the last token)]))
-        std::vector<float> lg((size_t) g.n_vocab);
         double joint = 1.0;
         for (int k = 0; k < n; ++k) {
             const float* hk = dfly_out + (size_t) (k + 1) * N;
@@ -2290,17 +2291,9 @@ struct Engine {
             hy4k::k_add<<<blocks(N), hy4k::kThreads, 0, st>>>(dfly_d, hk, N);
             if (dump && k == 0) dfly_dump(anchor, bonus, W, src);
             K::bf16_gemv_fp32_mmvf_multi(dfly_d, m->head, dfly_lg, N, g.n_vocab, 1, st);
-            CK(cudaMemcpyAsync(lg.data(), dfly_lg, lg.size() * 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            const auto top = std::max_element(lg.begin(), lg.end());
-            if (spec_min_p > 0.f) {   // the draft's probability under the head: 1 / sum exp(l - max)
-                const float mx = *top;
-                float z = 0.f;
-                for (const float v : lg) z += expf(v - mx);
-                joint /= (double) z;
-                if (joint < spec_min_p) break;
-            }
-            out.push_back((int32_t) (top - lg.begin()));
+            const int32_t tok = pick_draft(dfly_lg, joint);
+            if (tok < 0) break;
+            out.push_back(tok);
         }
         return out;
     }
@@ -2417,26 +2410,32 @@ struct Engine {
 
     /// Greedy drafts after `rows` (tokens at positions p0 .., the last the token they follow, every row's state in the
     /// ring): one pass for the rows and the first draft, then each next draft from the last one's output state.
+    /// A draft from a row of the drafter's logits on the device: its argmax and its probability under them
+    /// (1 / sum exp(l - max)) by k_pick, 8 bytes to the host; -1 once the drafts' joint probability falls below
+    /// --spec-min-p (`joint` the product so far)
+    int32_t pick_draft(const float* lg_d, double& joint) {
+        hy4k::k_pick<<<1, 1024, 0, st>>>(lg_d, (int) m->g.n_vocab, pick_d);
+        CK(cudaMemcpyAsync(h_pick, pick_d, 8, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        if (spec_min_p > 0.f) {
+            float z = 0.f;
+            std::memcpy(&z, &h_pick[1], 4);
+            joint /= (double) z;
+            if (joint < spec_min_p) return -1;
+        }
+        return h_pick[0];
+    }
+    int32_t *pick_d = nullptr, *h_pick = nullptr;
     std::vector<int32_t> draft(const std::vector<int32_t>& rows, int64_t p0, int n) {
         std::vector<int32_t> out, src(rows.size());
-        std::vector<float> lg;
         for (size_t i = 0; i < rows.size(); ++i) src[i] = ring_src(p0 + (int64_t) i);
         mtp_forward(rows.data(), src.data(), (int) rows.size(), p0, true);
         int64_t at = p0 + (int64_t) rows.size();
         double joint = 1.0;
         for (int i = 0; i < n; ++i) {
-            lg.resize((size_t) m->g.n_vocab);
-            CK(cudaMemcpyAsync(lg.data(), mtp_lg, lg.size() * 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            const auto top = std::max_element(lg.begin(), lg.end());
-            if (spec_min_p > 0.f) {   // the draft's probability under the head: 1 / sum exp(l - max)
-                const float mx = *top;
-                float z = 0.f;
-                for (const float v : lg) z += expf(v - mx);
-                joint /= (double) z;
-                if (joint < spec_min_p) break;
-            }
-            out.push_back((int32_t) (top - lg.begin()));
+            const int32_t pick = pick_draft(mtp_lg, joint);
+            if (pick < 0) break;
+            out.push_back(pick);
             if (i + 1 == n) break;
             const int32_t tok = out.back(), own = -1;   // mtp_h row 0
             mtp_forward(&tok, &own, 1, at++, true);
