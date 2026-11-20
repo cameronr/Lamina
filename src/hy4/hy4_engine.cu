@@ -1542,6 +1542,106 @@ struct Engine {
         std::fprintf(stderr, "lamina: the context takes the main GPU's expert slots %d -> %d a layer (%d experts moved "
                      "down, %d gone)\n", S, s2, moved, gone);
     }
+    /// n chunks for a buffer the prompt path maps for a while: the spare ones, the free VRAM above kReserve (new chunks),
+    /// the rest from the main GPU's last slots (shrink_main puts theirs in spare)
+    bool lend_chunks(int64_t n) {
+        if (!elastic) return false;
+        if ((int64_t) spare.size() >= n) return true;
+        const uint64_t G = lamina::core::vmm_granularity();
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const int64_t free_chunks = fr > kReserve ? (int64_t) ((fr - kReserve) / G) : 0;
+        const int64_t short_by = n - (int64_t) spare.size() - free_chunks;
+        if (short_by <= 0) return true;
+        if (gpus.empty() || gpus[0].S <= 0) return false;
+        CK(cudaStreamSynchronize(st));
+        settle(true);   // no copy in flight into a slot that moves or goes
+        lent_from.assign(m->layers.size(), {});   // the residents, for queue_restore
+        for (size_t li = 0; li < m->layers.size(); ++li) {
+            const Layer& l = m->layers[li];
+            if (l.dense || l.held.empty()) continue;
+            for (const int32_t e : l.held[0].slot_expert)
+                if (e >= 0) lent_from[li].push_back(e);
+        }
+        shrink_main(short_by);
+        return true;
+    }
+    /// The main GPU's residents before a lend (lend_chunks), and the copies that put the ones it displaced back into the
+    /// slots that came back (queue_restore), served by pump ahead of the plan's
+    std::vector<std::vector<int32_t>> lent_from;
+    std::vector<Planned> restore;
+    size_t restore_next = 0;
+    /// The residents a lend displaced, queued back into the main GPU's empty slots (the most used first): the state the
+    /// answer had before the prompt, not the prompt's routing's
+    int queue_restore() {
+        restore.clear();
+        restore_next = 0;
+        for (size_t li = 0; li < lent_from.size() && li < m->layers.size(); ++li) {
+            Layer& l = m->layers[li];
+            if (lent_from[li].empty() || l.held.empty()) continue;
+            std::vector<int32_t> back;
+            for (const int32_t e : lent_from[li]) {
+                bool held = l.moving[(size_t) e] != 0;
+                for (const SlotSet& o : l.held) held = held || (o.n > 0 && o.slot_of[(size_t) e] >= 0);
+                if (!held) back.push_back(e);
+            }
+            std::stable_sort(back.begin(), back.end(),
+                             [&](int32_t a, int32_t b) { return l.use[(size_t) a] > l.use[(size_t) b]; });
+            const SlotSet& s0 = l.held[0];
+            size_t bi = 0;
+            for (int k = 0; k < s0.n && bi < back.size(); ++k)
+                if (s0.slot_expert[(size_t) k] == -1) restore.push_back({1e9f, (int) li, 0, k, back[bi++], -1});
+        }
+        lent_from.clear();
+        const int n = (int) restore.size();
+        pump();
+        return n;
+    }
+    /// The main GPU's slots back toward s_max from the spare chunks and the free VRAM above kReserve (after the prompt
+    /// path's lent buffers went); they come back empty, the mover's next plan fills them.
+    void slots_back() {
+        if (!elastic || gpus.empty() || gpus[0].S >= s_max) return;
+        const uint64_t G = lamina::core::vmm_granularity();
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const int64_t avail = (int64_t) spare.size() + (fr > kReserve ? (int64_t) ((fr - kReserve) / G) : 0);
+        auto needs = [&](int n) {
+            int64_t k = 0;
+            for (const Layer& l : m->layers)
+                if (l.slot_vm) {
+                    const int64_t hi = (int64_t) (((uint64_t) n * l.stride + G - 1) / G);
+                    for (int64_t c = 0; c < std::min(hi, l.slot_vm->chunks()); ++c) k += l.slot_vm->mapped(c) ? 0 : 1;
+                }
+            return k;
+        };
+        const int S = gpus[0].S;
+        int s2 = S;
+        while (s2 < s_max && needs(s2 + 1) <= avail) ++s2;
+        if (s2 <= S) return;
+        auto take = [&]() -> lamina::core::VmmChunk {
+            if (spare.empty()) return 0;
+            const lamina::core::VmmChunk h = spare.back();
+            spare.pop_back();
+            return h;
+        };
+        int got = S;
+        for (Layer& l : m->layers) {
+            if (!l.slot_vm) continue;
+            const int64_t hi = (int64_t) (((uint64_t) s2 * l.stride + G - 1) / G);
+            if (!l.slot_vm->map_range(0, hi, take)) {
+                std::fprintf(stderr, "lamina: the main GPU's slots could not grow back past %d\n", got);
+                s2 = got;
+                break;
+            }
+        }
+        for (Layer& l : m->layers) {
+            if (!l.slot_vm) continue;
+            l.held[0].n = s2;
+            l.held[0].slot_expert.resize((size_t) s2, -1);
+        }
+        gpus[0].S = s2;
+        std::fprintf(stderr, "lamina: the main GPU's expert slots back %d -> %d a layer\n", S, s2);
+    }
     /// After a request: the K/V's chunks past what the state needs (two steps of room) go back to the main GPU's slots,
     /// which come back empty (the rebalance fills them); chunks no slot takes are freed.
     void relax() {
@@ -1598,6 +1698,10 @@ struct Engine {
     // or more: pieces as even as chunk_cap allows), else forwards of kMaxT rows
     std::function<void(const int32_t*, int)> chunk_fn;
     int64_t chunk_cap = 0, chunk_min = 0;
+    // --prefill-pass: a part of two chunks or more in chunks of up to pass_cap rows while pass_fn(true) has their
+    // buffers (pass_fn(false) after the part gives them back)
+    int64_t pass_cap = 0;
+    std::function<bool(bool)> pass_fn;
     /// n tokens into the state; `on(done)` after each piece (false: stop there).  Returns the logits row of the last
     /// token (host_logits), -1 when stopped first.
     std::vector<int64_t> chunk_snaps;   // the multiples of kSnapEvery inside the next chunk: snapshots taken there
@@ -1611,8 +1715,13 @@ struct Engine {
             const int64_t p = pos();
             const bool chunks = chunk_fn && n - done >= chunk_min;
             const int64_t seg = chunks ? n - done : std::min<int64_t>(n - done, (p / kSnapEvery + 1) * kSnapEvery - p);
-            const int64_t step = chunks ? chunk_cap : kMaxT, pieces = (seg + step - 1) / step,
+            const bool passes = chunks && pass_fn && pass_cap > chunk_cap && seg >= 2 * chunk_cap && pass_fn(true);
+            const int64_t step = passes ? pass_cap : chunks ? chunk_cap : kMaxT, pieces = (seg + step - 1) / step,
                           size = (seg + pieces - 1) / pieces;
+            struct PassEnd {   // the pass's buffers back however the part ends
+                const std::function<bool(bool)>* fn;
+                ~PassEnd() { if (fn) (*fn)(false); }
+            } pass_end{passes ? &pass_fn : nullptr};
             for (int64_t sd = 0; sd < seg;) {
                 const int T = (int) std::min<int64_t>(size, seg - sd);
                 settle(false);
@@ -3061,6 +3170,28 @@ struct Engine {
         int started = 0;
         for (size_t gi = 0; gi < gpus.size(); ++gi) {
             Gpu& gp = gpus[gi];
+            if (gi == 0 && restore_next < restore.size()) {   // the residents a lend displaced, ahead of the plan
+                size_t blob = 0;
+                for (const Layer& l : m->layers)
+                    if (!l.dense) blob = std::max(blob, l.fmt.bytes);
+                const size_t cap = std::max<size_t>(8, (size_t) (gp.h2d_gbps * 1e9 * kMoveWindowMs / 1000.0 /
+                                                                 (double) std::max<size_t>(blob, 1)));
+                while (gp.moves.size() < cap && restore_next < restore.size()) {
+                    const Planned c = restore[restore_next++];
+                    Layer& l = m->layers[(size_t) c.li];
+                    const SlotSet& s0 = l.held[0];
+                    if (c.k >= s0.n || s0.slot_expert[(size_t) c.k] != -1 || l.moving[(size_t) c.e]) continue;
+                    bool held = false;
+                    for (const SlotSet& so : l.held) held = held || (so.n > 0 && so.slot_of[(size_t) c.e] >= 0);
+                    if (held) continue;
+                    issue(c.li, 0, c.k, c.e);
+                    ++started;
+                }
+                if (restore_next >= restore.size()) {
+                    restore.clear();
+                    restore_next = 0;
+                }
+            }
             if (gp.next >= gp.backlog.size()) continue;
             size_t blob = 0;
             for (const Layer& l : m->layers)
@@ -3102,6 +3233,7 @@ struct Engine {
         pump();
     }
     bool moves_waiting() const {
+        if (restore_next < restore.size()) return true;
         for (const Gpu& gp : gpus)
             if (gp.next < gp.backlog.size()) return true;
         return false;
@@ -3365,6 +3497,17 @@ struct Prompt {
     int32_t* posc = nullptr;
     uint8_t* erawc = nullptr;
     int eng_T = 0, hids_T = -1;
+    // the main GPU's buffers a chunk's MoE and streams take whole: --prefill's rows (base, kept), the pass's (lent:
+    // allocated by pass_begin for a part, freed by pass_end); the running set in the members below
+    struct Bufs {
+        float *X = nullptr, *y = nullptr, *sy = nullptr, *post = nullptr, *evalid = nullptr, *wts = nullptr,
+              *rin = nullptr, *tmp = nullptr, *acc = nullptr;
+        uint8_t *eraw = nullptr, *mq = nullptr, *tq = nullptr;
+        int32_t *ids = nullptr, *tok_d = nullptr, *pos_d = nullptr;
+    };
+    Bufs base, lent;
+    bool lent_live = false;
+    int rows_now = 0;   // the running set's rows
     int64_t pass_p0 = 0;      // the running pass's first position
     int min_rows = 32;        // a shorter part goes through the decode's forwards
     static constexpr int kG = hy4p::kQRows;   // heads a pass
@@ -3471,13 +3614,13 @@ struct Prompt {
         const size_t PR = (size_t) pass;   // a pass's rows: the streams' buffers and the MoE pass's
         size_t hmax = 0;
         for (const Layer& l : m->layers) hmax = std::max<size_t>(hmax, (size_t) l.H);
-        X = dalloc<float>(PR * hc * N);
+        X = dalloc<float>(T * hc * N);
         xh = dalloc<float>(T * N);
         xn = dalloc<float>(T * N);
-        y = dalloc<float>(PR * N);
-        sy = dalloc<float>(PR * N);
+        y = dalloc<float>(T * N);
+        sy = dalloc<float>(T * N);
         emb = dalloc<float>(T * N);
-        post = dalloc<float>(PR * hc);
+        post = dalloc<float>(T * hc);
         xq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) N));
         qa = dalloc<float>(T * (size_t) g.q_lora);
         qrq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, g.q_lora));
@@ -3504,9 +3647,9 @@ struct Prompt {
         cells = dalloc<int32_t>(T * (size_t) g.idx_top_k);
         ncells = dalloc<int32_t>(T);
         const size_t n_mod = g.eng_layers.size(), eh = (size_t) g.eng_heads(), ed = (size_t) g.eng_dim;
-        eraw = dalloc<uint8_t>(n_mod * PR * eh * ed);
+        eraw = dalloc<uint8_t>(n_mod * T * eh * ed);
         erows = dalloc<float>(T * eh * ed);
-        evalid = dalloc<float>(PR);
+        evalid = dalloc<float>(T);
         const size_t sub = std::min<size_t>(T, kSub);
         size_t widest = std::max<size_t>(eh * ed, N);
         subq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) sub, (int64_t) std::max<size_t>(widest, (size_t) g.n_ff)));
@@ -3515,17 +3658,17 @@ struct Prompt {
         fu = dalloc<float>(sub * (size_t) g.n_ff);
         fh = dalloc<float>(sub * (size_t) g.n_ff);
         logits_r = dalloc<float>(T * Ex);
-        ids = dalloc<int32_t>(PR * K);
-        wts = dalloc<float>(PR * K);
-        rin = dalloc<float>(PR * Ld);
+        ids = dalloc<int32_t>(T * K);
+        wts = dalloc<float>(T * K);
+        rin = dalloc<float>(T * Ld);
         sg = dalloc<float>(T * F);
         su = dalloc<float>(T * F);
         sh = dalloc<float>(T * F);
         shq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) F));
-        mq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
-        tmp = dalloc<float>(PR * Ld);
-        tok_d = dalloc<int32_t>(PR);
-        pos_d = dalloc<int32_t>(PR);
+        mq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
+        tmp = dalloc<float>(T * Ld);
+        tok_d = dalloc<int32_t>(T);
+        pos_d = dalloc<int32_t>(T);
         h_ids = halloc<int32_t>(PR * K);
         h_wts = halloc<float>(PR * K);
         h_tok = halloc<int32_t>(PR);
@@ -3585,13 +3728,13 @@ struct Prompt {
             CK(cudaEventRecord(d.used[0], d.st));
             CK(cudaEventRecord(d.used[1], d.st));
             d.mmq = std::make_unique<MMQ::Context>();
-            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
+            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) (i == 0 ? T : PR), (int64_t) Ld));
             d.eq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) Ld));
             d.gu = dalloc<float>((size_t) kEmax * 2 * F);
             d.h = dalloc<float>((size_t) kEmax * F);
             d.hq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) F));
             d.rows = dalloc<float>((size_t) kEmax * Ld);
-            d.acc = dalloc<float>(PR * Ld);
+            d.acc = dalloc<float>((i == 0 ? T : PR) * Ld);
             d.ident_rows = MMQ::ids_table_rows(kEmax);
             d.ident = dalloc<int32_t>((size_t) d.ident_rows);
             MMQ::iota(d.ident, d.ident_rows, d.st);
@@ -3627,15 +3770,142 @@ struct Prompt {
                                 (int) sizeof(hy4p::AttnSmem)));
         CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int) sizeof(hy4p::AttnSmem)));
-        std::fprintf(stderr, "lamina: prompts in chunks of up to %d rows%s; the experts no GPU holds on GPU %d%s\n", pass,
-                     pass > cap ? (", the experts' pass over them all, the rest " + std::to_string(cap) +
-                                   " rows at a time").c_str() : "",
+        base = take();
+        rows_now = cap;
+        if (pass > cap && E.elastic) {
+            lent_vm = std::make_unique<lamina::core::VmmRange>();
+            if (!lent_vm->reserve(lent_total())) lent_vm.reset();
+        }
+        if (pass > cap && !lent_vm) pass = cap;   // no VMM: no passes
+        char lend_note[192] = "";
+        if (pass > cap)
+            std::snprintf(lend_note, sizeof lend_note, " (a part of two or more: of up to %d, the experts' pass over them "
+                          "all, %.2f GiB of the main GPU's slots lent to it)", pass,
+                          (double) lent_total() / (double) (1ull << 30));
+        std::fprintf(stderr, "lamina: prompts in chunks of up to %d rows%s; the experts no GPU holds on GPU %d%s\n", cap,
+                     lend_note,
                      devs[(size_t) streamer].dev,
                      devs.size() > 1 ? (" (" + std::to_string((int) best) + " GB/s from pinned memory)").c_str() : "");
         ok = true;
         return true;
     }
     int main_dev = 0;
+    std::unique_ptr<lamina::core::VmmRange> lent_vm;   // the lent set's addresses (mapped while a part runs in passes)
+    double lend_ms = 0;
+
+    Bufs take() const {
+        Bufs b;
+        b.X = X;
+        b.y = y;
+        b.sy = sy;
+        b.post = post;
+        b.evalid = evalid;
+        b.wts = wts;
+        b.rin = rin;
+        b.tmp = tmp;
+        b.acc = devs[0].acc;
+        b.eraw = eraw;
+        b.mq = mq;
+        b.tq = devs[0].tq;
+        b.ids = ids;
+        b.tok_d = tok_d;
+        b.pos_d = pos_d;
+        return b;
+    }
+    void use(const Bufs& b, int rows) {
+        X = b.X;
+        y = b.y;
+        sy = b.sy;
+        post = b.post;
+        evalid = b.evalid;
+        wts = b.wts;
+        rin = b.rin;
+        tmp = b.tmp;
+        devs[0].acc = b.acc;
+        eraw = b.eraw;
+        mq = b.mq;
+        devs[0].tq = b.tq;
+        ids = b.ids;
+        tok_d = b.tok_d;
+        pos_d = b.pos_d;
+        rows_now = rows;
+    }
+    /// The lent set's buffers' bytes, in Bufs' order (each rounded to 512 in the allocation)
+    std::vector<size_t> lent_sizes() const {
+        const auto& g = m->g;
+        const size_t R = (size_t) pass, N = (size_t) g.n_embd, hc = (size_t) g.hc, Ld = (size_t) g.n_latent,
+                     K = (size_t) g.top_k, n_mod = g.eng_layers.size(), eh = (size_t) g.eng_heads(), ed = (size_t) g.eng_dim;
+        return {R * hc * N * 4, R * N * 4, R * N * 4, R * hc * 4, R * 4, R * K * 4, R * Ld * 4, R * Ld * 4, R * Ld * 4,
+                n_mod * R * eh * ed, MMQ::q8_bytes((int64_t) R, (int64_t) Ld), MMQ::q8_bytes((int64_t) R, (int64_t) Ld),
+                R * K * 4, R * 4, R * 4};
+    }
+    size_t lent_total() const {
+        size_t t = 0;
+        for (const size_t z : lent_sizes()) t += (z + 511) / 512 * 512;
+        return t;
+    }
+    /// The pass's buffers for a part, mapped from the chunks the main GPU's last slots give up (Engine::lend_chunks)
+    /// and its free VRAM; false: no VMM or too few slots (the part runs in --prefill's chunks)
+    bool pass_begin() {
+        if (pass <= cap || !lent_vm) return false;
+        if (lent_live) return true;
+        const auto t0 = Clock::now();
+        const int64_t n = lent_vm->chunks();
+        if (!E.lend_chunks(n)) return false;
+        auto take = [&]() -> lamina::core::VmmChunk {
+            if (E.spare.empty()) return 0;
+            const lamina::core::VmmChunk h = E.spare.back();
+            E.spare.pop_back();
+            return h;
+        };
+        if (!lent_vm->map_range(0, n, take)) {
+            for (int64_t c = 0; c < n; ++c)
+                if (lent_vm->mapped(c)) E.spare.push_back(lent_vm->unmap(c));
+            E.slots_back();
+            return false;
+        }
+        const std::vector<size_t> z = lent_sizes();
+        size_t at = 0;
+        auto carve = [&](size_t i) {
+            uint8_t* q = lent_vm->base() + at;
+            at += (z[i] + 511) / 512 * 512;
+            return q;
+        };
+        lent.X = (float*) carve(0);
+        lent.y = (float*) carve(1);
+        lent.sy = (float*) carve(2);
+        lent.post = (float*) carve(3);
+        lent.evalid = (float*) carve(4);
+        lent.wts = (float*) carve(5);
+        lent.rin = (float*) carve(6);
+        lent.tmp = (float*) carve(7);
+        lent.acc = (float*) carve(8);
+        lent.eraw = carve(9);
+        lent.mq = carve(10);
+        lent.tq = carve(11);
+        lent.ids = (int32_t*) carve(12);
+        lent.tok_d = (int32_t*) carve(13);
+        lent.pos_d = (int32_t*) carve(14);
+        use(lent, pass);
+        lent_live = true;
+        lend_ms = ms_since(t0);
+        return true;
+    }
+    /// The pass's buffers' chunks back to the main GPU's slots after a part (they come back empty, the mover fills them)
+    void pass_end() {
+        if (!lent_live) return;
+        CK(cudaStreamSynchronize(st));
+        use(base, cap);
+        const auto t0 = Clock::now();
+        for (int64_t c = 0; c < lent_vm->chunks(); ++c)
+            if (lent_vm->mapped(c)) E.spare.push_back(lent_vm->unmap(c));
+        lent_live = false;
+        E.slots_back();
+        const int q = E.queue_restore();
+        std::fprintf(stderr, "lamina: the prompt's pass buffers %.2f GiB lent by the main GPU's slots (%.0f ms, back %.0f "
+                     "ms, %d residents queued back)\n", (double) lent_total() / (double) (1ull << 30), lend_ms,
+                     ms_since(t0), q);
+    }
 
     unsigned blocks(int64_t n) const { return (unsigned) ((n + hy4k::kThreads - 1) / hy4k::kThreads); }
     void dense(const Mat& w, const uint8_t* x, int T, float* out, int64_t rows = 0, size_t row0 = 0, int64_t ld = 0) {
@@ -3651,6 +3921,10 @@ struct Prompt {
     /// T rows (tokens toks at positions pos() ..) through the model; the last row's logits into the engine's logits row 0.
     void run(const int32_t* toks, int T) {
         const auto& g = m->g;
+        if (T > rows_now) {
+            std::fprintf(stderr, "lamina: a prompt chunk of %d rows, its buffers %d\n", T, rows_now);
+            throw Fatal{1};
+        }
         const int N = (int) g.n_embd, hc = (int) g.hc;
         E.ensure(E.pos() + T);
         const int64_t p0 = E.pos();
@@ -4564,7 +4838,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--no-graph") graphs = false;
         else if (a == "--prefill") prefill = std::atoi(next());            // rows a prompt chunk (0: the decode's forwards)
         else if (a == "--prefill-min") prefill_min = std::atoi(next());    // a shorter prompt part: the decode's forwards
-        else if (a == "--prefill-pass") prefill_pass = std::atoi(next());  // rows of the experts' pass (0: --prefill's)
+        else if (a == "--prefill-pass") prefill_pass = std::atoi(next());  // rows of a long part's chunks (0: none)
         else if (a == "--arena-pin") arena_pin = std::atof(next());        // GiB of the arena in pinned memory at most
         else if (a == "--park-mib" || a == "--conversation-cache-mib") park_mib = std::atof(next());
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
@@ -4634,7 +4908,13 @@ int run_engine(int argc, char** argv, bool check_only) {
     const bool mtp_kept = E.drafts_on && m.has_mtp;
     if (prefill > 0 && P.init(prefill, tier_devs, mtp_kept ? 0 : prefill_pass)) {
         E.chunk_fn = [&P](const int32_t* t, int n) { P.run(t, n); };
-        E.chunk_cap = P.pass;
+        E.chunk_cap = P.cap;
+        E.pass_cap = P.pass;
+        E.pass_fn = [&P](bool on) {
+            if (on) return P.pass_begin();
+            P.pass_end();
+            return false;
+        };
         E.chunk_min = std::max(1, prefill_min);
     }
     E.place_slots(expert_vram, tier_devs);
@@ -4741,7 +5021,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         std::fprintf(stderr, "lamina: GPU %d, %s: %.1f%% of the routed entries\n", gp.dev, gp.name.c_str(),
                      E.lookups ? 100.0 * (double) gp.hits / (double) E.lookups : 0.0);
     std::fprintf(stderr, "lamina: MiB of VRAM free: %s\n", E.vram_free().c_str());
-    if (windows > 0)
+    if (windows > 0)    if (windows > 0)
         std::fprintf(stderr, "lamina: %lld windows (%lld looked up), %lld drafts offered, %lld kept (%.1f%%), %.2f tokens "
                      "a window\n", (long long) windows, (long long) E.looked_windows, (long long) offered, (long long) kept,
                      offered ? 100.0 * (double) kept / (double) offered : 0.0, (double) gen.size() / (double) windows);
