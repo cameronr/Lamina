@@ -1600,7 +1600,7 @@ struct Engine {
     int64_t chunk_cap = 0, chunk_min = 0;
     /// n tokens into the state; `on(done)` after each piece (false: stop there).  Returns the logits row of the last
     /// token (host_logits), -1 when stopped first.
-    int64_t chunk_snap = -1;   // a multiple of kSnapEvery inside the next chunk: its snapshot taken there (Prompt::run)
+    std::vector<int64_t> chunk_snaps;   // the multiples of kSnapEvery inside the next chunk: snapshots taken there
     int feed(const int32_t* toks, int64_t n, const std::function<bool(int64_t)>& on) {
         int64_t done = 0;
         int last = 0;
@@ -1621,10 +1621,12 @@ struct Engine {
                     pump();
                 }
                 if (chunks) {
-                    const int64_t p0 = pos(), mark = (p0 / kSnapEvery + 1) * kSnapEvery;
-                    chunk_snap = mark < p0 + T ? mark : -1;
+                    const int64_t p0 = pos();
+                    chunk_snaps.clear();
+                    for (int64_t mk = (p0 / kSnapEvery + 1) * kSnapEvery; mk < p0 + T; mk += kSnapEvery)
+                        chunk_snaps.push_back(mk);
                     chunk_fn(toks + done + sd, T);
-                    chunk_snap = -1;
+                    chunk_snaps.clear();
                     if (pos() % kSnapEvery == 0 && done + sd + T < n) {   // the piece ends at a multiple
                         std::vector<float> lg;
                         host_logits(0, lg);
@@ -3354,7 +3356,15 @@ struct MoeDev {
 struct Prompt {
     Engine& E;
     Model* m = nullptr;
-    int cap = 0;              // rows a chunk
+    int cap = 0;              // rows a chunk's dense steps take at once (a sub-chunk of a pass)
+    int pass = 0;             // rows the MoE takes at once (--prefill-pass; cap when off): a chunk's rows
+    // a sub-chunk's views of the pass's buffers (front, attend, indexer, dense_ffn): its streams, post weights, positions,
+    // Engram rows (eng_T the pass's rows: a module's stride) and their valid flags
+    float *Xc = nullptr, *postc = nullptr, *evalidc = nullptr;
+    int32_t* posc = nullptr;
+    uint8_t* erawc = nullptr;
+    int eng_T = 0, hids_T = -1;
+    int64_t pass_p0 = 0;      // the running pass's first position
     int min_rows = 32;        // a shorter part goes through the decode's forwards
     static constexpr int kG = hy4p::kQRows;   // heads a pass
     static constexpr int kEmax = 4096;        // a group's entries at most
@@ -3383,10 +3393,10 @@ struct Prompt {
     uint8_t *tq_h = nullptr, *h_raw = nullptr;
     uint32_t* h_rows = nullptr;
     std::vector<MoeDev> devs;   // [0] the main GPU, then the tiers in Engine::gpus' order
-    // a snapshot inside a chunk (Engine::chunk_snap): its bytes on the main GPU as snapshot() lays them out, each window
-    // layer's ring at ring_off[il], each indexer layer's tail at tail_off[il] (of the cache layers, the MTP block's at
-    // [n_layers]), the drafters' ring at hring_off
-    uint8_t* snap_dev = nullptr;
+    // the snapshots inside a chunk (Engine::chunk_snaps, one buffer each): their bytes on the main GPU as snapshot() lays
+    // them out, each window layer's ring at ring_off[il], each indexer layer's tail at tail_off[il] (of the cache layers,
+    // the MTP block's at [n_layers]), the drafters' ring at hring_off
+    std::vector<uint8_t*> snap_devs;
     std::vector<size_t> ring_off, tail_off;
     size_t hring_off = 0, snap_size = 0;
     size_t stage_bytes = 0;
@@ -3410,9 +3420,10 @@ struct Prompt {
 
     /// The buffers of a chunk of `rows` on the main GPU and on each of `tier_devs` (before their slots take the rest);
     /// false (with a note) where MMQ cannot run one of the model's products.
-    bool init(int rows, const std::vector<int>& tier_devs) {
+    bool init(int rows, const std::vector<int>& tier_devs, int pass_rows = 0) {
         const auto& g = m->g;
         cap = std::max(kMaxT + 1, rows);
+        pass = std::max(cap, pass_rows);
         std::vector<const Layer*> checked;
         for (const Layer& l : m->layers) checked.push_back(&l);
         if (m->has_mtp) checked.push_back(&m->mtp);
@@ -3452,15 +3463,16 @@ struct Prompt {
         }
         const size_t T = (size_t) cap, N = (size_t) g.n_embd, hc = (size_t) g.hc, Ld = (size_t) g.n_latent,
                      F = (size_t) g.n_ff_exp, Ex = (size_t) g.n_expert, K = (size_t) g.top_k;
+        const size_t PR = (size_t) pass;   // a pass's rows: the streams' buffers and the MoE pass's
         size_t hmax = 0;
         for (const Layer& l : m->layers) hmax = std::max<size_t>(hmax, (size_t) l.H);
-        X = dalloc<float>(T * hc * N);
+        X = dalloc<float>(PR * hc * N);
         xh = dalloc<float>(T * N);
         xn = dalloc<float>(T * N);
-        y = dalloc<float>(T * N);
-        sy = dalloc<float>(T * N);
+        y = dalloc<float>(PR * N);
+        sy = dalloc<float>(PR * N);
         emb = dalloc<float>(T * N);
-        post = dalloc<float>(T * hc);
+        post = dalloc<float>(PR * hc);
         xq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) N));
         qa = dalloc<float>(T * (size_t) g.q_lora);
         qrq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, g.q_lora));
@@ -3487,9 +3499,9 @@ struct Prompt {
         cells = dalloc<int32_t>(T * (size_t) g.idx_top_k);
         ncells = dalloc<int32_t>(T);
         const size_t n_mod = g.eng_layers.size(), eh = (size_t) g.eng_heads(), ed = (size_t) g.eng_dim;
-        eraw = dalloc<uint8_t>(n_mod * T * eh * ed);
+        eraw = dalloc<uint8_t>(n_mod * PR * eh * ed);
         erows = dalloc<float>(T * eh * ed);
-        evalid = dalloc<float>(T);
+        evalid = dalloc<float>(PR);
         const size_t sub = std::min<size_t>(T, kSub);
         size_t widest = std::max<size_t>(eh * ed, N);
         subq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) sub, (int64_t) std::max<size_t>(widest, (size_t) g.n_ff)));
@@ -3498,25 +3510,25 @@ struct Prompt {
         fu = dalloc<float>(sub * (size_t) g.n_ff);
         fh = dalloc<float>(sub * (size_t) g.n_ff);
         logits_r = dalloc<float>(T * Ex);
-        ids = dalloc<int32_t>(T * K);
-        wts = dalloc<float>(T * K);
-        rin = dalloc<float>(T * Ld);
+        ids = dalloc<int32_t>(PR * K);
+        wts = dalloc<float>(PR * K);
+        rin = dalloc<float>(PR * Ld);
         sg = dalloc<float>(T * F);
         su = dalloc<float>(T * F);
         sh = dalloc<float>(T * F);
         shq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) F));
-        mq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
-        tmp = dalloc<float>(T * Ld);
-        tok_d = dalloc<int32_t>(T);
-        pos_d = dalloc<int32_t>(T);
-        h_ids = halloc<int32_t>(T * K);
-        h_wts = halloc<float>(T * K);
-        h_tok = halloc<int32_t>(T);
-        h_pos = halloc<int32_t>(T);
-        h_valid = halloc<float>(T);
-        h_rows = halloc<uint32_t>(n_mod * T * eh);
-        h_raw = halloc<uint8_t>(n_mod * T * eh * ed);
-        tq_h = halloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
+        mq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
+        tmp = dalloc<float>(PR * Ld);
+        tok_d = dalloc<int32_t>(PR);
+        pos_d = dalloc<int32_t>(PR);
+        h_ids = halloc<int32_t>(PR * K);
+        h_wts = halloc<float>(PR * K);
+        h_tok = halloc<int32_t>(PR);
+        h_pos = halloc<int32_t>(PR);
+        h_valid = halloc<float>(PR);
+        h_rows = halloc<uint32_t>(n_mod * PR * eh);
+        h_raw = halloc<uint8_t>(n_mod * PR * eh * ed);
+        tq_h = halloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
         for (const Layer& l : m->layers) stage_bytes = std::max(stage_bytes, l.stride);
         {
             ring_off.assign((size_t) g.n_layers + 1, 0);
@@ -3540,12 +3552,14 @@ struct Prompt {
                 std::fprintf(stderr, "lamina: the snapshot's layout differs from the engine's\n");
                 return false;
             }
-            snap_dev = dalloc<uint8_t>(snap_size);
+            // the multiples of kSnapEvery a chunk can hold inside it
+            for (int64_t k = 0; k < ((int64_t) PR - 1) / Engine::kSnapEvery + 1; ++k)
+                snap_devs.push_back(dalloc<uint8_t>(snap_size));
         }
         // the GPUs' shares: the main GPU, then the tiers
         std::vector<int> all{main_dev};
         all.insert(all.end(), tier_devs.begin(), tier_devs.end());
-        const size_t plan_n = T * K * 6 + 16384;
+        const size_t plan_n = PR * K * 6 + 16384;
         for (size_t i = 0; i < all.size(); ++i) {
             lamina::core::DeviceScope ds(all[i], main_dev, i > 0);
             MoeDev d;
@@ -3566,19 +3580,19 @@ struct Prompt {
             CK(cudaEventRecord(d.used[0], d.st));
             CK(cudaEventRecord(d.used[1], d.st));
             d.mmq = std::make_unique<MMQ::Context>();
-            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) T, (int64_t) Ld));
+            d.tq = dalloc<uint8_t>(MMQ::q8_bytes((int64_t) PR, (int64_t) Ld));
             d.eq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) Ld));
             d.gu = dalloc<float>((size_t) kEmax * 2 * F);
             d.h = dalloc<float>((size_t) kEmax * F);
             d.hq = dalloc<uint8_t>(MMQ::q8_bytes(kEmax, (int64_t) F));
             d.rows = dalloc<float>((size_t) kEmax * Ld);
-            d.acc = dalloc<float>(T * Ld);
+            d.acc = dalloc<float>(PR * Ld);
             d.ident_rows = MMQ::ids_table_rows(kEmax);
             d.ident = dalloc<int32_t>((size_t) d.ident_rows);
             MMQ::iota(d.ident, d.ident_rows, d.st);
             d.plan = dalloc<int32_t>(plan_n);
             d.plan_h = halloc<int32_t>(plan_n);
-            if (i > 0) d.acc_h = halloc<float>(T * Ld);
+            if (i > 0) d.acc_h = halloc<float>(PR * Ld);
             devs.push_back(std::move(d));
         }
         // the experts no GPU holds go to the GPU whose link copies fastest (core::probe_gpus: the links woken first)
@@ -3607,7 +3621,9 @@ struct Prompt {
                                 (int) sizeof(hy4p::AttnSmem)));
         CK(cudaFuncSetAttribute(hy4p::k_attn_prompt<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int) sizeof(hy4p::AttnSmem)));
-        std::fprintf(stderr, "lamina: prompts in chunks of up to %d rows; the experts no GPU holds on GPU %d%s\n", cap,
+        std::fprintf(stderr, "lamina: prompts in chunks of up to %d rows%s; the experts no GPU holds on GPU %d%s\n", pass,
+                     pass > cap ? (", the experts' pass over them all, the rest " + std::to_string(cap) +
+                                   " rows at a time").c_str() : "",
                      devs[(size_t) streamer].dev,
                      devs.size() > 1 ? (" (" + std::to_string((int) best) + " GB/s from pinned memory)").c_str() : "");
         ok = true;
@@ -3646,20 +3662,24 @@ struct Prompt {
         const lamina::ngram::PleReader::Ticket ticket = E.reader.issue(h_rows, n_mod * (size_t) T * eh, h_raw);
         CK(cudaMemcpyAsync(tok_d, h_tok, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos_d, h_pos, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        hy4p::k_head_ids<<<(unsigned) ((kG * T + 255) / 256), 256, 0, st>>>(hids, kG, T);
-        hy4p::k_head_bounds<<<1, 64, 0, st>>>(hb, kG, T);
-        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d, T, N, emb, st);
-        if (E.img)   // a picture's cells: its rows, a copy a run
-            for (int t = 0; t < T;) {
-                const int32_t row = E.img->row(p0 + t);
-                if (row < 0) { ++t; continue; }
-                int len = 1;
-                while (t + len < T && E.img->row(p0 + t + len) == row + len) ++len;
-                CK(cudaMemcpyAsync(emb + (size_t) t * N, E.img->rows.data() + (size_t) row * N, (size_t) len * N * 4,
-                                   cudaMemcpyHostToDevice, st));
-                t += len;
-            }
-        hy4k::k_streams_init<<<T, hy4k::kThreads, 0, st>>>(emb, X, hc, N);
+        // the dense steps' sub-chunks: as even as cap allows (one when the chunk fits)
+        const int nsub = (T + cap - 1) / cap, ssz = (T + nsub - 1) / nsub;
+        pass_p0 = p0;
+        for (int r0 = 0; r0 < T; r0 += ssz) {   // the embeddings into the streams, a sub-chunk at a time
+            const int ts = std::min(ssz, T - r0);
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, g.n_vocab, tok_d + r0, ts, N, emb, st);
+            if (E.img)   // a picture's cells: its rows, a copy a run
+                for (int t = 0; t < ts;) {
+                    const int32_t row = E.img->row(p0 + r0 + t);
+                    if (row < 0) { ++t; continue; }
+                    int len = 1;
+                    while (t + len < ts && E.img->row(p0 + r0 + t + len) == row + len) ++len;
+                    CK(cudaMemcpyAsync(emb + (size_t) t * N, E.img->rows.data() + (size_t) row * N, (size_t) len * N * 4,
+                                       cudaMemcpyHostToDevice, st));
+                    t += len;
+                }
+            hy4k::k_streams_init<<<ts, hy4k::kThreads, 0, st>>>(emb, X + (size_t) r0 * hc * N, hc, N);
+        }
         std::string err;
         if (!E.reader.collect(ticket, err)) {
             std::fprintf(stderr, "lamina: the Engram table: %s\n", err.c_str());
@@ -3671,13 +3691,34 @@ struct Prompt {
         std::fill(std::begin(ph), std::end(ph), 0.0);
         ph_t = Clock::now();
         const auto c0 = Clock::now();
+        eng_T = T;
+        const size_t ew = (size_t) g.eng_heads() * (size_t) g.eng_dim;
+        auto view = [&](int r0, int ts) {   // a sub-chunk's views; the head-group tables for its rows (cap at most)
+            Xc = X + (size_t) r0 * hc * N;
+            postc = post + (size_t) r0 * hc;
+            posc = pos_d + r0;
+            erawc = eraw + (size_t) r0 * ew;
+            evalidc = evalid + r0;
+            if (ts != hids_T && ts <= cap) {
+                hy4p::k_head_ids<<<(unsigned) ((kG * ts + 255) / 256), 256, 0, st>>>(hids, kG, ts);
+                hy4p::k_head_bounds<<<1, 64, 0, st>>>(hb, kG, ts);
+                hids_T = ts;
+            }
+        };
         for (Layer& l : m->layers) {
-            front(l, T, p0);
-            mark(0);
-            if (l.dense) dense_ffn(l, T);
-            else moe(l, T);
+            for (int r0 = 0; r0 < T; r0 += ssz) {   // the dense steps a sub-chunk at a time
+                const int ts = std::min(ssz, T - r0);
+                view(r0, ts);
+                front(l, ts, p0 + r0);
+                mark(0);
+                if (l.dense) dense_ffn(l, ts);
+                else moe_a(l, ts, r0, nsub > 1);
+                mark(l.dense ? 5 : 1);
+            }
+            if (!l.dense) moe_b(l, T, nsub > 1);
             mark(5);
         }
+        view(0, T);   // the whole chunk's views (the MTP block's catch-up: a chunk of one sub-chunk, its tables made)
         // the head over the last row; with the MTP block kept up, every row's normed final hidden (y) for its catch-up;
         // with DFly's, the last row's in the ring (its picks kept above)
         if (E.drafts_on && m->has_mtp) {
@@ -3696,18 +3737,19 @@ struct Prompt {
                 E.snap_rows = 1;
             }
         }
-        if (const int64_t S = E.chunk_snap; S > p0 && S < p0 + T) {   // the snapshot inside the chunk
+        for (size_t si = 0; si < E.chunk_snaps.size(); ++si) {   // the snapshots inside the chunk, in order
+            const int64_t S = E.chunk_snaps[si];
+            uint8_t* sd = snap_devs[si];
             for (const Layer& l : E.cl) {   // tails as they are (a snapshot at a multiple of the pool reads none)
                 if (!l.has_idx) continue;
                 const size_t li = l.mtp ? (size_t) g.n_layers : (size_t) l.il;
-                CK(cudaMemcpyAsync(snap_dev + tail_off[li], l.tail, (size_t) kTail * 2 * (size_t) g.idx_dim * 4,
+                CK(cudaMemcpyAsync(sd + tail_off[li], l.tail, (size_t) kTail * 2 * (size_t) g.idx_dim * 4,
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (E.hring)   // the drafters re-anchor after a restore (DFly) or catch up from it (the MTP block)
-                CK(cudaMemcpyAsync(snap_dev + hring_off, E.hring, (size_t) Engine::kHRing * N * 4, cudaMemcpyDeviceToDevice,
-                                   st));
+                CK(cudaMemcpyAsync(sd + hring_off, E.hring, (size_t) Engine::kHRing * N * 4, cudaMemcpyDeviceToDevice, st));
             std::vector<uint8_t> bytes(snap_size);
-            CK(cudaMemcpyAsync(bytes.data(), snap_dev, snap_size, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(bytes.data(), sd, snap_size, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             E.add_snapshot(S, std::move(bytes));
         }
@@ -3749,22 +3791,22 @@ struct Prompt {
         const int N = (int) g.n_embd, hc = (int) g.hc;
         if (l.eng >= 0) {
             const int ehn = (int) g.eng_heads(), edn = (int) g.eng_dim, w = ehn * edn;
-            hy4k::k_engram_rows<<<dim3(ehn, T), 128, 0, st>>>(eraw + (size_t) l.eng * T * w, l.e_lnorm, evalid, erows, ehn,
+            hy4k::k_engram_rows<<<dim3(ehn, T), 128, 0, st>>>(erawc + (size_t) l.eng * eng_T * w, l.e_lnorm, evalidc, erows, ehn,
                                                                edn, kEngramEps);
             for (int r0 = 0; r0 < T; r0 += kSub) {
                 const int n = std::min(kSub, T - r0);
                 q8(erows + (size_t) r0 * w, n, w, subq);
                 dense(l.e_kv, subq, n, ekv);
-                hy4k::k_engram_mix<<<n, 256, 0, st>>>(X + (size_t) r0 * hc * N, ekv, l.e_kv_b, l.e_gate, l.e_gamma,
-                                                      l.e_hcs, evalid + r0, hc, N, kEngramEps);
+                hy4k::k_engram_mix<<<n, 256, 0, st>>>(Xc + (size_t) r0 * hc * N, ekv, l.e_kv_b, l.e_gate, l.e_gamma,
+                                                      l.e_hcs, evalidc + r0, hc, N, kEngramEps);
             }
         }
-        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hca_fn, l.hca_scale, l.hca_base, hc, N, 2 * hc, g.eps, g.hc_eps,
-                                          g.hc_mag, post, xh, l.attn_norm, xn, g.eps);
+        hy4k::k_hc_pre<<<T, 256, 0, st>>>(Xc, l.hca_fn, l.hca_scale, l.hca_base, hc, N, 2 * hc, g.eps, g.hc_eps,
+                                          g.hc_mag, postc, xh, l.attn_norm, xn, g.eps);
         attend(l, T, p0);
-        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
-        hy4k::k_hc_pre<<<T, 256, 0, st>>>(X, l.hcf_fn, l.hcf_scale, l.hcf_base, hc, N, 2 * hc, g.eps, g.hc_eps,
-                                          g.hc_mag, post, xh, l.ffn_norm, xn, g.eps);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(Xc, y, postc, hc, N);
+        hy4k::k_hc_pre<<<T, 256, 0, st>>>(Xc, l.hcf_fn, l.hcf_scale, l.hcf_base, hc, N, 2 * hc, g.eps, g.hc_eps,
+                                          g.hc_mag, postc, xh, l.ffn_norm, xn, g.eps);
         q8(xn, T, N, xq);
     }
 
@@ -3785,9 +3827,11 @@ struct Prompt {
             lin0 = (int) std::max<int64_t>(0, p0 - n_swa + 1);
             __half* rh = reinterpret_cast<__half*>(l.kv);   // a ring's rows are halves
             if (p0 > lin0) hy4p::k_copy_cells<<<(unsigned) (p0 - lin0), 64, 0, st>>>(rh, ring, lin, 0, lin0, lin0);
-            hy4k::k_kv_store<false><<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, lin, pos_d, 0, lin0, l.theta, g.eps);
-            if (const int64_t S = E.chunk_snap; S > p0 && S < p_end && !l.mtp) {   // the ring as of position S
-                __half* dst = reinterpret_cast<__half*>(snap_dev + ring_off[(size_t) l.il]);
+            hy4k::k_kv_store<false><<<T, hy4k::kThreads, 0, st>>>(kva, l.kv_a_norm, lin, posc, 0, lin0, l.theta, g.eps);
+            for (size_t si = 0; si < E.chunk_snaps.size() && !l.mtp; ++si) {   // the ring as of each snapshot's S
+                const int64_t S = E.chunk_snaps[si];
+                if (S <= pass_p0 || S < p0 || S >= p_end) continue;
+                __half* dst = reinterpret_cast<__half*>(snap_devs[si] + ring_off[(size_t) l.il]);
                 const int64_t a = std::max<int64_t>(0, S - ring);
                 if (a < lin0)   // the oldest from the ring (still the chunk's predecessor's)
                     hy4p::k_copy_cells<<<(unsigned) (lin0 - a), 64, 0, st>>>(rh, ring, dst, ring, (int) a, 0);
@@ -3798,7 +3842,7 @@ struct Prompt {
             hy4p::k_copy_cells<<<(unsigned) (p_end - pa), 64, 0, st>>>(lin, 0, rh, ring, (int) pa, lin0);
         } else {
             (l.kv_q8 ? hy4k::k_kv_store<true> : hy4k::k_kv_store<false>)<<<T, hy4k::kThreads, 0, st>>>(
-                kva, l.kv_a_norm, l.kv, pos_d, 0, 0, l.theta, g.eps);
+                kva, l.kv_a_norm, l.kv, posc, 0, 0, l.theta, g.eps);
             indexer(l, T, p0);
             if (const int sl = m->dfly.on ? E.dfly_slot(l.il) : -1; sl >= 0) {   // DFly reads it: the last row's picks
                 CK(cudaMemcpyAsync(E.snap_cells + (size_t) sl * kMaxT * g.idx_top_k,
@@ -3812,7 +3856,7 @@ struct Prompt {
         const size_t vb_bytes = (size_t) g.v_head * ((size_t) hy4k::kLatent / 32 * 34);
         for (int h0 = 0; h0 < H; h0 += kG) {
             dense(l.q_b, qrq, T, qg, kG * g.k_head, (size_t) h0 * g.k_head);
-            hy4k::k_rope_norm<<<dim3(kG, T), 32, 0, st>>>(qg, kG, (int) g.k_head, (int) g.nope(), (int) g.n_rot, pos_d, 0,
+            hy4k::k_rope_norm<<<dim3(kG, T), 32, 0, st>>>(qg, kG, (int) g.k_head, (int) g.nope(), (int) g.n_rot, posc, 0,
                                                           l.theta);
             q8(qg, (int64_t) kG * T, g.nope(), hdq, 8, hids, g.k_head);
             MMQ::Product kb;
@@ -3832,11 +3876,11 @@ struct Prompt {
             kb.ld_dst = hy4k::kLatent;
             devs[0].mmq->run(kb, st);
             if (l.swa)
-                hy4p::k_attn_prompt<false><<<T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, lin, nullptr, nullptr, 0, pos_d,
+                hy4p::k_attn_prompt<false><<<T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, lin, nullptr, nullptr, 0, posc,
                                                                                   n_swa, lin0, l.sinks + h0, scale);
             else
                 (l.kv_q8 ? hy4p::k_attn_prompt<true, true> : hy4p::k_attn_prompt<true, false>)<<<
-                    T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, l.kv, cells, ncells, (int) g.idx_top_k, pos_d, 0, 0,
+                    T, 256, sizeof(hy4p::AttnSmem), st>>>(ql, qg, l.kv, cells, ncells, (int) g.idx_top_k, posc, 0, 0,
                                                           l.sinks + h0, scale);
             q8(ql, (int64_t) kG * T, hy4k::kLatent, hdq, 8, hids);
             MMQ::Product vb = kb;
@@ -3865,7 +3909,7 @@ struct Prompt {
         const auto& g = m->g;
         const int N = (int) g.n_embd, ih = (int) g.idx_heads, idd = (int) g.idx_dim, pool_n = (int) g.idx_pool;
         dense(l.iq_b, qrq, T, iq);
-        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, st>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, pos_d, 0, l.theta);
+        hy4k::k_rope_norm<<<dim3(ih, T), 32, 0, st>>>(iq, ih, idd, idd - (int) g.n_rot, (int) g.n_rot, posc, 0, l.theta);
         dense(l.ik, xq, T, ik);
         hy4k::k_rms<<<T, 128, 0, st>>>(ik, idd, l.ik_norm, ik, idd, idd, g.eps);
         q8(ik, T, idd, ikq);
@@ -3879,7 +3923,7 @@ struct Prompt {
                                                                       (int) g.n_rot, l.pooled);
         const int keep = std::min(T, kTail);
         hy4k::k_tail_store<<<keep, 128, 0, st>>>(iv + (size_t) (T - keep) * idd, ig + (size_t) (T - keep) * idd, l.tail,
-                                                 pos_d + (T - keep), kTail, idd);
+                                                 posc + (T - keep), kTail, idd);
         hy4k::k_gemv_f32<<<dim3((unsigned) ((ih + 7) / 8), T), 256, 0, st>>>(l.iproj, xn, iw, N, ih,
                                                                            1.0f / sqrtf((float) (idd * ih)));
         const int reach = (int) (g.idx_top_k / pool_n - (g.idx_tail ? 1 : 0));
@@ -3891,15 +3935,15 @@ struct Prompt {
             if (vis_max > reach && f32) {
                 const size_t smem = ((size_t) ih * idd + ih) * sizeof(float);
                 hy4k::k_index_scores_pos<<<dim3(kScoreBlocks, rr), 256, smem, st>>>(
-                    iq + (size_t) r0 * ih * idd, iw + (size_t) r0 * ih, l.pooled, pos_d + r0, pool_n, reach, ih, idd,
+                    iq + (size_t) r0 * ih * idd, iw + (size_t) r0 * ih, l.pooled, posc + r0, pool_n, reach, ih, idd,
                     scores, ld);
             } else if (vis_max > reach) {
                 const int splits = std::max(1, std::min(64, (vis_max + 1023) / 1024));
                 const int per = (vis_max + splits - 1) / splits / hy4p::kIdxTile * hy4p::kIdxTile + hy4p::kIdxTile;
                 hy4p::k_index_scores_mma<<<dim3((unsigned) ((rr + 7) / 8), (unsigned) splits), 256, 0, st>>>(
-                    iq, iw, l.pooled, pos_d, pool_n, reach, r0, rr, per, scores, ld);
+                    iq, iw, l.pooled, posc, pool_n, reach, r0, rr, per, scores, ld);
             }
-            hy4k::k_select_cells<<<rr, 1024, 0, st>>>(scores, ld, pos_d + r0, pool_n, reach,
+            hy4k::k_select_cells<<<rr, 1024, 0, st>>>(scores, ld, posc + r0, pool_n, reach,
                                                       cells + (size_t) r0 * g.idx_top_k, (int) g.idx_top_k, ncells + r0);
         }
     }
@@ -3917,7 +3961,7 @@ struct Prompt {
             dense(l.f_down, subq, n, y + (size_t) r0 * N);
         }
         hy4k::k_rms_inplace<<<T, hy4k::kThreads, 0, st>>>(y, l.post_ffw, N, g.eps);
-        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(X, y, post, hc, N);
+        hy4k::k_hc_post<<<T, hy4k::kThreads, 0, st>>>(Xc, y, postc, hc, N);
     }
 
     // ---- the routed experts.  The host takes each layer's routing, hands every entry to a GPU (its expert's slot, else
@@ -4133,19 +4177,36 @@ struct Prompt {
         }
     }
 
-    void moe(Layer& l, int T) {
+    /// A sub-chunk's part of an MoE layer (its ts rows at r0 of the pass): the router's picks, routed_down's input, and
+    /// with several sub-chunks the shared expert (its input the sub-chunk's xq)
+    void moe_a(Layer& l, int ts, int r0, bool shared) {
         const auto& g = m->g;
-        const int N = (int) g.n_embd, hc = (int) g.hc, nE = (int) g.n_expert, K = (int) g.top_k, Ld = (int) g.n_latent,
-                  F = (int) g.n_ff_exp;
+        const int N = (int) g.n_embd, nE = (int) g.n_expert, K = (int) g.top_k, Ld = (int) g.n_latent;
         const float one = 1.f, zero = 0.f;
-        if (cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, nE, T, N, &one, l.router, N, xn, N, &zero, logits_r, nE) !=
+        if (cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, nE, ts, N, &one, l.router, N, xn, N, &zero, logits_r, nE) !=
             CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "lamina: cublasSgemm (the router) failed\n");
             throw Fatal{1};
         }
-        hy4k::k_route<<<T, std::max(32, ((nE + 31) / 32) * 32), 0, st>>>(logits_r, l.bias, nE, K, g.w_norm, g.w_scale, ids,
-                                                                          wts);
-        dense(l.r_down, xq, T, rin);
+        hy4k::k_route<<<ts, std::max(32, ((nE + 31) / 32) * 32), 0, st>>>(logits_r, l.bias, nE, K, g.w_norm, g.w_scale,
+                                                                           ids + (size_t) r0 * K, wts + (size_t) r0 * K);
+        dense(l.r_down, xq, ts, rin + (size_t) r0 * Ld);
+        if (shared) shared_expert(l, ts, sy + (size_t) r0 * N);
+    }
+    void shared_expert(Layer& l, int ts, float* out) {
+        const int F = (int) m->g.n_ff_exp;
+        dense(l.s_gate, xq, ts, sg);
+        dense(l.s_up, xq, ts, su);
+        hy4k::k_swiglu<<<blocks((int64_t) ts * F), hy4k::kThreads, 0, st>>>(sg, su, sh, (int64_t) ts * F);
+        q8(sh, ts, F, shq);
+        dense(l.s_down, shq, ts, out);
+    }
+    /// The pass's part of an MoE layer over its T rows: the plan, every GPU's experts (the ones no GPU holds streamed
+    /// once), the sums, routed_up, the shared expert's rows added, the norm, iHC's post.  `shared_done`: the sub-chunks
+    /// made the shared expert's rows; else (one sub-chunk) it runs here, beside the experts.
+    void moe_b(Layer& l, int T, bool shared_done) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, hc = (int) g.hc, K = (int) g.top_k, Ld = (int) g.n_latent;
         MoeDev& d0 = devs[0];
         q8(rin, T, Ld, d0.tq, l.fmt.gu_type);
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, st));
@@ -4161,12 +4222,7 @@ struct Prompt {
         for (size_t d = 1; d < devs.size(); ++d)
             if ((int) d != streamer) enqueue(devs[d], l, T);
         enqueue(devs[(size_t) streamer], l, T);
-        // the shared expert
-        dense(l.s_gate, xq, T, sg);
-        dense(l.s_up, xq, T, su);
-        hy4k::k_swiglu<<<blocks((int64_t) T * F), hy4k::kThreads, 0, st>>>(sg, su, sh, (int64_t) T * F);
-        q8(sh, T, F, shq);
-        dense(l.s_down, shq, T, sy);
+        if (!shared_done) shared_expert(l, T, sy);
         // the tiers' sums, in their order
         for (size_t d = 1; d < devs.size(); ++d) {
             CK(cudaStreamWaitEvent(st, devs[d].done, 0));
@@ -4448,7 +4504,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     std::string profile, profile_save;
     double save_every = 1.0;
     bool graphs = true;
-    int prefill = 4096, prefill_min = 24;
+    int prefill = 4096, prefill_min = 24, prefill_pass = 0;
     double arena_pin = 72;
     double park_mib = 16384, reserve_mib = 6144;
     bool kv_grow = true;
@@ -4493,6 +4549,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--no-graph") graphs = false;
         else if (a == "--prefill") prefill = std::atoi(next());            // rows a prompt chunk (0: the decode's forwards)
         else if (a == "--prefill-min") prefill_min = std::atoi(next());    // a shorter prompt part: the decode's forwards
+        else if (a == "--prefill-pass") prefill_pass = std::atoi(next());  // rows of the experts' pass (0: --prefill's)
         else if (a == "--arena-pin") arena_pin = std::atof(next());        // GiB of the arena in pinned memory at most
         else if (a == "--park-mib" || a == "--conversation-cache-mib") park_mib = std::atof(next());
         else if (a == "--ram-reserve-mib") reserve_mib = std::atof(next());
@@ -4558,9 +4615,11 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.park_budget = (size_t) (std::max(0.0, park_mib) * (double) (1 << 20));
     E.ram_reserve = (size_t) (std::max(0.0, reserve_mib) * (double) (1 << 20));
     Prompt P(E);   // its buffers before the slots take the GPUs' free memory
-    if (prefill > 0 && P.init(prefill, tier_devs)) {
+    // the MTP block kept up catches up over a chunk's rows at once: no passes past --prefill's
+    const bool mtp_kept = E.drafts_on && m.has_mtp;
+    if (prefill > 0 && P.init(prefill, tier_devs, mtp_kept ? 0 : prefill_pass)) {
         E.chunk_fn = [&P](const int32_t* t, int n) { P.run(t, n); };
-        E.chunk_cap = P.cap;
+        E.chunk_cap = P.pass;
         E.chunk_min = std::max(1, prefill_min);
     }
     E.place_slots(expert_vram, tier_devs);
