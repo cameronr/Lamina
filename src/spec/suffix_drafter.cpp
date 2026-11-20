@@ -85,12 +85,17 @@ void SuffixDrafter::assign(const int32_t* tokens, size_t n) {
     size_t keep = 0;
     const size_t common = std::min(n, hist_.size());
     while (keep < common && hist_[keep] == tokens[keep]) ++keep;
+    truncate(keep);
+    append(tokens + keep, n - keep);
+}
+
+void SuffixDrafter::truncate(size_t keep) {
+    if (keep >= hist_.size()) return;
     for (size_t e = hist_.size(); e-- > std::max<size_t>(keep, 2);)   // newest first: each trigram's last goes back
         if (Slot* s = find_slot(key_at(e), false)) s->last = prev_[e];
     hist_.resize(keep);
     prev_.resize(keep);
     last_match_ = 0;
-    append(tokens + keep, n - keep);
 }
 
 int SuffixDrafter::propose(int max_k, int32_t* out) {

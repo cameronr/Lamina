@@ -745,7 +745,7 @@ if(LAMINA_NATIVE_EXPERTS)
     add_library(lamina_hy4 STATIC src/hy4/hy4_engine.cu src/hy4/hy4_dfly_file.cpp src/hy4/hy4_load.cpp)
     target_include_directories(lamina_hy4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(lamina_hy4 PRIVATE lamina_kernels lamina_kernels_cpu lamina_warnings lamina_serve_io
+    target_link_libraries(lamina_hy4 PRIVATE lamina_kernels lamina_kernels_cpu lamina_warnings lamina_serve_io lamina_spec
                           lamina_engine lamina_mmq nlohmann CUDA::cublas CUDA::cudart)
     target_compile_options(lamina_hy4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
     add_executable(lamina-hy4 src/hy4/hy4_main.cpp)

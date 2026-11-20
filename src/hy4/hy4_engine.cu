@@ -34,6 +34,7 @@
 #include "lamina/prefill/moe_mmq.hpp"
 #include "lamina/program/host_sampling.hpp"
 #include "lamina/program/serve_io.hpp"
+#include "lamina/spec/suffix_drafter.hpp"
 
 #include "ggml.h"
 
@@ -1606,12 +1607,14 @@ struct Engine {
         keep = std::min<int64_t>(keep, pos());
         if (pos() - keep <= kMaxT && !restore) {
             seq.resize((size_t) keep);
+            sfx_ok = std::min(sfx_ok, seq.size());
         } else {
             const Snap* best = nullptr;
             for (const Snap& s : snaps)
                 if (s.pos <= keep && (!best || s.pos > best->pos)) best = &s;
             if (best == nullptr) {
                 seq.clear();
+                sfx_ok = 0;
             } else {
                 size_t at = 0;
                 for (const Layer& l : cl) {
@@ -1631,6 +1634,7 @@ struct Engine {
                                        cudaMemcpyHostToDevice, st));
                 CK(cudaStreamSynchronize(st));
                 seq.resize((size_t) best->pos);
+                sfx_ok = std::min(sfx_ok, seq.size());
             }
             snap_base = -1;   // DFly's picks are not a snapshot's
         }
@@ -1727,6 +1731,7 @@ struct Engine {
         }
         CK(cudaStreamSynchronize(st));
         seq = std::move(c.seq);
+        sfx_ok = 0;
         snaps = std::move(c.snaps);
         rewind(pos(), true);   // the rings and tails from its end's snapshot
         std::fprintf(stderr, "lamina: a parked conversation of %lld tokens resumed\n", (long long) p);
@@ -2376,13 +2381,44 @@ struct Engine {
         std::vector<int32_t> drafts;
         int kept = 0;
         int32_t next = -1;
+        bool looked = false;   // the drafts the context's own continuation (prompt lookup)
     };
+    // prompt lookup (--spec-lookup N): when the text's last N tokens or more occurred before and the tokens that
+    // followed there outnumber the drafter's drafts, the window takes up to kMaxT - 1 of them instead; the drafter's
+    // history is the state's tokens, its first sfx_ok of them right (rewind and unpark lower it)
+    int lookup_min = 16;
+    std::unique_ptr<lamina::spec::SuffixDrafter> sfx;
+    size_t sfx_ok = 0;
+    int64_t looked_windows = 0;
+    /// The context's continuation after x (the token at pos()) when it is longer than n tokens, else none
+    std::vector<int32_t> look_up(int32_t x, int n) {
+        std::vector<int32_t> out;
+        if (!sfx || n <= 0) return out;
+        if (sfx->size() > sfx_ok) sfx->truncate(sfx_ok);
+        if (seq.size() > sfx_ok) {
+            sfx->append(seq.data() + sfx_ok, seq.size() - sfx_ok);
+            sfx_ok = seq.size();
+        }
+        sfx->append(x);   // not in the state yet: the next sync takes it out
+        out.resize(kMaxT - 1);
+        const int k = sfx->propose(kMaxT - 1, out.data());
+        out.resize(k > n ? (size_t) k : 0);
+        return out;
+    }
     template <class Pick, class Keep>
     Window drafted(std::vector<int32_t>& rows, int n, std::vector<float>& lg, Pick pick, Keep keep) {
         Window w;
         const int64_t P = pos();
         const auto td = Clock::now();
-        w.drafts = m->dfly.on ? dfly_draft(rows.back(), P, n) : draft(rows, P - (int64_t) rows.size() + 1, n);
+        w.drafts = look_up(rows.back(), n);
+        if (!w.drafts.empty()) {   // the drafter's pass skipped; the MTP block over the rows before x (x comes later)
+            w.looked = true;
+            ++looked_windows;
+            if (!m->dfly.on && m->has_mtp && rows.size() > 1)
+                mtp_catch_up(rows.data(), (int64_t) rows.size() - 1, P - (int64_t) rows.size() + 1);
+        } else {
+            w.drafts = m->dfly.on ? dfly_draft(rows.back(), P, n) : draft(rows, P - (int64_t) rows.size() + 1, n);
+        }
         if (trace) tr.draft += ms_since(td);
         std::vector<int32_t> win{rows.back()};
         win.insert(win.end(), w.drafts.begin(), w.drafts.end());
@@ -4081,6 +4117,7 @@ int run_engine(int argc, char** argv, bool check_only) {
     std::string dfly_path;
     int drafts = 0;
     float spec_min_p = 0.f;
+    int lookup = 16;
     std::vector<int> tier_devs;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4125,6 +4162,7 @@ int run_engine(int argc, char** argv, bool check_only) {
         else if (a == "--dfly") dfly_path = next();   // DFly2's drafts (the checkpoint's last shard); no MTP block
         else if (a == "--drafts-per-step") drafts = std::max(0, std::min(kMaxT - 1, std::atoi(next())));
         else if (a == "--spec-min-p") spec_min_p = (float) std::atof(next());
+        else if (a == "--spec-lookup") lookup = std::max(0, std::atoi(next()));   // prompt lookup's match (0: none)
         else if (a == "--kv-grow") kv_grow = true;
         else if (a == "--vision") vision = true;    // pictures: GENI requests, --emb (the rows lamina-vision's)
         else if (a == "--emb") emb_file = next();   // generate mode: --tokens' pictures, a lamina-vision file
@@ -4164,6 +4202,9 @@ int run_engine(int argc, char** argv, bool check_only) {
     E.kv_q8 = kv == "q8_0";
     E.drafts_on = (m.has_mtp || m.dfly.on) && drafts > 0;
     E.spec_min_p = spec_min_p;
+    E.lookup_min = lookup;
+    if (lookup > 0)
+        E.sfx = std::make_unique<lamina::spec::SuffixDrafter>(lookup, 32, (size_t) std::max<int64_t>(4096, max_ctx));
     E.vision = vision || !emb_file.empty();
     if (E.vision && m.image_pad < 0) {
         std::fprintf(stderr, "lamina: the model's vocabulary has no image pad token, so --vision has no cells to fill\n");
@@ -4279,8 +4320,8 @@ int run_engine(int argc, char** argv, bool check_only) {
                      E.lookups ? 100.0 * (double) gp.hits / (double) E.lookups : 0.0);
     std::fprintf(stderr, "lamina: MiB of VRAM free: %s\n", E.vram_free().c_str());
     if (windows > 0)
-        std::fprintf(stderr, "lamina: %lld windows, %lld drafts offered, %lld kept (%.1f%%), %.2f tokens a window\n",
-                     (long long) windows, (long long) offered, (long long) kept,
+        std::fprintf(stderr, "lamina: %lld windows (%lld looked up), %lld drafts offered, %lld kept (%.1f%%), %.2f tokens "
+                     "a window\n", (long long) windows, (long long) E.looked_windows, (long long) offered, (long long) kept,
                      offered ? 100.0 * (double) kept / (double) offered : 0.0, (double) gen.size() / (double) windows);
     E.save_profile(true);
     return 0;

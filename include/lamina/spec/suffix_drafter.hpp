@@ -33,6 +33,8 @@ public:
     void append(int32_t token) { append(&token, 1); }
     /// Make the history `tokens` (see above).
     void assign(const int32_t* tokens, size_t n);
+    /// The history's first `n` tokens alone: the positions past them undone, newest first (as `assign` undoes them).
+    void truncate(size_t n);
 
     /// Write up to `max_k` proposed next tokens to `out`; returns how many (0 = no match of at least min_match).
     int propose(int max_k, int32_t* out);
