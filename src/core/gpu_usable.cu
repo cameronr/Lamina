@@ -31,7 +31,7 @@ std::string gpu_unusable(int device) {
     cudaError_t e = cudaSetDevice(device);
     if (e == cudaSuccess) {
         e = cudaFuncGetAttributes(&a, usable_probe);
-        if (e != cudaSuccess) (void) cudaDeviceReset();   // the context made for the probe goes: nothing runs there
+        if (e != cudaSuccess) gpu_reset_unused(device);   // the context made for the probe goes: nothing runs there
     }
     (void) cudaGetLastError();
     if (e == cudaSuccess) return {};

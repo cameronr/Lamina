@@ -253,15 +253,15 @@ config renders Codex's compaction requests with the conversation's tools, so the
 ## Pictures
 
 With pictures on (an image projector beside the model, or a config's `vision` section), OpenAI `image_url` parts and
-Anthropic `image` blocks (base64 data, http(s) URLs or local file paths) go through the image encoder, the
-`lamina-vision` in the server's own folder (no config key names another), and reach the model as up to 1,024 tokens each
+Anthropic `image` blocks (base64 data, http(s) URLs or local file paths) go through the server's image encoder and
+reach the model as up to 1,024 tokens each
 (the `vision` section's `max_tokens`; a 640x480 photo is ~300). JPEG, PNG, BMP and GIF are read as they are; WebP, TIFF,
 AVIF and others are converted to PNG first. The encoder runs on the CPU (the `vision` section's `threads`), so the GPUs
 keep their VRAM for experts: on the development PC's 8-core Ryzen 7 9700X a picture of ~1,000 tokens takes ~9 s, once
 per picture (a picture sent again, as chat apps do every turn, is not encoded again). With `--vision-gpu` it runs on a
 GPU instead (the section's `gpu` and `cuda_device`; [SETUP.md](SETUP.md#a-model-file) says which card): on the
-development PC, on the RTX 3090 of its last expert tier, which keeps room to spare beside it, the first question about a
-picture of ~1,000 tokens takes 1.4-2.2 s instead of ~10.5 s with the encoder on the CPU. `--offline` refuses URLs.
+development PC, on the RTX 3090 of its last expert tier, the first question about a picture of ~1,000 tokens takes
+0.9-1.1 s instead of 8.4-8.9 s with the encoder on the CPU (the picture's encoding 0.2 s instead of 7.5 s). `--offline` refuses URLs.
 Qwen3.6-35B-A3B and Qwen3.8-27B read pictures with their repositories' own projectors.
 
 ## Image generation

@@ -3,12 +3,19 @@
 
 #include "http_client.hpp"
 #include "log.hpp"
+#include "process.hpp"
 #include "service.hpp"
 
 #include "hash/hash.h"
 #include "lamina/artifact/gguf_reader.hpp"
+#if LAMINA_VISION
+#include "lamina/core/gpu_select.hpp"
+#include "lamina/vision/encoder.hpp"
+#endif
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -43,19 +50,10 @@ namespace lamina {
 namespace fs = std::filesystem;
 namespace {
 
-const std::optional<double> kReadyS = timeout_env("LAMINA_VISION_READY_S", 300.0);
-const std::optional<double> kEncodeS = timeout_env("LAMINA_VISION_ENCODE_S", 300.0);
-
 std::string read_file(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open");
     return std::string(std::istreambuf_iterator<char>(f), {});
-}
-
-void write_file(const fs::path& p, const std::string& data) {
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    f.write(data.data(), (std::streamsize) data.size());
-    if (!f) throw std::runtime_error("the file " + p.string() + " could not be written");
 }
 
 /// base64 as Python's b64decode reads it (characters outside the alphabet are skipped)
@@ -244,28 +242,9 @@ std::optional<Pixels> wic_decode(const std::string& data, std::string& why) {
 }
 #endif
 
-std::string vision_start_error(const std::string& line, const std::string& log) {
-    const std::string text(strip(line));
-    std::string tail;
-    if (!log.empty()) {
-        std::ifstream f(u8_path(log), std::ios::binary | std::ios::ate);
-        if (f) {
-            const std::streamoff end = f.tellg();
-            f.seekg(std::max<std::streamoff>(0, end - 16384));
-            tail.assign(std::istreambuf_iterator<char>(f), {});
-        }
-    }
-    if (lower(text + tail).find("busy or unavailable") != std::string::npos)
-        return "the vision encoder did not start: the GPU refused a second CUDA context (\"CUDA-capable device(s) "
-               "is/are busy or unavailable\"). This is usually the compute mode Exclusive_Process: only one process "
-               "may use the card, and the engine already holds it. Check with: nvidia-smi --query-gpu=compute_mode "
-               "--format=csv; set it back with: sudo nvidia-smi -c DEFAULT (or run the encoder on another card). "
-               "First line from the encoder: " + (text.empty() ? std::string("(none)") : text);
-    return "the vision encoder did not start: " + text;
-}
-
-/// #480: a directory for the encoder's files whose path has no space (the system temp directory while it has none,
-/// then the working directory, then the system drive's root; the temp directory as the last resort)
+/// #480: a directory for the pictures' rows whose path has no space (the engine's GENI line splits at spaces): the
+/// system temp directory while it has none, then the working directory, then the system drive's root; the temp
+/// directory as the last resort
 std::string work_dir() {
     std::random_device rd;
     auto make = [&](const fs::path& parent) -> std::optional<fs::path> {
@@ -381,43 +360,33 @@ std::string projector_type(const std::string& mmproj) {
 
 bool projector_type_read(const std::string& type) { return type == "qwen3vl_merger" || type == "hy_v4_flash"; }
 
-std::string vision_exe_path() {
-#ifdef _WIN32
-    return u8_str(u8_path(self_dir()) / "lamina-vision.exe");
+bool vision_built() {
+#if LAMINA_VISION
+    return true;
 #else
-    return u8_str(u8_path(self_dir()) / "lamina-vision");
+    return false;
 #endif
 }
 
-std::string vision_exe() {
-    const fs::path exe = u8_path(vision_exe_path());
-    std::error_code ec;
-    if (!fs::is_regular_file(exe, ec))
-        throw std::runtime_error("the config has a \"vision\" section, and the image encoder is not there: " + u8_str(exe) +
-                                 " (lamina-vision belongs in lamina-server's folder; without pictures, take the "
-                                 "section and --vision out of the config)");
-    return u8_str(exe);
+const char* vision_not_built() {
+    return "this lamina-server was built without the image encoder (LAMINA_BUILD_VISION=OFF)";
 }
 
-std::vector<std::string> vision_reader_args(const json& cfg) {
-    // the encoder runs in its own directory (#480): a path with a directory part is made absolute
-    auto absolute = [](const std::string& p) {
-        const fs::path x = u8_path(p);
-        return x.has_parent_path() ? u8_str(fs::absolute(x)) : p;
-    };
-    const std::string mmproj = absolute(jstr(cfg, "mmproj"));
-    // --model: the encoder reads no text model; named for a lamina-vision of an earlier build beside this server
-    std::vector<std::string> args = {vision_exe(), "--mmproj", mmproj, "--model", absolute(jstr(cfg, "model"))};
-    auto num = [](const json& v) { return v.is_number_integer() ? std::to_string(v.get<int64_t>()) : py_dumps(v); };
-    if (truthy(jget(cfg, "gpu"))) args.push_back("--gpu");
-    if (truthy(jget(cfg, "threads"))) args.insert(args.end(), {"--threads", num(cfg["threads"])});
-    if (truthy(jget(cfg, "max_tokens"))) args.insert(args.end(), {"--max-tokens", num(cfg["max_tokens"])});
-    if (truthy(jget(cfg, "min_tokens"))) args.insert(args.end(), {"--min-tokens", num(cfg["min_tokens"])});   // #767
-    return args;
-}
+#if LAMINA_VISION
+struct Vision::Loaded {
+    std::unique_ptr<vision::Encoder> encoder;
+    int device = -1;   // a GPU's encoder: its CUDA device, kept from the engine's resets while it is loaded
+    ~Loaded() {
+        encoder.reset();
+        if (device >= 0) core::gpu_keep(device, false);
+    }
+};
+#else
+struct Vision::Loaded {};
+#endif
 
-Vision::Vision(const json& cfg, std::string log, std::optional<Environment> env, bool lazy)
-    : dir(work_dir()), args_(vision_reader_args(cfg)), log_(std::move(log)), env_(std::move(env)) {
+Vision::Vision(const json& cfg, bool lazy) : dir(work_dir()), cfg_(cfg) {
+    if (!vision_built()) throw std::runtime_error(std::string("the config has a \"vision\" section, and ") + vision_not_built());
     if (!lazy) start();
 }
 
@@ -428,70 +397,94 @@ Vision::~Vision() {
 }
 
 void Vision::start() {
-    SpawnOptions o;
-    o.args = args_;
-    o.cwd = dir;   // the ENC lines name the files relative to it (#480: no space in the line)
-    o.env = env_;
-    o.in = SpawnOptions::pipe;
-    o.out = SpawnOptions::pipe;
-    if (log_.empty()) {
-        o.err = SpawnOptions::null;
-    } else {
-        o.err = SpawnOptions::file;
-        o.err_file = log_;
+#if LAMINA_VISION
+    using Clock = std::chrono::steady_clock;
+    auto seconds = [](Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); };
+    const json& cfg = cfg_;
+    vision::EncoderParams p;
+    p.mmproj = jstr(cfg, "mmproj");
+    p.gpu = truthy(jget(cfg, "gpu"));
+    auto number = [](const json& v) { return v.is_number() ? (int) v.get<double>() : 0; };
+    p.threads = number(jget(cfg, "threads"));
+    p.max_tokens = number(jget(cfg, "max_tokens"));
+    p.min_tokens = number(jget(cfg, "min_tokens"));   // #767
+    p.q8_fp16 = lower(jstr(cfg, "q8")) == "fp16";
+    auto loaded = std::make_unique<Loaded>();
+    std::string where = "on the CPU";
+    if (p.gpu) {
+        // its card among this process's CUDA devices: a UUID or its start, a PCI bus id, a name, or a number, which
+        // counts the cards in the PCI buses' order as nvidia-smi does
+        const std::vector<core::GpuInfo> gpus = core::list_gpus(true);
+        const json& dev = jget(cfg, "cuda_device");
+        const std::string spec = dev.is_null() ? "" : dev.is_string() ? std::string(strip(dev.get<std::string>())) : py_dumps(dev);
+        std::string why;
+        if (spec.empty()) {
+            p.device = gpus.empty() ? -1 : 0;
+            why = "no CUDA device is visible";
+        } else if (std::all_of(spec.begin(), spec.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            std::vector<const core::GpuInfo*> by_bus;
+            for (const core::GpuInfo& g : gpus) by_bus.push_back(&g);
+            std::stable_sort(by_bus.begin(), by_bus.end(),
+                             [](const core::GpuInfo* a, const core::GpuInfo* b) { return a->bus_id < b->bus_id; });
+            const size_t i = (size_t) std::stoul(spec);
+            p.device = i < by_bus.size() ? by_bus[i]->ordinal : -1;
+            why = "no GPU " + spec + " (CUDA sees " + std::to_string(gpus.size()) + ")";
+        } else {
+            p.device = core::find_gpu(gpus, spec, why);
+        }
+        if (p.device < 0)
+            throw std::runtime_error("the vision encoder did not start: its GPU" + (spec.empty() ? std::string() : " " + spec) +
+                                     " is not there (" + why + "): name a card that is there in the config's vision "
+                                     "\"cuda_device\" (nvidia-smi -L lists them), or set \"gpu\" to false");
+        where = "on GPU " + std::to_string(p.device) + ", " + gpus[(size_t) p.device].name;
+        // the encoder's kernels are the engine's: a card they do not run on (older than an RTX 30, or one this build
+        // has no kernels for) is said before anything is loaded
+        if (const std::string no = core::gpu_unusable(p.device); !no.empty())
+            throw std::runtime_error("the vision encoder did not start " + where + ": " + no + "; name another card in the "
+                                     "config's vision \"cuda_device\", or set \"gpu\" to false (the CPU)");
+        core::gpu_keep(p.device, true);
+        loaded->device = p.device;
     }
-    o.own_group = true;
-    proc_ = std::make_unique<Process>(o);
-    std::string line;
-    try {
-        read_line(line, kReadyS.value_or(-1), "the vision encoder did not start");
-    } catch (const std::runtime_error&) {   // silent for VISION_READY_S: ended, and not left half-started
-        proc_.reset();
-        stopped_ = true;
-        throw;
+    const auto t0 = Clock::now();
+    std::string err;
+    loaded->encoder = vision::open_encoder(p, err);
+    if (!loaded->encoder)
+        throw std::runtime_error("the vision encoder did not start: " + p.mmproj + " (" + err + ")");
+    const uint64_t vram = loaded->encoder->gpu_bytes();
+    std::fprintf(stderr, "lamina: the image encoder %s: %s loaded in %.1f s%s\n", where.c_str(), p.mmproj.c_str(), seconds(t0),
+                 vram == 0 ? "" : (", " + std::to_string(vram >> 20) + " MiB of VRAM for its weights and buffers").c_str());
+    if (p.gpu) {
+        // A picture at the projector's limit now: what a picture takes of the GPU (the buffers, cuBLAS's, the kernels'
+        // images) is taken before the engine sizes its caches from what is left, and the first picture's time is a
+        // picture's.  (A square well above any limit; the encoder scales it down.)
+        const auto w0 = Clock::now();
+        vision::Rgb grey;
+        grey.w = grey.h = 2048;
+        grey.px.assign((size_t) grey.w * grey.h * 3, 128);
+        vision::Rows rows;
+        if (!loaded->encoder->encode(grey, rows, err))
+            throw std::runtime_error("the vision encoder did not start: a picture at its limit failed (" + err + ")");
+        std::fprintf(stderr, "lamina: the image encoder warmed up at %d image tokens in %.1f s\n", rows.n, seconds(w0));
     }
-    if (!starts_with(line, "READY")) {
-        proc_.reset();   // killed
-        stopped_ = true;
-        throw std::runtime_error(vision_start_error(line, log_));
-    }
-    stopped_ = false;
+    const std::lock_guard<std::mutex> lk(mu_);
+    loaded_ = std::move(loaded);
+    alive_ = true;
+#endif
 }
 
-int Vision::read_line(std::string& line, double timeout_s, const std::string& what) {
-    // #1317: on a timeout the encoder is killed, so the next request starts a fresh one
-    const int r = proc_->read_line(line, timeout_s);
-    if (r == 0) {
-        proc_->kill();
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%.0f", timeout_s);
-        throw std::runtime_error(what + ": it said nothing for " + buf + " s");
-    }
-    if (r < 0) line.clear();
-    return r;
-}
+bool Vision::alive() { return alive_; }
 
-bool Vision::alive() { return proc_ != nullptr && !stopped_ && !proc_->poll(); }
-
-void Vision::unload() {
-    close();
-    stopped_ = true;
-}
+void Vision::unload() { close(); }
 
 void Vision::restart() {
-    if (proc_ != nullptr) proc_->kill();
-    proc_.reset();
-    stopped_ = true;
+    close();
     start();
 }
 
 void Vision::close() {
-    std::unique_ptr<Process> p = std::move(proc_);
-    stopped_ = true;
-    if (p == nullptr) return;
-    if (p->write("QUIT\n") && p->wait(10)) return;
-    p->kill();
-    p->wait(10);
+    const std::lock_guard<std::mutex> lk(mu_);
+    alive_ = false;
+    loaded_.reset();
 }
 
 std::string Vision::load(const std::string& source) {
@@ -604,37 +597,25 @@ std::pair<std::string, int64_t> Vision::encode(const std::string& source, bool i
             cache_.push_back(hit);
             return hit.second;
         }
-    const fs::path img = u8_path(dir) / (key + ".img"), out = u8_path(dir) / (key + ".sve");
-    write_file(img, data);
-    std::string line;
-    struct Unlink {   // #352: also when the encoder's pipe is gone
-        fs::path p;
-        ~Unlink() {
-            std::error_code ec;
-            fs::remove(p, ec);
-        }
-    } unlink{img};
-    if (proc_ == nullptr || !proc_->write("ENC " + u8_str(img.filename()) + " " + u8_str(out.filename()) + "\n")) {
-        stopped_ = true;
-        throw std::invalid_argument("the image could not be read: the vision encoder stopped");
-    }
-    try {
-        read_line(line, kEncodeS.value_or(-1), "the image could not be read");
-    } catch (const std::runtime_error& e) {   // silent for VISION_ENCODE_S: ended (#1317); alive() is false now
-        stopped_ = true;
-        throw std::invalid_argument(e.what());
-    }
-    line = std::string(strip(line));
-    if (!starts_with(line, "OK"))
-        throw std::invalid_argument("the image could not be read: " +
-                                    (starts_with(line, "ERR") ? line.substr(std::min<size_t>(4, line.size())) : "the vision encoder stopped"));
-    const std::vector<std::string> f = split(line, " ");
+    const fs::path out = u8_path(dir) / (key + ".sve");
     int64_t ntok = 0;
-    try {
-        ntok = f.size() > 1 ? std::stoll(f[1]) : 0;
-    } catch (const std::exception&) {
-        throw std::invalid_argument("the image could not be read: " + line);
+#if LAMINA_VISION
+    if (loaded_ == nullptr) throw std::invalid_argument("the image could not be read: the vision encoder is unloaded");
+    vision::Rgb picture;
+    vision::Rows rows;
+    std::string err;
+    if (!vision::decode_memory((const uint8_t*) data.data(), data.size(), picture, err))
+        throw std::invalid_argument("the image could not be read (" + err + ")");
+    if (!loaded_->encoder->encode(picture, rows, err)) throw std::invalid_argument("the image could not be read: " + err);
+    if (!vision::write_rows(u8_str(out), rows)) {
+        std::error_code ec;
+        fs::remove(out, ec);
+        throw std::invalid_argument("the image could not be read: its embeddings could not be written to " + u8_str(out));
     }
+    ntok = rows.n;
+#else
+    throw std::invalid_argument(std::string("the image could not be read: ") + vision_not_built());
+#endif
     const std::pair<std::string, int64_t> result{u8_str(out), ntok};
     cache_.push_back({key, result});
     std::vector<std::string> held = keep;

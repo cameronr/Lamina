@@ -109,9 +109,11 @@ void apply_engine_env(const json& cfg, bool offline);
 /// a child engine's environment (a replica): this process's with the config's "gpu", "env", "lib_dirs" and the offline
 /// policy
 Environment child_env(const json& cfg, bool offline);
-/// the image encoder's environment: this process's with the config's "lib_dirs", on its own card when the vision
-/// section names "cuda_device"
-Environment vision_env(const json& cfg);
+/// After apply_engine_env, for the image encoder, which runs in this process too: where "gpu" is numbers (the process
+/// narrowed to them) and the vision section's "cuda_device" is none of them, that card is visible after them and the
+/// engine's devices are CUDA's first ones, as many as the numbers (core::engine_gpu_count).  `gpus`: nvidia-smi's
+/// list, read when empty.
+void show_vision_gpu(const json& cfg, std::vector<GpuInfo>& gpus);
 /// the config's "lib_dirs" (the existing ones) before env's library search path: LD_LIBRARY_PATH, PATH on Windows
 void prepend_lib_dirs(const json& cfg, Environment& env);
 /// the variables every child gets under --offline

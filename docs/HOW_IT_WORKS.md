@@ -160,11 +160,13 @@ The API reports how many prompt tokens were reused (`cached_tokens`, `cache_read
 
 ## Pictures
 
-The image encoder, `lamina-vision`, is the engine's own code on ggml, llama.cpp's tensor library (`src/vision`: the
-picture sized and resampled as the model's reference processor does it, one vision transformer for every model's
-projector, each model's adapter; its arithmetic is that of llama.cpp's multimodal library, operation for operation),
-with the model's projector, run on the CPU in a process of its own: the GPUs keep their VRAM for experts. The server sends it each picture and passes the embeddings
-it returns to the engine, which places them in the prompt with their positions in the picture's grid (Hy4-flash's file:
+The image encoder is the engine's own code, a part of `lamina-server` (`src/vision`: the picture sized and resampled
+as the model's reference processor does it, one vision transformer for every model's projector, each model's adapter;
+its arithmetic is that of llama.cpp's multimodal library). On the CPU it is a graph on ggml, llama.cpp's tensor
+library, that library's operation for operation; on a GPU the engine's own kernels: cuBLAS products, llama.cpp's
+quantized products for a Q8_0 projector, and an attention kernel on the tensor cores. It runs on the CPU unless a
+config puts it on a GPU: the GPUs keep their VRAM for experts. The server encodes each picture once and passes its
+embeddings to the engine, which places them in the prompt with their positions in the picture's grid (Hy4-flash's file:
 at consecutive positions, as text, which is how llama.cpp's support for it reads them).
 
 ## The server

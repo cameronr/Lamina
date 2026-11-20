@@ -20,8 +20,13 @@ struct GpuInfo {
     int sms = 0;
     int cc = 0;           ///< compute capability x 10 (86: 8.6)
 };
-/// Every visible device, its ordinal its index.
-std::vector<GpuInfo> list_gpus();
+/// The engine's devices are CUDA's first `n`: lamina-server narrows its process to the engine's cards
+/// (CUDA_VISIBLE_DEVICES) and adds after them a card its image encoder runs on that is none of theirs.  n < 0 (as at
+/// the start): every visible device.
+void engine_gpu_count(int n);
+/// The engine's devices, each one's ordinal its index: every visible one unless engine_gpu_count says fewer; `all`:
+/// every visible one regardless.
+std::vector<GpuInfo> list_gpus(bool all = false);
 
 /// "" when the engine can run on `device`, else why not, to follow the GPU's name in a message: a compute capability
 /// below 8.0, no kernels for it in this build (CMAKE_CUDA_ARCHITECTURES), or a driver that cannot load them.  The
@@ -42,6 +47,14 @@ bool gpu_in_desktop_use(const std::string& bus_id, bool& known);
 /// with `why` when none or several match (then each one's ordinal, name and UUID).  lamina-server's find_gpu
 /// (src/server/config.cpp) reads names the same way.
 int find_gpu(const std::vector<GpuInfo>& gpus, const std::string& spec, std::string& why);
+
+/// A GPU another part of this process keeps memory on (lamina-server's image encoder runs in the server's process,
+/// on a card of its own choice): counted, a keep for each one that holds it.  The engine's own use of a card needs
+/// none.
+void gpu_keep(int device, bool keep);
+/// The context a query made on `device`, a GPU the engine then leaves out, goes with all it holds
+/// (cudaDeviceReset), unless the card is kept (gpu_keep): then nothing is done.  `device` is current after it.
+void gpu_reset_unused(int device);
 
 /// A tier's GPU as a short probe saw it: the pinned host-to-device rate of 64 MiB copies (GB/s, the best of five
 /// after the link is woken, and of five more for as long as those were faster), and whether the desktop or another

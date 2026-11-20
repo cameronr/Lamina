@@ -483,7 +483,7 @@ void usage(bool all = false) {
                  "                       --expert-profile-save wrote; --serve: the built-in one) instead of admitting\n"
                  "                       experts on first use\n"
                  "  --serve              stay resident and take requests on stdin, as lamina-server sends them\n"
-                 "  --vision             --serve takes images too (GENI requests; embeddings from lamina-vision)\n"
+                 "  --vision             --serve takes images too (GENI requests; the image encoder's rows)\n"
                  "  --help-all           every option\n"
                  "  -v, --version        the program's version\n",
                  lamina::kDraftLayerScript);
@@ -2747,8 +2747,7 @@ int lamina::program::run(int argc, char** argv) {
             if ((int) devs.size() == lamina::core::kMaxGpuTiers) {   // "auto" past the third: its context goes
                 std::fprintf(stderr, "lamina: GPU %d, %s, left out: the tiers are at most %d\n", d,
                              gpus[(size_t) d].name.c_str(), lamina::core::kMaxGpuTiers);
-                cudaSetDevice(d);
-                cudaDeviceReset();
+                lamina::core::gpu_reset_unused(d);
                 continue;
             }
             devs.push_back(d);
@@ -4440,7 +4439,7 @@ int lamina::program::run(int argc, char** argv) {
         // The previous request's prompt: where a new one leaves it, it gets a checkpoint (see `fork` below).
         std::vector<int64_t> prev_prompt;
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
-        // or more lamina-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
+        // or more of the image encoder's records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
         // h = p + y, w = p + x, and the text after the image continues at p + max(nx, ny).
         constexpr int64_t kImagePad = 248056;   // qwen4exp.ple.image_token_id: the PLE hash reads it for image cells

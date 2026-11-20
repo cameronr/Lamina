@@ -5,6 +5,7 @@
 #include "lamina/core/expert_cache.hpp"
 #include "lamina/core/gpu_select.hpp"
 #include "lamina/program/engine.hpp"
+#include "lamina/core/gpu_select.hpp"
 #include "lamina/program/gpu_cards.hpp"
 #include "log.hpp"
 
@@ -751,14 +752,22 @@ void prepend_lib_dirs(const json& cfg, Environment& env) {
     }
 }
 
-Environment vision_env(const json& cfg) {
-    Environment env = environment();
-    prepend_lib_dirs(cfg, env);   // a CUDA encoder's runtime (its RUNPATH is its own folder)
-    const json& dev = jget(jget(cfg, "vision"), "cuda_device");
-    if (dev.is_null()) return env;
-    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID";   // #408: the encoder on a card of its own
-    env["CUDA_VISIBLE_DEVICES"] = arg_str(dev);
-    return env;
+void show_vision_gpu(const json& cfg, std::vector<GpuInfo>& gpus) {
+    const std::vector<int> engine = gpu_list(cfg);
+    const json& v = jget(cfg, "vision");
+    const json& dev = jget(v, "cuda_device");
+    if (engine.empty() || !v.is_object() || !truthy(jget(v, "gpu")) || dev.is_null()) return;
+    const std::string spec(strip(arg_str(dev)));
+    if (spec.empty()) return;
+    if (gpus.empty()) gpus = nvidia_gpus();
+    const int index = find_gpu(spec, gpus);   // -1 where nvidia-smi lists nothing: the name as it is
+    const bool number = std::all_of(spec.begin(), spec.end(), ::isdigit);
+    const int named = index >= 0 ? index : number ? std::stoi(spec) : -1;
+    if (named >= 0 && std::find(engine.begin(), engine.end(), named) != engine.end()) return;   // one of the engine's
+    std::string list;
+    for (const int g : engine) list += (list.empty() ? "" : ",") + std::to_string(g);
+    set_env("CUDA_VISIBLE_DEVICES", list + "," + (named >= 0 ? std::to_string(named) : spec));
+    core::engine_gpu_count((int) engine.size());
 }
 
 std::vector<std::string> offline_blockers(const json& cfg) {

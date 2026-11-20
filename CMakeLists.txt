@@ -1,6 +1,6 @@
 ﻿# Lamina Engine - top-level build.
 #
-# The engine (`lamina`), the server (`lamina-server`), the image encoder (tools/vision, an external project here) and
+# The engine (`lamina`), the server (`lamina-server`, the image encoder in it) and
 # the GPU tools need LAMINA_ENABLE_CUDA and NVIDIA GPUs of compute capability 8.0 or newer; without CUDA only the
 # CPU-side libraries, their tools and tests build. CMakePresets.json has the two builds: `native` (this PC's GPUs and
 # CPU, in build/) and `portable` (the releases': RTX 30, 40 and 50, any AVX2 CPU, in build-portable/); build.bat and
@@ -9,8 +9,7 @@
 # CMake 3.22 (Ubuntu 22.04's) or newer, with 3.24's policies where CMake has them
 cmake_minimum_required(VERSION 3.22...3.24)
 project(lamina VERSION 0.3.2 LANGUAGES CXX)
-# on the files that print it alone: a new version recompiles these and the image encoder's (tools/vision, which gets
-# it below), not every one (the CUDA kernels, ggml)
+# on the files that print it alone: a new version recompiles these, not every one (the CUDA kernels, ggml)
 set_property(SOURCE src/program/main.cpp src/program/generate.cpp src/server/main.cpp src/server/bench.cpp
              src/server/model_config.cpp APPEND PROPERTY COMPILE_DEFINITIONS LAMINA_VERSION="${PROJECT_VERSION}")
 
@@ -536,6 +535,9 @@ if(LAMINA_NATIVE_EXPERTS)
   set(GGML_CUDA OFF CACHE BOOL "" FORCE)
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+  # ggml's CPU matrix products through its llamafile kernels, as llama.cpp's own top level turns them on (ggml's
+  # CMake alone leaves them off): the image encoder's CPU path computes with them (src/vision/ggml_encoder.cpp)
+  set(GGML_LLAMAFILE ON CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   # no compiler launcher of ggml's choosing for every target (it sets one when it finds ccache):
@@ -685,6 +687,23 @@ if(LAMINA_NATIVE_EXPERTS)
     target_link_libraries(lamina_mmq PUBLIC ggml-base CUDA::cudart)
     target_link_libraries(lamina_prefill PUBLIC lamina_mmq)
     target_link_libraries(lamina_engine PUBLIC lamina_mmq)   # the verify window's projections at 7-8 tokens
+
+    # ---- lamina_vision: the image encoder (include/lamina/vision), a part of lamina-server ----
+    # A picture's rows from a model's projector file: on a GPU the engine's own kernels (cuda_encoder.cu: cuBLAS
+    # products, MMQ for a Q8_0 projector, a tensor-core attention kernel), on the CPU a ggml graph on ggml's CPU
+    # backend (ggml_encoder.cpp).  stb_image from the llama.cpp checkout's vendor folder.  LAMINA_BUILD_VISION=OFF
+    # leaves it out: such a server reads no pictures, and refuses a config that has a "vision" section.
+    option(LAMINA_BUILD_VISION "build the image encoder into lamina-server" ON)
+    if(LAMINA_BUILD_VISION)
+      add_library(lamina_vision STATIC src/vision/image.cpp src/vision/projector.cpp src/vision/ggml_encoder.cpp
+                                       src/vision/encoder.cpp src/vision/cuda_encoder.cu)
+      target_include_directories(lamina_vision PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                 PRIVATE ${_lamina_llama_root}/vendor)
+      target_link_libraries(lamina_vision PUBLIC lamina_mmq ggml CUDA::cublas CUDA::cudart lamina_warnings)
+      # the encoder as a program over picture files (READY, ENC <picture> <rows file>), for comparing its rows
+      add_executable(vision_rows tools/vision/vision_rows.cpp)
+      target_link_libraries(vision_rows PRIVATE lamina_vision)
+    endif()
     # the prompt path's routed-expert products by format at the engine's shapes (a bench, not a test)
     add_executable(mmq_expert_bench src/prefill/mmq_expert_bench.cpp)
     target_include_directories(mmq_expert_bench PRIVATE ${_lamina_gg}/include)
@@ -841,6 +860,10 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
     target_include_directories(lamina_server_core PUBLIC src/server ${_lamina_llama_root}/vendor
                                ${_lamina_llama_root}/vendor/cpp-httplib)
     target_link_libraries(lamina_server_core PUBLIC lamina_text cpp-httplib vendor-hash lamina_program lamina_warnings)
+    if(TARGET lamina_vision)   # the image encoder, in the server's process (src/server/vision.cpp)
+      target_link_libraries(lamina_server_core PUBLIC lamina_vision)
+      target_compile_definitions(lamina_server_core PRIVATE LAMINA_VISION=1)
+    endif()
     if(WIN32)
       target_link_libraries(lamina_server_core PUBLIC winhttp ws2_32 ole32 windowscodecs shell32)
     else()
@@ -918,56 +941,6 @@ if(TARGET cpp-httplib AND TARGET ggml-base)
         break()
       endif()
     endforeach()
-
-    # The image encoder (tools/vision: src/vision on ggml), a CMake project of its own, as its ggml differs from the
-    # engine's: with ggml-cuda, its CPU code for any AVX2 CPU (arm64: Armv8.2 with dotprod and fp16; a native build
-    # on an AVX-512 CPU runs without flash attention, about half as fast). Built for the same GPUs, after the engine's
-    # programs so that their CUDA compiles and its do not run at once, into this folder: the server starts the
-    # lamina-vision in its own folder and no other, on the CPU or a GPU as a config's vision section says.
-    option(LAMINA_BUILD_VISION "build the image encoder (tools/vision) beside the server" ON)
-    if(LAMINA_BUILD_VISION)
-      include(ExternalProject)
-      set(_lamina_vision_args
-          -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
-          -DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
-          -DLLAMA_DIR:PATH=${_lamina_llama_root}
-          -DLAMINA_VISION_CUDA:BOOL=ON
-          -DLAMINA_PORTABLE:BOOL=ON
-          -DLAMINA_VISION_OUTPUT_DIR:PATH=${CMAKE_BINARY_DIR}
-          -DLAMINA_VERSION:STRING=${PROJECT_VERSION}
-          -DLAMINA_JOBS:STRING=${LAMINA_JOBS_USED}
-          -DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}
-          # the engine's toolkit: ggml-cuda looks for one before CUDA is enabled, where FindCUDAToolkit takes neither
-          # CUDACXX nor CMAKE_CUDA_COMPILER (only the PATH, CUDA_PATH and /usr/local/cuda)
-          -DCUDAToolkit_ROOT:PATH=${_lamina_cuda_root})
-      foreach(_v CMAKE_C_COMPILER CMAKE_CXX_COMPILER CMAKE_CUDA_COMPILER CMAKE_CUDA_HOST_COMPILER
-                 CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER CMAKE_CUDA_COMPILER_LAUNCHER)
-        if(${_v})
-          list(APPEND _lamina_vision_args "-D${_v}:STRING=${${_v}}")
-        endif()
-      endforeach()
-      # Windows paths with forward slashes: the encoder's initial cache file sets each value in quotes, where a
-      # backslash starts an escape (a build folder an earlier setup.py configured holds its Ninja as ...\ninja.exe)
-      if(CMAKE_HOST_WIN32)
-        string(REPLACE "\\" "/" _lamina_vision_args "${_lamina_vision_args}")
-      endif()
-      ExternalProject_Add(lamina-vision
-        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision
-        BINARY_DIR ${CMAKE_BINARY_DIR}/vision
-        CMAKE_CACHE_ARGS ${_lamina_vision_args}
-        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target lamina-vision
-        INSTALL_COMMAND ""
-        BUILD_ALWAYS ON
-        USES_TERMINAL_CONFIGURE ON
-        USES_TERMINAL_BUILD ON
-        DEPENDS lamina lamina-server)
-      install(CODE "
-        if(NOT EXISTS \"${CMAKE_BINARY_DIR}/vision/cmake_install.cmake\")
-          message(FATAL_ERROR \"the image encoder is not built: cmake --build ${CMAKE_BINARY_DIR} first\")
-        endif()
-        execute_process(COMMAND \"${CMAKE_COMMAND}\" --install \"${CMAKE_BINARY_DIR}/vision\" --component lamina
-                                --prefix \"\${CMAKE_INSTALL_PREFIX}\" COMMAND_ERROR_IS_FATAL ANY)" COMPONENT lamina)
-    endif()
   endif()
 endif()
 
@@ -983,8 +956,8 @@ if(LAMINA_BUILD_TESTS)
   endforeach()
 endif()
 
-# Without LAMINA_BUILD_TESTS the default target builds the programs a release holds (lamina, lamina-server, the image
-# encoder): the tests, parity checks, benches and tools build by name (cmake --build <build> --target <name>)
+# Without LAMINA_BUILD_TESTS the default target builds the programs a release holds (lamina, lamina-server): the
+# tests, parity checks, benches and tools build by name (cmake --build <build> --target <name>)
 get_property(_lamina_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 foreach(_t IN LISTS _lamina_targets)
   get_target_property(_type ${_t} TYPE)
@@ -992,9 +965,6 @@ foreach(_t IN LISTS _lamina_targets)
     continue()
   elseif(NOT LAMINA_BUILD_TESTS)
     set_target_properties(${_t} PROPERTIES EXCLUDE_FROM_ALL ON)
-  elseif(TARGET lamina-vision)
-    # with the tests every program is built, and the image encoder after them all (its jobs and theirs not at once)
-    add_dependencies(lamina-vision ${_t})
   endif()
 endforeach()
 

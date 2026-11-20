@@ -70,7 +70,7 @@ struct ModelConfig {
 /// The config for `opts.model`: its preset's, the model's own paths in place of the preset's (--native, the
 /// projector, the log, the learned profile), the main GPU pick_main_gpu() chooses, and none of the preset's files the
 /// server finds itself (the draft layer: resolve_draft_layer; the expert profile: the engine's built-in one).  Pictures
-/// are on with a projector (--mmproj, else the one projectors_beside() lists first) and lamina-vision beside the server.
+/// are on with a projector (--mmproj, else the one projectors_beside() lists first) in a build with the image encoder.
 /// ConfigError for a model no preset is for, or a --mmproj that is not its projector or has no encoder to run it.
 ModelConfig config_from_model(const ModelOptions& opts, const std::vector<GpuInfo>& gpus);
 

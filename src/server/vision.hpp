@@ -1,14 +1,16 @@
 // src/server/vision.hpp - the resident image encoder (serve/server.py's Vision).
 //
-// lamina-vision (the engine's encoder, include/lamina/vision, on the model's mmproj file) reads "ENC <image> <out>"
-// lines and writes each picture's embeddings; the results are cached by the picture's hash, so a conversation that
-// sends the same picture every turn (most clients do) encodes it once.
+// The engine's encoder (include/lamina/vision, on the model's mmproj file) in this process: on a GPU the engine's own
+// kernels, on a card the config names, its memory taken before the engine sizes its caches; on the CPU a ggml graph.
+// A picture's embeddings are written to a file the engine reads and cached by the picture's hash, so a conversation
+// that sends the same picture every turn (most clients do) encodes it once.  A build without the encoder
+// (LAMINA_BUILD_VISION=OFF) has the class and refuses to make one.
 #pragma once
 
 #include "json.hpp"
-#include "process.hpp"
 #include "sync.hpp"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -27,16 +29,17 @@ inline constexpr uint64_t kImagePixelsMax = 178956970;
 
 class Vision {
 public:
-    /// the config's "vision" section (mmproj, model, gpu, threads, max_tokens, min_tokens), the log its stderr
-    /// is appended to ("": none), its environment; started now unless `lazy`. The encoder is the lamina-vision
-    /// beside this program (std::runtime_error when none is there).
-    Vision(const json& cfg, std::string log = "", std::optional<Environment> env = std::nullopt, bool lazy = false);
-    /// for good (#914): the encoder ends and its directory (one .sve file per picture) goes with it
+    /// the config's "vision" section (mmproj, gpu, cuda_device, threads, max_tokens, min_tokens, q8; its paths
+    /// absolute); loaded now unless `lazy`.  std::runtime_error when the build has no encoder, the projector is not
+    /// one it reads, or its GPU is not there.
+    explicit Vision(const json& cfg, bool lazy = false);
+    /// for good (#914): the encoder's memory goes back and its directory (one .sve file per picture) with it
     ~Vision();
     bool alive();
-    /// stops the encoder (its memory goes back); the encoded pictures stay cached on disk
+    /// frees the encoder (its RAM, or its VRAM: the process keeps its CUDA context on the card); the encoded
+    /// pictures stay cached on disk
     void unload();
-    /// starts it again after an unload, or after it died; the cache is kept
+    /// loads it again after an unload; the cache is kept
     void restart();
     void close();
     /// a picture's bytes from a data: URL, an http(s) URL or a local file, a URL's or file's at most kImageBytesMax
@@ -44,7 +47,7 @@ public:
     static std::string load(const std::string& source);
     /// an image URL's bytes, at most kImageBytesMax (std::invalid_argument when it cannot be read)
     static std::string download(const std::string& url);
-    /// the formats lamina-vision's decoder reads pass through; any other is converted, a JPEG stored turned (its EXIF
+    /// the formats the encoder's decoder reads pass through; any other is converted, a JPEG stored turned (its EXIF
     /// Orientation) is turned upright (std::invalid_argument when it cannot be read, or has over kImagePixelsMax)
     static std::string normalize(const std::string& data);
     /// encode() for every picture of one request: the files of its earlier pictures are never evicted for a later
@@ -55,33 +58,27 @@ public:
     /// `keep`: files the caller still needs
     std::pair<std::string, int64_t> encode(const std::string& source, bool is_bytes = false,
                                            const std::vector<std::string>& keep = {});
-    std::string dir;   ///< the encoder's files: a path without a space (#480: the ENC and GENI lines split at spaces)
+    std::string dir;   ///< the pictures' files: a path without a space (#480: the GENI line splits at spaces)
 
 private:
+    struct Loaded;   ///< the encoder, and its GPU kept from the engine's resets
     void start();
-    int read_line(std::string& line, double timeout_s, const std::string& what);
 
-    std::vector<std::string> args_;
-    std::string log_;
-    std::optional<Environment> env_;
-    std::unique_ptr<Process> proc_;
-    bool stopped_ = true;
-    std::mutex mu_;
+    json cfg_;
+    std::unique_ptr<Loaded> loaded_;
+    std::atomic<bool> alive_{false};
+    std::mutex mu_;   ///< the encoder and the cache: a picture at a time
     std::vector<std::pair<std::string, std::pair<std::string, int64_t>>> cache_;   ///< key -> (file, tokens), oldest first
 };
 
-/// where the image encoder belongs: lamina-vision in this program's folder, where a release and every build put it (no
-/// config names another)
-std::string vision_exe_path();
-/// that encoder; std::runtime_error when it is not there
-std::string vision_exe();
+/// whether this build has the image encoder (LAMINA_BUILD_VISION)
+bool vision_built();
+/// what a build without it says of itself
+const char* vision_not_built();
 /// a projector file's type (clip.projector_type; "" for a file that names none or cannot be read)
 std::string projector_type(const std::string& mmproj);
 /// the types the encoder reads: qwen3vl_merger (Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3.8-27B) and hy_v4_flash
 bool projector_type_read(const std::string& type);
-/// the encoder's command line from the config's vision section: it runs in its own directory, so the section's paths
-/// are made absolute
-std::vector<std::string> vision_reader_args(const json& cfg);
 /// a path to another computer (\\host\share, //host/share, \\?\UNC\..., \??\UNC\...): Windows would sign in to it
 bool network_path(const std::string& path);
 /// #874: where one request's combined image-embeddings file goes: on Linux /dev/shm when it has room (the engine
@@ -90,7 +87,7 @@ std::string combined_embeddings_path(const std::string& vision_dir, uintmax_t nb
 /// #874: `parts` (files) one after the other into `path`; on Windows as a short-lived file (FILE_ATTRIBUTE_TEMPORARY),
 /// which normally never reaches the drive before it is deleted
 void write_temporary(const std::string& path, const std::vector<std::string>& parts);
-/// a timeout from the environment (LAMINA_VISION_READY_S ...): seconds, nullopt for no limit (0 or less)
+/// a timeout from the environment (LAMINA_ENGINE_STALL_S ...): seconds, nullopt for no limit (0 or less)
 std::optional<double> timeout_env(const char* name, double dflt);
 
 }  // namespace lamina

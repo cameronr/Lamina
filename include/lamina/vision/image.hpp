@@ -11,10 +11,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
 namespace lamina::vision {
+
+/// A file by its UTF-8 path, for reading or (made anew) for writing, in binary; nullptr when it cannot be opened.
+std::FILE* open_utf8(const std::string& path, bool write);
 
 /// A picture's pixels: 3 bytes each (R, G, B), rows top to bottom.
 struct Rgb {

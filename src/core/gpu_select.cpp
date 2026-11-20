@@ -144,13 +144,20 @@ bool gpu_in_desktop_use(const std::string& bus_id, bool& known) {
     return desktop(Nvml::get().handle(bus_id), known);
 }
 
-std::vector<GpuInfo> list_gpus() {
+namespace {
+std::atomic<int> g_engine_gpus{-1};
+}  // namespace
+
+void engine_gpu_count(int n) { g_engine_gpus = n; }
+
+std::vector<GpuInfo> list_gpus(bool all) {
     std::vector<GpuInfo> out;
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess) {
         (void) cudaGetLastError();
         return out;
     }
+    if (const int engine = g_engine_gpus.load(); !all && engine >= 0) n = std::min(n, engine);
     for (int i = 0; i < n; ++i) out.push_back(info_of(i));
     return out;
 }
@@ -220,6 +227,28 @@ int find_gpu(const std::vector<GpuInfo>& gpus, const std::string& spec_in, std::
         why.pop_back();
     }
     return -1;
+}
+
+namespace {
+std::mutex g_keep_mu;
+std::vector<int> g_keep;   // a device's keeps, by its ordinal
+}  // namespace
+
+void gpu_keep(int device, bool keep) {
+    if (device < 0) return;
+    const std::lock_guard<std::mutex> lk(g_keep_mu);
+    if (g_keep.size() <= (size_t) device) g_keep.resize((size_t) device + 1, 0);
+    g_keep[(size_t) device] = std::max(0, g_keep[(size_t) device] + (keep ? 1 : -1));
+}
+
+void gpu_reset_unused(int device) {
+    (void) cudaSetDevice(device);
+    {
+        const std::lock_guard<std::mutex> lk(g_keep_mu);
+        if ((size_t) device < g_keep.size() && g_keep[(size_t) device] > 0) return;
+    }
+    (void) cudaDeviceReset();
+    (void) cudaGetLastError();
 }
 
 std::vector<GpuProbe> probe_gpus(const std::vector<int>& devices, int main_device) {

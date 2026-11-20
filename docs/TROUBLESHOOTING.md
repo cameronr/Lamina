@@ -84,20 +84,21 @@ off with `--no-mmproj`.
 **"port N is already in use - is Lamina (or another server) already running?".** Another server listens on the
 config's port: close it, or start this one with `--port`.
 
-**"the config has a "vision" section, and the image encoder is not there: ...".** The server starts the
-`lamina-vision` (`.exe`) in its own folder and no other: a release has it there, and the build writes it there. Put
-it back (a release's programs archive extracted whole, or the build run again), or take the `vision` section
-and `"--vision"` out of the config to run without pictures. The `exe` a config of an earlier version's setup holds is
-not read ([SETUP.md](SETUP.md#updating)).
+**"config "vision": this lamina-server was built without the image encoder (LAMINA_BUILD_VISION=OFF)".** The
+image encoder is a part of `lamina-server`, and this one was built without it. Build it with the encoder (the
+default: `build.bat`, `./build.sh`) or take a release's, or take the `vision` section and `"--vision"` out of the
+config to run without pictures. The `exe` a config of an earlier version's setup holds is not read
+([SETUP.md](SETUP.md#updating)).
 
-**"the vision encoder did not start: ERR this lamina-vision was built without CUDA ...".** The `lamina-vision` beside
-the server is a CPU-only build and the config's `vision` section asks for a GPU (`"gpu": true`). Set `"gpu"` to
-`false` (and remove `cuda_device`), or put the CUDA build back: a release's programs archive, or the build run again.
+**"the vision encoder did not start: its GPU ... is not there (...)".** The config's `vision` section asks for a GPU
+(`"gpu": true`) and its `cuda_device` names a card that is not in this PC (moved, replaced, or a config from another
+PC), or the driver gives no GPU. `nvidia-smi -L` lists the cards with their UUIDs: name one there, or set `"gpu"` to
+`false`.
 
-**"the vision encoder did not start: ERR lamina-vision sees no GPU (CUDA_VISIBLE_DEVICES=...)".** The config's
-`vision` section asks for a GPU (`"gpu": true`) and the encoder sees none: its `cuda_device` names a card that is not
-in this PC (moved, replaced, or a config from another PC), or is not a UUID or number CUDA takes, or the driver gives
-no GPU. `nvidia-smi -L` lists the cards with their UUIDs: name one there, or set `"gpu"` to `false`.
+**"the vision encoder did not start on GPU N, ...: its compute capability is ..., and Lamina needs 8.0 or newer".**
+On a GPU the encoder runs on the engine's kernels, which need an RTX 30 series card or newer (up to 0.3.2 it
+ran on older cards too). Name such a card in the `vision` section's `cuda_device`, or set `"gpu"` to `false`: the
+encoder then runs on the CPU.
 
 **"WARNING: no draft layer (...)".** Qwen3.8-Flash-Next's draft layer, `Lamina-Qwen3.8-Flash-Next-MTP.gguf`, is
 neither beside the model nor beside the server, or the config's `args` name a file that is not there (`"--mtp",
@@ -131,8 +132,8 @@ pageable. Raise it for the server: `memlock` in `/etc/security/limits.conf`, `Li
 unit, `--ulimit memlock=-1` for a container.
 
 **"Windows blocked ... Smart App Control".** Smart App Control on Windows 11 refuses programs that are not signed, and
-the engine and the image encoder are built on this PC. Turn it off (Windows Security > App & browser control > Smart
-App Control settings), or, if only the image encoder is blocked, start the server without pictures (`--no-mmproj`).
+the programs are built on this PC. Turn it off (Windows Security > App & browser control > Smart App Control
+settings).
 
 **"ExpertCache: cudaMalloc(...) failed: out of memory" although the GPU has VRAM free.** On Windows, every allocation
 on a GPU also counts against Windows' commit limit (RAM and the page file), and the locked experts already take much of
@@ -182,7 +183,7 @@ window said why at the start.
 
 **Pictures take seconds.** The image encoder runs on the CPU: about 9 s for a picture of ~1,000 image tokens on an
 8-core CPU. The config's `vision.max_tokens` caps a picture's tokens (1,024 in the configs). With a GPU that has
-~1.3 GB to spare, `--vision-gpu` runs the encoder there (about 2 s for such a picture).
+~1 GB to spare, `--vision-gpu` runs the encoder there (about 0.2 s for such a picture on an RTX 3090).
 
 **Two runs of one greedy request differ.** Where an expert is computed changes its rounding a little, and the GPUs'
 expert caches change as their copies land, so runs can part at a near-tie

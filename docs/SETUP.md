@@ -15,8 +15,8 @@ build.bat                        (Windows)
 ./build.sh                       (Linux)
 ```
 
-They build the preset `native` of `CMakePresets.json` into `build/`: `lamina-server`, `lamina` and the image encoder
-`lamina-vision`, on Windows with the CUDA runtime's DLLs beside them (on Linux they take the toolkit's), for this PC's
+They build the preset `native` of `CMakePresets.json` into `build/`: `lamina-server` (the image encoder is a part of
+it) and `lamina`, on Windows with the CUDA runtime's DLLs beside them (on Linux they take the toolkit's), for this PC's
 CPU and its GPUs of the RTX 30 series and newer, as `nvidia-smi` names them at each build (after a card is added, build
 again). The programs run from there: `build\lamina-server -m MODEL.gguf` ([below](#a-model-file)).
 `build.bat portable` (`./build.sh portable`) builds them for other PCs into `build-portable/`, as the releases are: RTX
@@ -41,9 +41,10 @@ Studio developer prompt).
 - **Jobs**: half the logical cores compile and link at once, so that the PC stays usable, fewer when the free RAM holds
   fewer (1.5 GB a job: nvcc's largest files take up to 0.9 GB); `-DLAMINA_JOBS=N` sets another number. A build that
   stops is tried once more: CUDA's ptxas now and then fails to read a file it has just written.
-- **What it builds**: the three programs. `-DLAMINA_BUILD_TESTS=ON` adds the tests (`ctest --test-dir build`), the
+- **What it builds**: the two programs. `-DLAMINA_BUILD_TESTS=ON` adds the tests (`ctest --test-dir build`), the
   parity checks and the tools, which otherwise build by name (`cmake --build build --target verify_parity`);
-  `-DLAMINA_BUILD_VISION=OFF` leaves the image encoder out.
+  `-DLAMINA_BUILD_VISION=OFF` leaves the image encoder out of the server, which then reads no pictures and does not
+  start with a config that has a `vision` section.
 
 **Without Visual Studio.** On Windows nvcc compiles with MSVC alone, and Visual Studio's installer is one way to get it:
 [portable-msvc.py](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977) (Python 3.9 or newer) downloads
@@ -65,19 +66,9 @@ downloads extract: the programs, `download-draft-layer.bat` (`.sh` on Linux) and
 `lamina`), and the CUDA runtime and cuBLAS the programs load, with NVIDIA's license (`cudart`; `--component` installs
 one). Installed on Linux, the programs load the libraries in their own folder.
 
-**A CPU-only image encoder.** `tools/vision` builds one without CUDA by default: 2 MB instead of the CUDA build's
-~89 MB, in seconds instead of minutes, as fast on the CPU. From the clone (on Windows in a Visual Studio developer
-prompt or after a portable MSVC's `setup_x64.bat`; it downloads llama.cpp as the engine's build does when
-`third_party/llama.cpp` is not there):
-
-```
-cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build-vision --target lamina-vision
-```
-
-Copy `build-vision/bin/lamina-vision` (`.exe`) beside `lamina-server`, over the one there, and keep `"gpu": false` in
-the configs' `vision` sections: with `"gpu": true` such a build refuses to start, and the server says so. The engine's
-build with `-DLAMINA_BUILD_VISION=OFF` leaves it there; a build with the encoder writes its CUDA one over it.
+**The image encoder** is a part of `lamina-server` (half a megabyte of it): on the CPU a graph on ggml, on a GPU the
+engine's own kernels, so a GPU it runs on is one the engine runs on (an RTX 30 or newer). A config's `vision` section
+says which ([below](#a-model-file)); no program beside the server is needed for pictures.
 
 The encoder reads the projectors of the engine's models: the type `qwen3vl_merger` (Qwen3.8-Flash-Next,
 Qwen3.6-35B-A3B, Qwen3.8-27B) and Hy4-flash's `hy_v4_flash` (`mmproj-Hy4-flash-bf16.gguf`). The server refuses a
@@ -105,10 +96,11 @@ The server builds a config for the file and says in its window what it took:
   ([the README](../README.md#the-draft-layer)).
 - **Pictures**: an image projector made for the model beside it (an `mmproj*.gguf` whose width is the model's; of
   several the smallest; Qwen3.6's and Qwen3.8-27B's repositories have theirs, `mmproj-F16.gguf`), read by the
-  `lamina-vision` beside the server on the CPU's logical cores, where it hides the GPUs so that they keep their VRAM for
-  experts. With `--vision-gpu` it runs on a GPU (~1.3 GB of its VRAM): of the cards besides the main one, the one with
-  the least VRAM that drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another
-  (`nvidia-smi -L` lists the UUIDs). `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
+  server's image encoder on the CPU's logical cores, so that the GPUs keep their VRAM for experts. With `--vision-gpu`
+  it runs on a GPU (the projector's size and 0.1-0.3 GB of buffers of its VRAM: 0.7 GB with Lamina's Q8_0 projector,
+  1.0 GB with an F16 one, 1.2 GB with Hy4-flash's): of the cards besides the main one, the one with the least VRAM that
+  drives no display, else any, else the main one; `--vision-cuda-device <UUID>` names another (`nvidia-smi -L` lists
+  the UUIDs). `--mmproj FILE` names a projector, `--no-mmproj` leaves pictures out; without a
   projector or the encoder the window says why there are none. For Qwen3.8-Flash-Next on the CPU, download Lamina's Q8_0
   projector into the model's folder: `mmproj-Qwen3.8-Flash-Next-Q8_0.gguf` (0.6 GB, ISTA-DASLab's BF16 one in Q8_0), in
   [eddoursul/Lamina-Qwen3.8-Flash-Next-MTP](https://huggingface.co/eddoursul/Lamina-Qwen3.8-Flash-Next-MTP) beside the
@@ -186,9 +178,8 @@ stops it before anything loads: the two would share the GPUs.
 Each [release](https://github.com/eddoursul/Lamina/releases) has the programs built for Windows and Linux, on x64 and
 arm64, in two downloads a platform:
 
-- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine (`lamina-server`), the engine alone
-  (`lamina`) and the image encoder (`lamina-vision`, on the CPU or a GPU as a config says), with their licenses, and
-  the script that downloads Flash-Next's draft layer (`download-draft-layer.bat`, `.sh` on Linux);
+- `lamina-<version>-bin-<os>-cuda-<x.y>-<cpu>`: the server with the engine and the image encoder (`lamina-server`)
+  and the engine alone (`lamina`), with their licenses, and the script that downloads Flash-Next's draft layer (`download-draft-layer.bat`, `.sh` on Linux);
 - `cudart-lamina-bin-<os>-cuda-<x.y>-<cpu>`: the CUDA runtime and cuBLAS they load, beside them (the same in every
   release of that CUDA version: one download serves the next releases).
 
@@ -220,7 +211,7 @@ preset ([above](#a-model-file)). Its keys:
 | `model_name` | the name the API lists |
 | `port`, `log` | the server's port; the engine's log file |
 | `sampling` | the defaults for requests that send no sampling fields ([USING.md](USING.md#sampling)) |
-| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does). The encoder itself is the `lamina-vision` in the server's folder |
+| `vision` | the image encoder's files and settings: the projector (`mmproj`; `model` is taken and not read), `threads` (the CPU's logical cores), or `gpu` (`true`, or the card it runs on, named as in `"gpu"`) and `cuda_device` (that card by its UUID: the server does not start when that card is not there; without one the server picks a card as `--vision-gpu` does), `q8` (a Q8_0 projector on a GPU: `mmq`, the default, multiplies its blocks as llama.cpp does, `fp16` its values as FP16, nearer the unquantized projector's embeddings; the answers measured the same). The encoder is a part of the server |
 | `expert_profile_save`, `expert_profile_save_every` | what the run learned about the experts (below) |
 
 The server's other keys (the network, API keys, idle unload, MCP servers, image generation):
@@ -385,8 +376,8 @@ at the `setup.py` it runs after the pull ("can't open file '...setup.py'", on Wi
 found"): the pull went through, and nothing is built. `build.bat` (`./build.sh`) builds the programs into the same
 `build/`, where the `run-<model>.bat` (`.sh`) and `lamina-<model>.json` setup wrote run them as before. The configs
 need no change: their `vision` section's `exe`, which named setup's encoder in `build-vision/bin` or
-`build-vision-cuda/bin`, is not read (the server starts the `lamina-vision` the build writes beside it, so a build of
-`lamina-server` alone, or with `-DLAMINA_BUILD_VISION=OFF`, leaves such a config unable to start), and the draft
+`build-vision-cuda/bin`, is not read (the encoder is a part of `lamina-server`; a build with `-DLAMINA_BUILD_VISION=OFF` leaves such a
+config unable to start), and the draft
 layer's folder `mtp/rt-distilled` still loads.
 
 - **CMake and Ninja**: `build.bat` takes Visual Studio's ("C++ CMake tools for Windows", part of the workload "Desktop

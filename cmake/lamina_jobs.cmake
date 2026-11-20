@@ -1,7 +1,7 @@
 # One Ninja job pool for every compile and link of the build: half the logical cores, so that the PC stays usable
 # while it builds, and no more jobs than the RAM free at configure time holds at LAMINA_JOB_MIB each (nvcc's largest
 # files). LAMINA_JOBS sets the number (the logical cores: the fastest build). Generators other than Ninja ignore pools.
-# The engine (CMakeLists.txt) and the image encoder (tools/vision) both take it, before their first target.
+# The engine's build (CMakeLists.txt) takes it, before its first target.
 #
 #   lamina_job_pool()   the pool lamina_jobs, every later target's (CMAKE_JOB_POOL_COMPILE and _LINK in the caller's
 #                       scope); LAMINA_JOBS_USED: its size

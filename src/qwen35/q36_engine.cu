@@ -21,6 +21,7 @@
 #include "lamina/artifact/gguf_reader.hpp"
 #include "lamina/core/cuda_host.hpp"
 #include "lamina/core/family_layout.hpp"
+#include "lamina/core/gpu_select.hpp"
 #include "lamina/kernels/fused_gdn.hpp"
 #include "lamina/kernels/iq_kernels.hpp"
 #include "lamina/kernels/native_mmvq.hpp"
@@ -1269,10 +1270,8 @@ bool plan_stages(Model& m, const lamina::GgufModel& gm, const std::vector<int>& 
     const auto take = [&](size_t n, const std::vector<size_t>& ends) {
         m.stage_dev.assign(devs.begin(), devs.begin() + (std::ptrdiff_t) n);
         m.stage_end = ends;
-        for (size_t i = n; i < devs.size(); ++i) {   // the GPUs left out: the context the query made goes
-            CK(cudaSetDevice(devs[i]));
-            CK(cudaDeviceReset());
-        }
+        // the GPUs left out: the context the query made goes
+        for (size_t i = n; i < devs.size(); ++i) lamina::core::gpu_reset_unused(devs[i]);
         CK(cudaSetDevice(devs[0]));
     };
     for (size_t n = 1; n <= devs.size(); ++n) {

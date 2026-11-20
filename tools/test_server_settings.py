@@ -36,6 +36,8 @@ COMPARED = {"mcp.cpp": ("settings_from", "mcp"), "service.cpp": ("sampling_defau
 # read, and not settings: the config's engine options, the other spelling of mcp_servers, and the sampling keys'
 # other spellings (repeat_penalty, repeat_last_n: merged into the table's)
 NOT_SETTINGS = {"args", "mcpServers", "sampling.repeat_penalty", "sampling.repeat_last_n"}
+# options taken and not read: a config or a command line of an earlier version may hold them
+NOT_READ = {"vision.model"}
 
 
 def table() -> dict[str, tuple[str, str, str]]:
@@ -80,7 +82,7 @@ class SettingsTable(unittest.TestCase):
     def test_every_option_is_read(self):
         read = keys_read()
         sections = {k.split(".")[0] for k in read}
-        unread = sorted(k for k in table() if k not in read and k not in sections)
+        unread = sorted(k for k in table() if k not in read and k not in sections and k not in NOT_READ)
         self.assertEqual(unread, [], "options of src/server/params.cpp whose key the server does not read")
 
     def test_options_named_after_their_keys(self):

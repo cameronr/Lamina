@@ -36,21 +36,18 @@
 #endif
 
 namespace lamina::vision {
-namespace {
 
-std::FILE* open_read(const std::string& path) {
+std::FILE* open_utf8(const std::string& path, bool write) {
 #ifdef _WIN32
     const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     if (n <= 0) return nullptr;
     std::vector<wchar_t> wide((size_t) n);
     if (MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), n) <= 0) return nullptr;
-    return _wfopen(wide.data(), L"rb");
+    return _wfopen(wide.data(), write ? L"wb" : L"rb");
 #else
-    return std::fopen(path.c_str(), "rb");
+    return std::fopen(path.c_str(), write ? "wb" : "rb");
 #endif
 }
-
-}  // namespace
 
 bool decode_memory(const uint8_t* data, size_t n, Rgb& out, std::string& err) {
     int w = 0, h = 0, channels = 0;
@@ -68,7 +65,7 @@ bool decode_memory(const uint8_t* data, size_t n, Rgb& out, std::string& err) {
 }
 
 bool decode_file(const std::string& path, Rgb& out, std::string& err) {
-    std::FILE* f = open_read(path);
+    std::FILE* f = open_utf8(path, false);
     if (f == nullptr) {
         err = "cannot open " + path;
         return false;

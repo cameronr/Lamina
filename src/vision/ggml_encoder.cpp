@@ -1,11 +1,12 @@
-// src/vision/ggml_encoder.cpp - the image encoder as a ggml graph (include/lamina/vision/encoder.hpp).
+// src/vision/ggml_encoder.cpp - the image encoder on the CPU, a ggml graph (include/lamina/vision/encoder.hpp).
 //
 // What llama.cpp's mtmd does for these two projector types at the pinned commit, kept operation for operation and in
 // its order (tools/mtmd/clip.cpp, models/qwen3vl.cpp, models/hunyuanvl.cpp, MIT; Hy4's adapter and limits from pull
-// request 32517's models/hy-v4-flash.cpp): the weights in their GGUF types on the backend, a graph built per picture
-// for its size, ggml's scheduler placing each operation on the GPU or the CPU.  The graph's nodes are added in mtmd's
-// order, so the backend's kernels see the same work and the rows come out the same.
-#include "lamina/vision/encoder.hpp"
+// request 32517's models/hy-v4-flash.cpp): the weights in their GGUF types in ggml's CPU backend, a graph built per
+// picture for its size.  The graph's nodes are added in mtmd's order, so ggml's kernels see the same work and the rows
+// come out the same.
+#include "backends.hpp"
+
 #include "lamina/vision/projector.hpp"
 
 #include "ggml-alloc.h"
@@ -23,6 +24,10 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace lamina::vision {
 namespace {
@@ -103,6 +108,16 @@ struct Graph {
     ggml_tensor* inp_raw = nullptr;
     ggml_tensor* positions = nullptr;   // Qwen's rotary positions
     ggml_tensor* pos_embd = nullptr;    // Hy4's resampled position table
+    // LAMINA_VISION_DUMP: tensors kept past the graph's run (each an output, so its buffer is not reused)
+    bool dump = false;
+    std::vector<std::pair<std::string, ggml_tensor*>> taps;
+    void tap(ggml_tensor* t, const std::string& name) {
+        if (!dump) return;
+        ggml_set_output(t);
+        taps.emplace_back(name, t);
+    }
+    bool tap_layer(int il) const { return il < 2 || il == n_layer - 1; }
+    bool tap_attn = false;   // the next attention's output before its projection
 
     Graph(const Model& model, ggml_context* ctx, int w, int h, bool flash_attention, int pad)
         : m(model), ctx0(ctx), gf(ggml_new_graph_custom(ctx, kMaxNodes, false)), img_w(w), img_h(h),
@@ -139,7 +154,7 @@ struct Graph {
 
     // q, k, v [d_head, n_head, n_pos, B] -> the block's attention output [n_embd, n_pos * B]
     ggml_tensor* build_attn(ggml_tensor* wo, ggml_tensor* wo_b, ggml_tensor* q_cur, ggml_tensor* k_cur,
-                            ggml_tensor* v_cur) const {
+                            ggml_tensor* v_cur) {
         // into the graph together, in this order
         ggml_build_forward_order(gf, q_cur);
         ggml_build_forward_order(gf, k_cur);
@@ -174,6 +189,7 @@ struct Graph {
             cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
             cur = ggml_cont_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
         }
+        if (tap_attn) tap(cur, "fa0");
         if (wo) cur = ggml_mul_mat(ctx0, wo, cur);
         if (wo_b) cur = ggml_add(ctx0, cur, wo_b);
         return cur;
@@ -204,7 +220,8 @@ struct Graph {
         inp = ggml_add(ctx0, inp, m.patch_bias);
 
         // the learned position table at the picture's grid, in the same grouping
-        ggml_tensor* learned_pos_embd = resize_position_embeddings(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
+        ggml_tensor* learned_pos_embd = resize_position_embeddings((uint32_t) GGML_SCALE_MODE_BILINEAR |
+                                                                   (uint32_t) GGML_SCALE_FLAG_ALIGN_CORNERS);
         learned_pos_embd = ggml_cont_4d(ctx0, learned_pos_embd, n_embd * 2, n_patches_x / 2, n_patches_y, batch_size);
         learned_pos_embd =
             ggml_reshape_4d(ctx0, learned_pos_embd, n_embd * 2, n_patches_x / 2, 2, batch_size * (n_patches_y / 2));
@@ -213,6 +230,7 @@ struct Graph {
         inp = ggml_add(ctx0, inp, learned_pos_embd);
 
         ggml_tensor* inpL = inp;
+        tap(inpL, "embed");
 
         positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, num_position_ids);
         ggml_set_name(positions, "positions");
@@ -225,6 +243,8 @@ struct Graph {
             ggml_tensor* cur = inpL;
 
             cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, false, eps);
+            if (il == 0) tap(cur, "ln0");
+            tap_attn = il == 0;
 
             {
                 cur = ggml_mul_mat(ctx0, layer.qkv_w, cur);
@@ -244,6 +264,7 @@ struct Graph {
 
                 cur = build_attn(layer.o_w, layer.o_b, Qcur, Kcur, Vcur);
             }
+            if (il == 0) tap(cur, "attn0");
 
             cur = ggml_add(ctx0, cur, inpL);
             inpL = cur;
@@ -253,6 +274,7 @@ struct Graph {
 
             cur = ggml_add(ctx0, inpL, cur);
             inpL = cur;
+            if (tap_layer(il)) tap(inpL, "layer" + std::to_string(il));
         }
 
         if (m.post_ln_w) inpL = build_norm(inpL, m.post_ln_w, m.post_ln_b, false, eps);
@@ -300,6 +322,7 @@ struct Graph {
 
         inp = ggml_reshape_2d(ctx0, inp, n_embd, n_pos * B);
         ggml_tensor* inpL = inp;
+        tap(inpL, "embed");
 
         if (m.pre_ln_w) inpL = build_norm(inpL, m.pre_ln_w, m.pre_ln_b, false, eps);
 
@@ -308,6 +331,8 @@ struct Graph {
             ggml_tensor* cur = inpL;
 
             cur = build_norm(cur, layer.ln_1_w, layer.ln_1_b, false, eps);
+            if (il == 0) tap(cur, "ln0");
+            tap_attn = il == 0;
 
             {
                 ggml_tensor* Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
@@ -325,6 +350,7 @@ struct Graph {
 
                 cur = build_attn(layer.o_w, layer.o_b, Qcur, Kcur, Vcur);
             }
+            if (il == 0) tap(cur, "attn0");
 
             cur = ggml_add(ctx0, cur, inpL);
             inpL = cur;
@@ -334,6 +360,7 @@ struct Graph {
 
             cur = ggml_add(ctx0, inpL, cur);
             inpL = cur;
+            if (tap_layer(il)) tap(inpL, "layer" + std::to_string(il));
         }
 
         if (m.post_ln_w) inpL = build_norm(inpL, m.post_ln_w, m.post_ln_b, false, eps);
@@ -418,49 +445,32 @@ public:
         sched_.reset();
         buf_.reset();
         if (backend_ != nullptr) ggml_backend_free(backend_);
-        if (backend_cpu_ != nullptr && backend_cpu_ != backend_) ggml_backend_free(backend_cpu_);
     }
     GgmlEncoder(const GgmlEncoder&) = delete;
     GgmlEncoder& operator=(const GgmlEncoder&) = delete;
 
     /// throws std::runtime_error
     void open(const EncoderParams& p) {
-        flash_ = p.flash_attention;
-        threads_ = p.threads > 0 ? p.threads : 4;
+        flash_ = p.flash_attention != FlashAttention::off;
+        // without a number of threads: one a core, at most 16 (a 256-thread server does not need 128 of them)
+        threads_ = p.threads > 0 ? p.threads : (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
 
-        // the backends: the GPU first when asked for, the CPU for what it lacks
-        backend_cpu_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        if (backend_cpu_ == nullptr) throw std::runtime_error("the CPU backend did not start");
-        if (p.gpu) {
-            backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-            if (backend_ == nullptr) backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
-            if (backend_ == nullptr) throw std::runtime_error("no GPU backend started");
-        }
-        if (backend_ != nullptr) {
-            backends_.push_back(backend_);
-            bufts_.push_back(ggml_backend_get_default_buffer_type(backend_));
-        } else {
-            backend_ = backend_cpu_;
-        }
-        backends_.push_back(backend_cpu_);
-        bufts_.push_back(ggml_backend_get_default_buffer_type(backend_cpu_));
-        sched_.reset(ggml_backend_sched_new(backends_.data(), bufts_.data(), (int) backends_.size(), kMaxNodes, false, true));
+        backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (backend_ == nullptr) throw std::runtime_error("ggml's CPU backend did not start");
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
+        sched_.reset(ggml_backend_sched_new(&backend_, &buft, 1, kMaxNodes, false, true));
 
         proj_.open(p);
         static_cast<ProjectorParams&>(m_) = proj_;
         load();
-        // ggml's CUDA flash attention has tensor-core kernels for heads of 64, 80, 96, 112 and 128 values; a head
-        // of another size (this tower's 72) goes to its tile kernel, which at the pinned commit is slower and, the
-        // more patches a picture has, further from the FP32 attention: Hy4's 3,645-row screenshot 3.05 s and rows
-        // 27% from the CPU's, padded to 80 1.19 s and 6%; Flash-Next's pictures of ~1,000 tokens 0.33-0.35 s and
-        // 5-13% from the CPU's FP32 attention, padded 0.19-0.21 s and 2.4-5.5%.  So on a GPU the heads are padded
-        // to the next of those sizes (mtmd leaves them: Qwen's rows on a GPU are no longer its bytes; on the CPU
-        // they are).  LAMINA_VISION_HEAD_PAD=N pads them to N values (0: none), for comparisons.
-        if (backend_ != backend_cpu_) {
+        // ggml's fast flash attention kernel takes heads that are whole vectors: 8 floats with AVX2, which this
+        // tower's 72 are, 16 with AVX-512, where 72 go to a kernel several times slower.  A build with AVX-512 pads
+        // them with zeros to 80 (a 975-token picture, Q8_0 projector, 16 threads: 7.0 s; unpadded 34.7 s, 20.5 s with
+        // the attention as two products; an AVX2 build 9.05 s, its rows mtmd's bytes: mtmd pads none).
+        // LAMINA_VISION_HEAD_PAD=N pads them to N values (0: none), for comparisons.
+        {
             const int d_head = m_.d_head();
-            int to = d_head;
-            for (const int size : {64, 80, 96, 112, 128})
-                if (to == d_head && size >= d_head) to = size;
+            int to = ggml_cpu_has_avx512() != 0 ? (d_head + 15) / 16 * 16 : d_head;
             if (const char* s = std::getenv("LAMINA_VISION_HEAD_PAD")) to = std::max(d_head, std::atoi(s));
             head_pad_ = to - d_head;
         }
@@ -552,24 +562,14 @@ private:
         const int64_t width = m_.kind == Kind::qwen3vl ? m_.mm_1_b->ne[0] : m_.mm_1_w->ne[3];
         if (width != m_.projection_dim) throw std::runtime_error("its adapter's output is not its projection_dim wide");
 
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
-        buf_.reset(ggml_backend_alloc_ctx_tensors_from_buft(data_.get(), buft));
-        if (!buf_) throw std::runtime_error("the projector's weights do not fit the device's memory");
+        buf_.reset(ggml_backend_alloc_ctx_tensors_from_buft(data_.get(), ggml_backend_get_default_buffer_type(backend_)));
+        if (!buf_) throw std::runtime_error("the projector's weights do not fit the RAM");
         ggml_backend_buffer_set_usage(buf_.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-        const bool host = ggml_backend_buft_is_host(buft);
-        std::vector<uint8_t> read_buf;
         for (ggml_tensor* t : to_load) {
             const TensorInfo* info = proj_.find(t->name);
             if (info == nullptr || info->bytes != ggml_nbytes(t))
                 throw std::runtime_error(std::string("the projector has no tensor ") + t->name);
-            if (host) {
-                proj_.read(t->name, *info, t->data);   // the CPU's buffer: read in place
-            } else {
-                read_buf.resize(info->bytes);
-                proj_.read(t->name, *info, read_buf.data());
-                ggml_backend_tensor_set(t, read_buf.data(), 0, info->bytes);
-            }
+            proj_.read(t->name, *info, t->data);   // the CPU's buffer: read in place
         }
         if (m_.kind == Kind::hy4) {
             pos_host_.resize((size_t) ggml_nelements(m_.position_embd));
@@ -583,21 +583,17 @@ private:
                                /*.no_alloc =*/ true};
         ctx0.reset(ggml_init(ip));
         g = std::make_unique<Graph>(m_, ctx0.get(), w, h, flash, head_pad_);
+        g->dump = std::getenv("LAMINA_VISION_DUMP") != nullptr;
         return g->build();
     }
 
-    /// the buffers for a w x h picture's graph reserved; false where the backend lacks its flash attention
-    bool reserve(int w, int h, bool flash) {
+    /// the buffers for a w x h picture's graph reserved
+    void reserve(int w, int h) {
         ggml_context_ptr ctx0;
         std::unique_ptr<Graph> g;
-        ggml_cgraph* gf = build(ctx0, g, w, h, flash);
+        ggml_cgraph* gf = build(ctx0, g, w, h, flash_);
         if (!ggml_backend_sched_reserve(sched_.get(), gf))
-            throw std::runtime_error("the encoder's buffers do not fit the device's memory");
-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-            ggml_tensor* node = ggml_graph_node(gf, i);
-            if (node->op == GGML_OP_FLASH_ATTN_EXT && !ggml_backend_supports_op(backend_, node)) return false;
-        }
-        return true;
+            throw std::runtime_error("the encoder's buffers do not fit the RAM");
     }
 
     void encode_or_throw(const Rgb& picture, Rows& out) {
@@ -610,27 +606,18 @@ private:
         const Rgb sized = fit(picture, tw, th, m_.filter, m_.letterbox, m_.pad);
         const std::vector<float> pixels = planes(sized, m_.mean, m_.std);
 
-        // The first picture settles the flash attention (automatic: on where the backend has it for this tower) and
-        // reserves the buffers, as mtmd's warm-up does.
+        // the first picture reserves the buffers, as mtmd's warm-up does
         if (!allocated_) {
-            if (flash_ == FlashAttention::automatic) {
-                flash_ = FlashAttention::on;
-                if (!reserve(tw, th, true)) {
-                    flash_ = FlashAttention::off;
-                    reserve(tw, th, false);
-                }
-            } else {
-                reserve(tw, th, flash_ == FlashAttention::on);
-            }
+            reserve(tw, th);
             allocated_ = true;
         }
 
         ggml_backend_sched_reset(sched_.get());
         ggml_context_ptr ctx0;
         std::unique_ptr<Graph> g;
-        ggml_cgraph* gf = build(ctx0, g, tw, th, flash_ == FlashAttention::on);
+        ggml_cgraph* gf = build(ctx0, g, tw, th, flash_);
         if (!ggml_backend_sched_alloc_graph(sched_.get(), gf))
-            throw std::runtime_error("the picture's buffers do not fit the device's memory");
+            throw std::runtime_error("the picture's buffers do not fit the RAM");
 
         ggml_backend_tensor_set(g->inp_raw, pixels.data(), 0, ggml_nbytes(g->inp_raw));
         const int pw = tw / m_.patch_size, ph = th / m_.patch_size;
@@ -643,11 +630,20 @@ private:
             ggml_backend_tensor_set(g->pos_embd, table.data(), 0, ggml_nbytes(g->pos_embd));
         }
 
-        ggml_backend_cpu_set_n_threads(backend_cpu_, threads_);
+        ggml_backend_cpu_set_n_threads(backend_, threads_);
         const ggml_status status = ggml_backend_sched_graph_compute(sched_.get(), gf);
         if (status != GGML_STATUS_SUCCESS)
             throw std::runtime_error("the encoder's graph failed (ggml status " + std::to_string((int) status) + ")");
 
+        for (const auto& [name, t] : g->taps) {
+            std::vector<float> v((size_t) ggml_nelements(t));
+            ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+            const std::string file = std::string(std::getenv("LAMINA_VISION_DUMP")) + "/" + name + ".f32";
+            if (std::FILE* f = ggml_fopen(file.c_str(), "wb")) {
+                std::fwrite(v.data(), 4, v.size(), f);
+                std::fclose(f);
+            }
+        }
         ggml_tensor* rows = ggml_graph_node(gf, -1);
         const int n = (int) rows->ne[1];
         const int merged_x = pw / m_.n_merge, merged_y = ph / m_.n_merge;
@@ -672,14 +668,12 @@ private:
     Projector proj_;
     Model m_;
     ggml_context_ptr data_;
-    ggml_backend_t backend_ = nullptr, backend_cpu_ = nullptr;
-    std::vector<ggml_backend_t> backends_;
-    std::vector<ggml_backend_buffer_type_t> bufts_;
+    ggml_backend_t backend_ = nullptr;   // ggml's CPU backend
     ggml_backend_buffer_ptr buf_;
     ggml_backend_sched_ptr sched_;
     std::vector<uint8_t> compute_meta_;
     std::vector<float> pos_host_;   // Hy4's position table
-    FlashAttention flash_ = FlashAttention::automatic;
+    bool flash_ = true;             // flash attention (K and V in FP16); false: two products in FP32
     int threads_ = 4;
     int head_pad_ = 0;
     bool allocated_ = false;
@@ -687,15 +681,7 @@ private:
 
 }  // namespace
 
-bool gpu_visible() {
-    backends_init();
-    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
-           ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr;
-}
-
-bool cpu_has_avx512() { return ggml_cpu_has_avx512() != 0; }
-
-std::unique_ptr<Encoder> open_encoder(const EncoderParams& params, std::string& err) {
+std::unique_ptr<Encoder> open_ggml_encoder(const EncoderParams& params, std::string& err) {
     backends_init();
     auto enc = std::make_unique<GgmlEncoder>();
     try {

@@ -272,7 +272,8 @@ void settle_vision(json& cfg) {
 }
 
 /// a vision section that asks for a GPU and names none: the card pick_vision_gpu chooses, by its UUID, said in the
-/// window (the encoder would otherwise see every card and take CUDA's first)
+/// window (the encoder would otherwise take CUDA's first); one that names its card by nvidia-smi's number: that
+/// card's UUID (the encoder finds its card among this process's CUDA devices, whose order is another)
 void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
     // "gpu" naming a card (a name, a UUID's start, a PCI bus id, a number): the encoder on it, by its UUID
     if (const json& g = jget(jget(cfg, "vision"), "gpu"); g.is_string() && !strip(g.get<std::string>()).empty()) {
@@ -287,7 +288,15 @@ void settle_vision_gpu(json& cfg, std::vector<GpuInfo>& gpus) {
     const json& v = jget(cfg, "vision");
     const json& dev = jget(v, "cuda_device");
     const bool named = !dev.is_null() && !(dev.is_string() && strip(dev.get<std::string>()).empty());
-    if (!v.is_object() || !truthy(jget(v, "gpu")) || named) return;
+    if (!v.is_object() || !truthy(jget(v, "gpu"))) return;
+    if (named) {
+        const std::string spec(strip(dev.is_string() ? dev.get<std::string>() : py_dumps(dev)));
+        if (!std::all_of(spec.begin(), spec.end(), ::isdigit)) return;
+        if (gpus.empty()) gpus = nvidia_gpus();
+        for (const GpuInfo& g : gpus)
+            if (g.index == std::stoi(spec) && !g.uuid.empty()) cfg["vision"]["cuda_device"] = g.uuid;
+        return;
+    }
     if (gpus.empty()) gpus = nvidia_gpus();
     const std::vector<int> engine = engine_gpus(cfg, gpus);
     const int pick = pick_vision_gpu(gpus, engine.empty() ? -1 : engine.front());
@@ -603,6 +612,7 @@ int run(int argc, char** argv) {
             }
             if (groups.empty()) {
                 apply_engine_env(cfg, offline);   // the engine runs in this process: its environment is this one
+                show_vision_gpu(cfg, gpus);       // and the image encoder's
                 if (!log.empty()) redirect_stderr(log);   // the engine's messages go to its log; the server's stay here
             }
             monitor_gpus = engine_gpus(cfg);   // in the config's "env", before the engine and the image encoder start
@@ -616,18 +626,14 @@ int run(int argc, char** argv) {
             }
             lazy = jget(cfg, "lazy_load") == true;
             if (truthy(jget(cfg, "vision"))) {
+                if (!vision_built())
+                    throw ConfigError(std::string("\"vision\": ") + vision_not_built());
                 say(lazy ? "vision encoder unloaded; it starts with the model ..." : "loading the vision encoder ...");
-                json vcfg = cfg["vision"];   // relative paths are the config's cwd's, as for the engine
-                for (const char* k : {"mmproj", "model"})
-                    if (jget(vcfg, k).is_string() && !u8_path(vcfg[k].get<std::string>()).is_absolute())
-                        vcfg[k] = u8_str(cfg_dir / u8_path(vcfg[k].get<std::string>()));
-                Environment venv = groups.empty() ? vision_env(cfg) : child_env(cfg, offline);
-                const json& dev = jget(cfg["vision"], "cuda_device");
-                if (!groups.empty() && !dev.is_null()) {   // #408: the encoder on a card of its own
-                    venv["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID";
-                    venv["CUDA_VISIBLE_DEVICES"] = dev.is_string() ? dev.get<std::string>() : py_dumps(dev);
-                }
-                vision = std::make_shared<Vision>(vcfg, log, venv, lazy);
+                // in this process, before the engine: what it takes of a GPU is taken when the engine sizes its caches
+                json vcfg = cfg["vision"];   // a relative path is the config's cwd's, as for the engine
+                if (const std::string f = jstr(vcfg, "mmproj"); !f.empty() && !u8_path(f).is_absolute())
+                    vcfg["mmproj"] = u8_str(cfg_dir / u8_path(f));
+                vision = std::make_shared<Vision>(vcfg, lazy);
             }
             say(lazy ? "model unloaded; the first request loads it ..." : "loading the model (the first start takes a minute or two) ...");
             const double silence = engine_silence_s(cfg);   // #481: checked before the (minutes-long) start

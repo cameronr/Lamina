@@ -29,6 +29,9 @@ const std::vector<Param> kParams = {
      "(earlier versions read its vocabulary)"},
     {"--vision-gpu", "", "vision.gpu", K::Bool, "", "the image encoder on a GPU, not the CPU"},
     {"--vision-cuda-device", "", "vision.cuda_device", K::Str, "UUID", "that GPU (nvidia-smi -L lists the UUIDs)"},
+    {"--vision-q8", "", "vision.q8", K::Str, "mmq|fp16",
+     "a Q8_0 projector on a GPU: its blocks multiplied as llama.cpp multiplies them (mmq, the default: the inputs "
+     "rounded to 8 bits), or its values multiplied as FP16 (fp16: nearer the unquantized projector's rows)"},
     {"--vision-threads", "", "vision.threads", K::Int, "N", "the encoder's CPU threads (with -m: the logical cores)"},
     {"--vision-max-tokens", "", "vision.max_tokens", K::Int, "N", "a picture's tokens at most"},
     {"--vision-min-tokens", "", "vision.min_tokens", K::Int, "N", "a picture's tokens at least"},

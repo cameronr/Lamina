@@ -44,16 +44,15 @@ REDIST_URL = "https://developer.download.nvidia.com/compute/cuda/redist"
 COMPONENTS = ("cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "libcublas", "cccl")
 SKIP = {"libcublas_static.a", "libcublasLt_static.a"}   # ~1 GB the engine does not link
 # What each archive holds (cmake --install's components): checked before it is written
-EXECUTABLES = [f"lamina-server{EXE}", f"lamina{EXE}", f"lamina-vision{EXE}"]
+EXECUTABLES = [f"lamina-server{EXE}", f"lamina{EXE}"]
 PROGRAMS = [*EXECUTABLES, "download-draft-layer.bat" if WIN else "download-draft-layer.sh", "LICENSE",
             "LICENSE-llama.cpp", "LICENSE-cpp-httplib", "LICENSE-jsonhpp", "LICENSE-Outfit"]
 # What the Linux programs may take from the system (docs/SETUP.md, Release binaries): glibc 2.34 at most (Ubuntu
-# 22.04, Debian 12, RHEL 9, Amazon Linux 2023), OpenSSL 3 and the NVIDIA driver's libcuda.so.1 (the image encoder's
-# ggml-cuda links it); the C++ runtime is linked in (the portable preset) and the CUDA runtime is the archive's,
+# 22.04, Debian 12, RHEL 9, Amazon Linux 2023), OpenSSL 3; the C++ runtime is linked in (the portable preset) and the CUDA runtime is the archive's,
 # beside them (RUNPATH $ORIGIN)
 GLIBC_MAX = (2, 34)
 SYSTEM_LIBS = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "ld-linux-x86-64.so.2",
-               "ld-linux-aarch64.so.1", "libssl.so.3", "libcrypto.so.3", "libcuda.so.1"}
+               "ld-linux-aarch64.so.1", "libssl.so.3", "libcrypto.so.3"}
 
 
 def say(msg=""):
