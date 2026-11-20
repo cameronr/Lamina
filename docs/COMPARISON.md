@@ -34,7 +34,7 @@ predate: an RTX 5060 Ti in the Gyro-L section's runs, now a second RTX 3090, the
   both GPUs, long prompts 2-8% slower. [Qwen3.8-27B](#qwen38-27b) (UD-Q6_K_M, the full context on both GPUs): Lamina writes code 29%
   faster than llama.cpp, thinks 48% faster, edits 23% faster and reads prompts 4-13% faster.
 - [Hy4-flash](#hy4-flash) (Tencent's model, its Q4_K_M with 83 GiB of experts over the three GPUs and the RAM):
-  Lamina writes 4.4-6x as fast as llama.cpp's PR #32517 and reads prompts 17-30x as fast (its 64K prompt in 35 s
+  Lamina writes 4.7-6.1x as fast as llama.cpp's PR #32517 and reads prompts 17-31x as fast (its 64K prompt in 35 s
   against 18 minutes).
 
 ## The PC and the engines
