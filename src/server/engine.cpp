@@ -145,6 +145,7 @@ void LaminaEngine::start() {
     std::string line;
     bool timed_out = false;
     json info = json::object();   // this start's INFO facts
+    json adapters = json::array();   // its LoRA adapters (ADAPTER lines), INFO's "adapters"
     while (true) {
         double left = ready_timeout_s > 0 ? ready_timeout_s - since(t0) : -1;
         if (ready_timeout_s > 0 && left <= 0) {
@@ -161,6 +162,9 @@ void LaminaEngine::start() {
                 const std::string k = kv.substr(0, eq), v = eq == std::string::npos ? "" : kv.substr(eq + 1);
                 info[k] = digits(v, true) ? json(std::atoll(v.c_str())) : json(v);
             }
+        } else if (starts_with(line, "ADAPTER ")) {   // a LoRA adapter it loaded (--lora), as JSON
+            json a;
+            if (py_loads(line.substr(8), a) && a.is_object()) adapters.push_back(std::move(a));
         } else if (starts_with(line, "CACHE ")) {   // the prompt cache at rest
             cache_line(line);
         } else if (starts_with(line, "WARN ")) {    // the engine's warning, as its start goes (RAM that is tight)
@@ -190,6 +194,7 @@ void LaminaEngine::start() {
                          (log_.empty() ? "" : " (see " + log_ + ")") + "\n" + death_note());
     }
     known_ctx_ = max_context_;
+    if (!adapters.empty()) info["adapters"] = std::move(adapters);
     if (info.contains("engine")) info["version"] = info["engine"].is_string() ? info["engine"] : json(py_dumps(info["engine"]));
     batch_ = info.contains("batch_slots") && info["batch_slots"].is_number_integer() ? info["batch_slots"].get<int>() : 0;
     set_info(std::move(info));
@@ -459,6 +464,11 @@ std::string LaminaEngine::sampling_keys(const json& s) {
     if (const json& score = jget(s, "score"); truthy(score)) {   // POST /v1/choose: the engine's LP line for these ids
         keys += " score=";
         for (size_t k = 0; k < score.size(); ++k) keys += (k ? ":" : "") + std::to_string(score[k].get<int64_t>());
+    }
+    // the LoRA adapters' scales, every adapter's in their order (the engine keeps a conversation's state per choice)
+    if (const json& ls = jget(s, "lamina_lora"); ls.is_array() && !ls.empty()) {
+        keys += " lora=";
+        for (size_t k = 0; k < ls.size(); ++k) keys += (k ? "," : "") + fr(ls[k].is_number() ? ls[k].get<double>() : 0.0);
     }
     // "lamina_checkpoint": false - a one-shot call no later request extends: no conversation checkpoint for it (#830)
     if (const json& c = jget(s, "lamina_checkpoint"); c.is_boolean() && !c.get<bool>()) keys += " ckpt=0";

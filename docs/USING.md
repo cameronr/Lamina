@@ -31,6 +31,7 @@ its config file ([below](#the-config)); only the page itself can change them.
 | The prompt a chat request is read as; a text's token ids and back (llama-server's fields) | `POST /apply-template`, `POST /tokenize`, `POST /detokenize` |
 | Image generation, when set up ([below](#image-generation)) | `POST /v1/images/generations` |
 | Unload the model now, or load it ahead of a request | `POST /unload`, `POST /load` |
+| The LoRA adapters and their scales (llama-server's; [below](#lora-adapters)) | `GET /lora-adapters`, `POST /lora-adapters` |
 
 ```bash
 curl http://127.0.0.1:8081/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -124,6 +125,40 @@ Every token, drafted or not, is the model's own pick: with sampling, a draft is 
 model sampled for its position, so the drafts change the speed, never the distribution. The expert tiers adapt to the
 conversation in the background, so a sampled answer is reproducible run to run only with `--adapt-every 0` in the
 engine's arguments.
+
+## LoRA adapters
+
+Qwen3.6-35B-A3B and Qwen3.8-27B take LoRA adapters in llama.cpp's GGUF format (`convert_lora_to_gguf.py`'s), with
+llama-server's options and API. In the config's `args` (or on the command line):
+
+| Option | |
+| --- | --- |
+| `--lora F[,F]` | the adapters, each at scale 1 |
+| `--lora-scaled F:S[,F:S]` | the same at scale S (the scale after the last `:`, so `D:\adapters\pi.gguf:0.5` reads) |
+| `--lora-init-without-apply` | the adapters loaded at scale 0: requests or `POST /lora-adapters` set them |
+
+```json
+"args": {"lora": "D:\\adapters\\Qwen3.8-27B-pi-lora-F16.gguf,D:\\adapters\\Qwen3.8-27B-opencode-lora-F16.gguf"}
+```
+
+Each product with a pair adds `s B (A x)`, `s` the scale times the adapter's alpha over its rank (llama.cpp's). Several
+adapters add up. The adapters are numbered in their order:
+
+- `GET /lora-adapters`: `[{"id": 0, "path": ..., "scale": 1.0, "task_name": ..., "prompt_prefix": ...}, ...]`, the
+  scales a request that names none takes.
+- `POST /lora-adapters` with `[{"id": 0, "scale": 0.5}]` sets those scales, every adapter left out at 0.
+- A request's `"lora": [{"id": 1, "scale": 1.0}]` (Chat Completions, Messages, Responses) runs it with those
+  scales, every adapter left out at 0; an id that is not an adapter's, or a scale that is not a number, is a 400.
+- The config's `lora_models` gives sets of scales names: `"lora_models": {"qwen3.8-27b-pi": [{"id": 0, "scale": 1}],
+  "qwen3.8-27b-opencode": [{"id": 1, "scale": 1}]}`. A request naming one as its model (and no `"lora"` of its own)
+  runs with them, so a client that only picks a model name picks an adapter; `/v1/models` lists them beside the
+  model.
+
+A conversation's state belongs to the scales it was read with: a request with other scales reads its prompt again
+(llama.cpp's cache does the same), and with batch slots (`parallel`) each slot keeps its own, so requests with
+different adapters decode together. The adapters' pairs may be F16, BF16, F32 or Q8_0, at any of the model's
+projections but the embedding, the router and the routed experts; activated LoRA (aLoRA) adapters are refused.
+Flash-Next and Hy4-flash take no adapters.
 
 ## Behaviour
 
@@ -357,6 +392,7 @@ alone: `--config`, `--write-config`, `--check`, `--help` and `--version` (`-v`).
 | `cors_origins`, `trusted_origins`, `allowed_hosts` | browsers and host names ([above](#from-other-devices)) |
 | `sampling`, `reasoning_effort`, `reasoning_budget_tokens`, `answer_room` | the defaults for requests ([above](#thinking)) |
 | `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases` | [above](#behaviour) |
+| `lora_models` | model names that run with the engine's LoRA adapters ([above](#lora-adapters)) |
 | `tool_call_recovery`, `repeat_stop_tokens`, `reasoning_close_retry`, `literal_markers`, `short_opening_tokens`, `reasoning_loop_recovery`, `engine_silence_s` | [above](#behaviour) |
 | `chat_template_file` | a chat template file in place of the model file's ([the README](../README.md#a-fixed-chat-template)) |
 | `codex_compaction_cache`, `codex_thread_titles`, `env_to_user` | Codex's compaction and titles; opencode's `<env>` block moved to the first user message, so the system turn stays the same between sessions |

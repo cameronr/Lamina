@@ -140,6 +140,21 @@ public:
     void set_reasoning_budget_tokens(json v);
     /// the config's "sampling" block, a copy
     json sampling_defaults_now() const;
+    // ---- LoRA adapters (the engine's --lora, llama.cpp's server API)
+    /// GET /lora-adapters: [{id, path, scale, task_name, prompt_prefix}] with the scales a request that names none takes
+    /// (empty until the engine has started with adapters)
+    json lora_adapters();
+    /// POST /lora-adapters: [{id, scale}, ...] sets those scales, every adapter left out at 0 (llama.cpp's); RequestError
+    /// for a bad body
+    void set_lora(const json& body);
+    /// a request's "lora" field checked (RequestError: a 400 before anything is sent)
+    void check_lora(const json& req);
+    /// the scales of every adapter for a request: its "lora" field ([{id, scale}], the others 0), else its model name's
+    /// in lora_models, else the server's; empty without adapters
+    std::vector<double> lora_for(const json& req);
+    /// the config's "lora_models": model names a request picks adapters by, {"NAME": [{"id": N, "scale": X}], ...}
+    void set_lora_models(const json& value);
+    json lora_models_now() const;
     /// a Settings view key (runconfig::kEditable, one that applies while the server runs) set to `value` (null: its
     /// default) for the requests from now on
     void apply_setting(const std::string& key, const json& value);
@@ -211,8 +226,15 @@ private:
     json shared_ = json::object();
     mutable std::mutex live_mu_;   ///< the three below: the Settings view changes them while requests read them
     std::vector<std::string> aliases_;
+    json lora_models_ = json::object();
     json reasoning_budget_tokens_ = 0;
     json sampling_defaults_ = json::object();
+    /// the adapters the engine reported (its ADAPTER lines) and the scales the server applies to them
+    std::mutex lora_mu_;
+    json lora_list_ = json::array();
+    std::vector<double> lora_scales_;
+    /// the engine's adapters, the server's scales reset to their start's when the list changed (a restart with others)
+    json lora_sync();
 };
 
 // ---- helpers (module functions of serve/server.py)

@@ -616,6 +616,14 @@ void get_models(Exchange& x) {
         m["alias_of"] = svc.model;
         data.push_back(m);
     }
+    const json lm = svc.lora_models_now();   // the names that run with LoRA adapters, each with its scales
+    for (auto it = lm.begin(); it != lm.end(); ++it) {
+        json m = model;
+        m["id"] = it.key();
+        m["alias_of"] = svc.model;
+        m["lora"] = it.value();
+        data.push_back(m);
+    }
     if (!loaded) data = json::array();
     if (svc.images != nullptr)   // the image model: POST /v1/images/generations
         data.push_back({{"id", svc.images->model}, {"object", "model"}, {"status", {{"value", "loaded"}}},
@@ -787,6 +795,8 @@ void do_get(Service& svc, HttpServer& server, const httplib::Request& req, httpl
         if (x.authorized()) get_props(x);
     } else if (path == "/slots") {
         if (x.authorized()) get_slots(x);
+    } else if (path == "/lora-adapters") {   // llama.cpp's: the adapters and the scales a request that names none takes
+        if (x.authorized()) x.reply(200, svc.lora_adapters());
     } else if (path == "/v1/status") {
         if (x.authorized()) x.reply(200, svc.v1_status());
     } else {
@@ -1110,6 +1120,7 @@ void post_openai(std::shared_ptr<Exchange> xp, json req) {
     svc.reasoning_budget(req);       // a bad value is a 400 before anything is sent
     stop_strings(req);               // ... and so is a bad stop / stop_sequences
     check_request_sampling(req);     // ... and a sampling field of the wrong type
+    svc.check_lora(req);             // ... and a "lora" list the adapters do not take
     Cancel& cancel = x.watch_client();   // #430 #431 (#1999: before prepare, which can take long)
     Prepared p = svc.prepare(messages, tools, kw, max_new, force, &req, &cancel);
     debug_request("openai", req, messages, tools, p.max_new, p.thinking, p.ids.size());
@@ -1196,6 +1207,7 @@ void post_anthropic(std::shared_ptr<Exchange> xp, json req) {
     svc.reasoning_budget(req);
     stop_strings(req);
     check_request_sampling(req);
+    svc.check_lora(req);
     Cancel& cancel = x.watch_client();
     Prepared p = svc.prepare(messages, tools, kw, max_new, force, &req, &cancel);
     debug_request("anthropic", req, messages, tools, p.max_new, p.thinking, p.ids.size());
@@ -1402,6 +1414,7 @@ void post_responses(std::shared_ptr<Exchange> xp, json req) {
         }
         try {
             check_request_sampling(req);   // the request is also the sampling dict
+            svc.check_lora(req);
         } catch (const std::invalid_argument& e) {
             const std::string m = e.what();
             throw responses::ResponsesError(m, m.substr(0, m.find(':')));
@@ -1603,6 +1616,19 @@ void do_post(Service& svc, HttpServer& server, const httplib::Request& req, http
                 x.reply(503, {{"error", {{"type", "server_error"}, {"message", e.what()}}}},
                         e.retry_after ? json{{"Retry-After", e.retry_after}} : json::object());
             }
+        }
+        return;
+    }
+    if (path == "/lora-adapters") {   // llama.cpp's: [{"id": N, "scale": X}, ...], the adapters left out at 0
+        if (!x.control_body() || !x.own_page("the LoRA adapters' scales can be set")) return;
+        try {
+            json body;
+            std::string err;
+            if (!py_loads(req.body.empty() ? "[]" : req.body, body, &err)) throw RequestError(err);
+            svc.set_lora(body);
+            x.reply(200, {{"success", true}});
+        } catch (const std::invalid_argument& e) {
+            x.reply(400, {{"error", {{"type", "invalid_request_error"}, {"message", e.what()}}}});
         }
         return;
     }

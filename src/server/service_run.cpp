@@ -496,6 +496,11 @@ void Service::run_inner(const std::vector<int32_t>& ids, bool thinking, const js
         if (!sampling.is_object()) sampling = json::object();
         sampling["lamina_img_keys"] = img_keys;   // #2228: sent beside the embeddings file
     }
+    // the LoRA adapters' scales: the request's "lora", else the server's (every adapter's, in their order)
+    if (const std::vector<double> ls = lora_for(sampling.is_object() ? sampling : json::object()); !ls.empty()) {
+        if (!sampling.is_object()) sampling = json::object();
+        sampling["lamina_lora"] = ls;
+    }
     std::vector<json> segments;   // each pass's own DONE (a reasoning-budget continuation is another pass)
     json* tr = trace;
     const double waiting = mono_s();

@@ -34,6 +34,9 @@ const std::vector<Param> kParams = {
     {"--vision-min-tokens", "", "vision.min_tokens", K::Int, "N", "a picture's tokens at least"},
     {"--model-name", "", "model_name", K::Str, "NAME", "the model's name in the API (with -m: the file's)"},
     {"--aliases", "--alias", "aliases", K::List, "A,B", "other names the model answers to"},
+    {"--lora-models", "", "lora_models", K::Value, "JSON",
+     "model names that run with the engine's LoRA adapters, {\"NAME\": [{\"id\": 0, \"scale\": 1}], ...}: a request "
+     "naming one (and no \"lora\" of its own) takes those scales, the other adapters at 0"},
     {"--arch", "", "arch", K::Str, "ARCH", "the architecture whose model card gives the sampling a request leaves out "
      "(default: the file's)"},
     {"--chat-template-file", "", "chat_template_file", K::Path, "FILE", "a chat template in place of the model file's"},

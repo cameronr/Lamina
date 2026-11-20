@@ -541,6 +541,102 @@ void Service::set_aliases(const json& value) {
     aliases_ = std::move(out);
 }
 
+// ---- LoRA adapters: the engine's (its ADAPTER lines, INFO "adapters"), llama.cpp's API over them
+json Service::lora_sync() {
+    // (lora_mu_ held) a list other than the last one (the engine started with other adapters): their start's scales
+    const json now = jget(engine->info(), "adapters");
+    const json list = now.is_array() ? now : json::array();
+    if (list != lora_list_) {
+        lora_list_ = list;
+        lora_scales_.clear();
+        for (const auto& a : list) lora_scales_.push_back(jget(a, "scale").is_number() ? a["scale"].get<double>() : 0.0);
+    }
+    return lora_list_;
+}
+
+namespace {
+/// [{"id": N, "scale": X}, ...] -> every adapter's scale, the ones left out 0 (llama.cpp's); RequestError otherwise
+std::vector<double> lora_entries(const json& v, size_t n, const std::string& what) {
+    if (n == 0) throw RequestError(what + ": this model runs without LoRA adapters (--lora)");
+    if (!v.is_array()) throw RequestError(what + ": a list of {\"id\": N, \"scale\": X}");
+    std::vector<double> out(n, 0.0);
+    for (const auto& e : v) {
+        const json& id = jget(e, "id");
+        const json& sc = jget(e, "scale");
+        if (!e.is_object() || !is_int(id) || id.get<int64_t>() < 0 || id.get<int64_t>() >= (int64_t) n)
+            throw RequestError(what + ": each entry an \"id\" from 0 to " + std::to_string(n - 1));
+        if (!sc.is_number() || !std::isfinite(sc.get<double>()))
+            throw RequestError(what + ": each entry a number as its \"scale\"");
+        out[(size_t) id.get<int64_t>()] = sc.get<double>();
+    }
+    return out;
+}
+}  // namespace
+
+json Service::lora_adapters() {
+    std::lock_guard<std::mutex> lk(lora_mu_);
+    const json list = lora_sync();
+    json out = json::array();
+    for (size_t i = 0; i < list.size(); ++i)
+        out.push_back({{"id", (int64_t) i}, {"path", jget(list[i], "path")}, {"scale", lora_scales_[i]},
+                       {"task_name", jstr(list[i], "task_name")}, {"prompt_prefix", jstr(list[i], "prompt_prefix")}});
+    return out;
+}
+
+void Service::set_lora(const json& body) {
+    std::lock_guard<std::mutex> lk(lora_mu_);
+    lora_scales_ = lora_entries(body, lora_sync().size(), "lora-adapters");
+}
+
+void Service::check_lora(const json& req) {
+    const json& v = jget(req, "lora");
+    const json named = v.is_null() ? jget(lora_models_now(), jstr(req, "model")) : json();
+    if ((v.is_null() && named.is_null()) || !engine->alive()) return;   // (an engine still to start: when it runs)
+    std::lock_guard<std::mutex> lk(lora_mu_);
+    (void) lora_entries(v.is_null() ? named : v, lora_sync().size(),
+                        v.is_null() ? "lora_models." + jstr(req, "model") : "lora");
+}
+
+std::vector<double> Service::lora_for(const json& req) {
+    const json named = jget(lora_models_now(), jstr(req, "model"));   // the request's model name's adapters, if any
+    std::lock_guard<std::mutex> lk(lora_mu_);
+    const json list = lora_sync();
+    const json& v = jget(req, "lora");
+    if (list.empty()) {
+        if (!v.is_null()) (void) lora_entries(v, 0, "lora");
+        return {};
+    }
+    if (!v.is_null()) return lora_entries(v, list.size(), "lora");
+    if (!named.is_null()) return lora_entries(named, list.size(), "lora_models." + jstr(req, "model"));
+    return lora_scales_;
+}
+
+void Service::set_lora_models(const json& value) {
+    json out = json::object();
+    if (!value.is_null()) {
+        if (!value.is_object()) throw std::invalid_argument("lora_models: an object of model names, each a list of "
+                                                            "{\"id\": N, \"scale\": X}");
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            const std::string name(strip(it.key()));
+            if (name.empty() || name == model)
+                throw std::invalid_argument("lora_models: a name other than the model's own (" + model + ")");
+            bool ok = it.value().is_array();
+            for (const auto& e : ok ? it.value() : json::array())
+                ok = ok && e.is_object() && is_int(jget(e, "id")) && jget(e, "id").get<int64_t>() >= 0 &&
+                     jget(e, "scale").is_number();
+            if (!ok) throw std::invalid_argument("lora_models." + name + ": a list of {\"id\": N, \"scale\": X}");
+            out[name] = it.value();
+        }
+    }
+    std::lock_guard<std::mutex> lk(live_mu_);
+    lora_models_ = std::move(out);
+}
+
+json Service::lora_models_now() const {
+    std::lock_guard<std::mutex> lk(live_mu_);
+    return lora_models_;
+}
+
 std::vector<std::string> Service::aliases_now() const {
     std::lock_guard<std::mutex> lk(live_mu_);
     return aliases_;
@@ -597,14 +693,17 @@ std::vector<std::string> Service::model_names() const {
     std::vector<std::string> out{model};
     const std::vector<std::string> a = aliases_now();
     out.insert(out.end(), a.begin(), a.end());
+    const json lm = lora_models_now();
+    for (auto it = lm.begin(); it != lm.end(); ++it) out.push_back(it.key());
     return out;
 }
 
 std::string Service::model_for(const json& req) const {
-    // the request's own name when it is an alias (#297), else the model's; other names are still served
+    // the request's own name when it is an alias (#297) or a LoRA model name, else the model's; other names are still
+    // served
     const std::string asked = jstr(req, "model");
     const std::vector<std::string> a = aliases_now();
-    return std::find(a.begin(), a.end(), asked) != a.end() ? asked : model;
+    return std::find(a.begin(), a.end(), asked) != a.end() || lora_models_now().contains(asked) ? asked : model;
 }
 
 int64_t Service::reported_ctx() {

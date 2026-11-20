@@ -732,6 +732,12 @@ int run(int argc, char** argv) {
         svc.codex_compaction_cache = jget(cfg, "codex_compaction_cache") == true; // #924: opt-in
         svc.set_aliases(jget(cfg, "aliases"));   // #297: other names the model answers to
         if (!svc.aliases_now().empty()) say("[lamina] model aliases: " + join(svc.aliases_now(), ", "));
+        svc.set_lora_models(jget(cfg, "lora_models"));   // names that pick LoRA adapters
+        if (const json lm = svc.lora_models_now(); !lm.empty()) {
+            std::vector<std::string> names;
+            for (auto it = lm.begin(); it != lm.end(); ++it) names.push_back(it.key());
+            say("[lamina] LoRA model names: " + join(names, ", "));
+        }
         svc.api_key = api_key;
         if (!truthy(svc.api_key) && cfg.contains("api_key"))   // #569: written, but empty: a warning, not a stop
             say_err("[lamina] the api_key in the config is empty: this server has no API key (anyone who can reach it can use "
